@@ -1,0 +1,236 @@
+# spandsp V.42, vendored and patched
+
+`v42.c` from spandsp, compiled into datamodem so that it **overrides the one
+in the installed libspandsp**. Unlike `../spandsp-v22bis`, which is simply a
+newer copy of working code, this one carries a real patch. `v42.c.orig` is
+the pristine file; `diff -u v42.c.orig v42.c` is the whole change.
+
+## The patches
+
+V.42's detection phase has the answering modem send an ADP: the character
+`E`, then 8 to 16 one-bits, then `C`, then 8 to 16 one-bits, repeated.
+spandsp counts those ones like this:
+
+```c
+case 2:
+    s->neg.rxbits++;          /* counts the terminating zero as well */
+    if (new_bit)
+        break;
+    if (s->neg.rxbits >= 8  &&  s->neg.rxbits <= 16)
+```
+
+The increment runs before the test, so the zero that *ends* the run of ones
+is counted as one of them. The window is shifted by one: spandsp accepts 7
+to 15 ones where V.42 specifies 8 to 16. A far end using 16 — the top of the
+permitted range — is rejected, detection fails, and the call falls back to a
+link with no error correction while the far end has already committed to
+LAPM and is sending HDLC that we read as line noise.
+
+Measured against spandsp's own documented pattern before the patch:
+
+```
+    6 ones between E and C: no
+    7 ones between E and C: DETECTED
+   ...
+   15 ones between E and C: DETECTED
+   16 ones between E and C: no        <- legal, and refused
+```
+
+### 2. Real equipment puts the whole idle after the pair
+
+Instrumenting the detector against a real modem produced this:
+
+```
+detect gave up: 5324 bits seen, 0 good cycles;
+                first char wrong 207 times, gap1 wrong 1 times (0..0),
+                second char wrong 0 times, gap2 wrong 0 times
+```
+
+5324 bits carrying 208 characters is 25.6 bits each, so `E(10) + g1 +
+C(10) + g2` comes to 51 bits a pair and the two gaps sum to 31. The one
+time the detector did align on `E`, it measured the following gap as
+**zero**. That far end sends `E` and `C` back to back and puts the whole
+idle after the pair — where V.42, and spandsp, want 8 to 16 ones in each.
+Rejected at the first gap, every single time.
+
+So the accepted range is now simply "up to 64", with no lower bound. The
+pattern is still `E` then `C` then idle, twice over, which is specific
+enough; and a wrong guess is cheap, because LAPM establishment then fails
+and datamodem falls back.
+
+### 3. Resynchronisation latched onto data bits
+
+The same log showed the first character failing 207 times — about once per
+character received — and succeeding once. `case 0` is commented "look for
+some ones" but accepted *any* zero, including the zeros inside a
+character's data. Having misaligned once, it would misalign again on the
+next character, and again, and never recover.
+
+It now requires a real idle run before treating a zero as a start bit. The
+second character is located by `case 3` at a known offset, so it does not
+need an idle in front of it and is unaffected.
+
+Together these make the detector accept both shapes from every starting
+offset in the cycle:
+
+```
+textbook: E +8 ones+ C +8 ones          DETECTED from every offset
+textbook: E +16 ones+ C +16 ones        DETECTED from every offset
+the real far end: E C then 31 ones      DETECTED from every offset
+```
+
+### 4. Establishment sent XID and never SABME
+
+The one that actually stopped real calls connecting. After detection
+succeeds, `initiate_negotiation_expired()` called `lapm_config()`, which
+transmits an **XID** — parameter negotiation — and nothing else. V.42 8.3
+is explicit that an error-corrected connection is established by sending
+SABME; 8.10 has XID initiated by the control function, not as a
+precondition for connecting. A far end waiting for SABME never sees one,
+so it never answers.
+
+It then fails silently. While `configuring` is set, `t401_expired()` only
+ever retransmits the XID, and the LAPM state is still `LAPM_IDLE` — which
+matches no case in the retry-exhausted switch:
+
+```c
+switch (s->state) {
+case LAPM_ESTABLISH:
+case LAPM_RELEASE:   ... report_rx_status_change(SIG_STATUS_LINK_DISCONNECTED);
+case LAPM_DATA:      ... }
+```
+
+so nothing is reported at all. From a real call it looks like this: four
+`T.401 expired` a second apart, then silence, then the far end clears the
+call.
+
+```
+29.330  v42 status 1 (LAPM_IDLE)      <- detection succeeded
+29.491  Start negotiation
+30.491  T.401 expired
+31.490  T.401 expired
+32.491  T.401 expired
+33.490  T.401 expired
+34.330  carrier dropped
+35.461  BYE from the far end
+```
+
+Two spandsp ends never notice, because spandsp answers its own XID.
+
+`lapm_connect()` is what was wanted — it sends the SABME, starts T401, and
+sets the state to `LAPM_ESTABLISH` so a failure is at least reported. The
+author had already commented the XID out of it. Nothing is lost by
+skipping the negotiation: spandsp never applies the negotiated values
+anyway, its `config` fields being compile-time constants that the XID
+exchange does not update.
+
+### 5. A failed establishment said nothing about why
+
+`SIG_STATUS_LINK_DISCONNECTED` arrives with no reason attached, and there are
+six quite different ways to reach it — from "we ran out of SABME retries"
+through "the far end sent DISC" to "the far end answered our SABME with a
+point-blank DM refusal". Everything spandsp knows about which it was is at
+`SPAN_LOG_FLOW`. They are not the same problem and they do not call for the
+same response, so `dm_v42_disconnect_cause` now carries a short description
+out to whoever handles the status change.
+
+The one that turns up in the field is **DM in answer to SABME**: the far end
+completes detection, receives the SABME, and refuses. V.42 8.3.2.1 is clear
+that this is legitimate and that the originator must report failure — so
+spandsp is right to stop. But a far end entitled to say "not yet" is equally
+entitled to be ready a moment later, and spandsp has no way to try again:
+`lapm_connect()` is static, and `v42_restart()` goes all the way back to the
+detection phase, which a far end that has already finished detection will not
+run a second time. `dm_v42_reconnect()` repeats just the establishment step,
+so `--v42-timeout` can mean what it says. See `v42_retry_establishment()` in
+`src/modem.c` for the retry policy.
+
+### 6. Both answerer detection patterns were treated as "yes"
+
+Table 3/V.42 defines two Answerer Detection Patterns, and they mean opposite
+things:
+
+| Pattern | Meaning |
+|---|---|
+| `(E)` `(C)` | V.42 supported |
+| `(E)` `(Null)` | No error-correcting protocol desired |
+
+and 7.2.1.2 has the originator "take the appropriate action based upon the
+ADP received (e.g. if EC is received, initiate LAPM)". Upstream matches both
+in `negotiation_rx_bit()` case 3, advances the state machine identically for
+each, and then initiates LAPM regardless — its own comment at the hit calls
+the result "the V.42 supported pattern":
+
+```c
+if (s->calling_party  &&  s->neg.rxstream == 0x185)        /* (C)    */
+    s->neg.rx_negotiation_step++;
+else if (s->calling_party  &&  s->neg.rxstream == 0x001)   /* (Null) */
+    s->neg.rx_negotiation_step++;
+```
+
+So a far end that politely declines error correction during detection is sent
+a SABME anyway, and answers it with DM — the correct response to a request it
+has already refused. From the outside detection appears to succeed,
+establishment is refused every single time, and nothing says why. Which ADP
+arrived is now recorded in `dm_v42_adp_no_ec`, and the `(Null)` form goes
+straight to `LAPM_V42_UNSUPPORTED` without sending a SABME.
+
+Two spandsp ends never send the `(Null)` form, so `dm_v42_answer_no_ec` (set
+from `DATAMODEM_V42_ANSWER_NO_EC`) makes the answering end send it.
+
+### 7. The wire was invisible
+
+spandsp logs no LAPM frames at all, and `lapm_receive()` drops every frame
+whose FCS fails without a word. Those two together make the most important
+distinction in a failed negotiation impossible to see from the outside: a far
+end that is answering correctly over a path that is mangling its answers
+looks exactly like a far end that is saying nothing. Every frame is now
+logged in both directions with its address, control field, P/F bit and first
+octets, and frames that fail FCS are counted into `dm_v42_fcs_errors` and
+logged as such rather than vanishing.
+
+`lapm_receive()` also indexed `frame[1]` before checking that two octets had
+arrived; a zero- or one-octet frame with a passing FCS read off the end of
+the buffer. It now returns early.
+
+### The test hook
+
+`dm_v42_refuse_sabme` makes the answering end refuse that many SABMEs with
+DM, and `src/modem.c` sets it from `DATAMODEM_V42_REFUSE_SABME`. It exists
+because two spandsp ends accept each other's SABME on the first attempt, so
+without it the retry path above is unreachable from the test suite — and a
+path that only ever runs against real equipment is a path that only ever
+fails in the field. It is zero in any normal run.
+
+```
+DATAMODEM_V42_REFUSE_SABME=3 datamodem selftest --modulation v22bis \
+    --v42 require --v42bis --v42-timeout 20
+```
+
+## The other V.42 defect is fixed from outside
+
+spandsp hardcodes `tx_bit_rate = 28800` and derives every timer from it, so
+at 2400 bps they run twelve times too long and at 300 bps ninety-six times.
+That is corrected in `src/modem.c` rather than here, because the rate is not
+known until the modem has trained and can change when V.22bis negotiates
+down. See `v42_arm()`, which is called twice: once when the modem is built,
+with the rate being offered, so the context is valid through training, and
+again the moment the carrier comes up, with the rate that was actually
+negotiated. The second call is the one that matters. A link that offered 2400
+and settled at 1200 would otherwise run every LAPM timer at twice the speed
+V.42 allows, and T401 would exhaust its retries while the far end was still
+well within its rights to be thinking.
+
+## Why overriding the library like this is safe
+
+Nothing else in libspandsp references `v42_*` — checked across every `.c` in
+the tree — so no library code can hold a `v42_state_t` that this file
+allocated, or the reverse. Every header it needs is installed and unchanged.
+
+Drop this directory and `DATAMODEM_VENDOR_V42` when a libspandsp ships with
+the counting fixed.
+
+## Licence
+
+spandsp is LGPL-2.1-only. See `COPYING.LGPL`, and the note in
+`../spandsp-v22bis/README.md` about static linking.
