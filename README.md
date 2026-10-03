@@ -363,7 +363,8 @@ sender's acknowledgement bookkeeping catching up:
 | 2400 bps | 12.04s | 1.04s | 12× |
 
 `28800/rate` in every case, and the corrected figure is T401 = 1000 ms, as
-specified. datamodem sets the rate before `v42_restart()` — after it is too
+specified (longer only on a path measured to need it - see "V.42bis is
+negotiated" below). datamodem sets the rate before `v42_restart()` — after it is too
 late, because the restart has already armed T400 from the stale value.
 
 Two consequences worth knowing:
@@ -718,9 +719,40 @@ warn [modem] the far end declined V.42bis in the XID exchange; error correction 
 
 `--v42bis-dict` and `--v42bis-max-string` are therefore ceilings, not
 something both ends have to match (the defaults, 2048 and 32, are what real
-modems shipped with). A far end that never answers XID gets three of them a
-second apart, then a SABME, and an uncompressed link with a warning saying
-why. `--log-level debug` prints both ends' XID values and every LAPM frame.
+modems shipped with). A far end that never answers XID gets a SABME after two
+of them, and an uncompressed link with a warning saying why - and if frames
+were arriving damaged meanwhile, a second warning saying that it may have
+answered after all.
+
+**Some far ends compress without agreeing to.** A BBS's modem was seen
+ignoring our XID entirely, accepting the SABME, sending its banner in the
+clear - and then `00 00` and compressed data, which uncompressed is a screen
+of garbage two lines in. V.42bis always starts in transparent mode and can
+only leave it with its escape character, initially `00`, followed by a
+command (`00`, `01` or `02`). So when the XID goes unanswered, what arrives
+is delivered as it is but also fed to a decompressor in the background, to
+keep its dictionary in step, and the first `00` settles it: followed by a
+command, the far end is compressing, and from there on its data is
+decompressed (`protocol V.42/V.42bis (receiving only)`, and a warning saying
+so); followed by anything else, it is not, and the background decompressor
+is dropped. Our own direction stays uncompressed, which a far end
+decompressing anyway passes through untouched. The one case this misjudges
+is a far end that is genuinely not compressing whose first `00` happens to
+be followed by `00`, `01` or `02` - binary data, on a link with no V.42bis
+on either side - which is why it only applies when the XID went unanswered.
+
+**T401 is sized to the path.** V.42's acknowledgement timer is 1 s, which
+outlasts a round trip on a phone line and not over RTP: one BBS was 772 ms
+away, answered our XID a little after 1 s, and - having answered - went on
+to compress, at an end that had given up waiting and was not decompressing.
+The banner arrived clean for its first line, while V.42bis was still in its
+transparent start-up, and then turned to garbage. T401 is now the round trip
+(V.32 measures it; otherwise the two jitter buffers) plus half a second,
+never less than V.42's 1 s - which on the default jitter buffers is exactly
+1 s, so the timer table above still holds unless a longer path is measured - and an XID answer
+that does arrive late, before the link is up, is taken rather than
+discarded. The V.42 detection window is sized from the same round trip. All
+of it only makes this end more patient; nothing the far end does changes. `--log-level debug` prints both ends' XID values and every LAPM frame.
 
 **Detection traffic is real junk to a far end that is not listening for it.**
 The ODP pattern will show up as perhaps a hundred garbage characters before

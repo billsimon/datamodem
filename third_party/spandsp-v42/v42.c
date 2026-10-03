@@ -277,6 +277,7 @@ static struct
 {
     const v42_state_t *s;
     int done;
+    int t401_ms;
 } dm_xid[DM_XID_SLOTS];
 
 /* datamodem: test hook. When set, this end behaves like the far ends that
@@ -285,14 +286,14 @@ static struct
    give-up-on-XID path can be exercised. */
 int dm_v42_no_xid = 0;
 
-static int *dm_xid_flag(const v42_state_t *s)
+static int dm_xid_slot(const v42_state_t *s)
 {
     int free_slot = -1;
 
     for (int i = 0; i < DM_XID_SLOTS; i++)
     {
         if (dm_xid[i].s == s)
-            return &dm_xid[i].done;
+            return i;
         if (dm_xid[i].s == NULL && free_slot < 0)
             free_slot = i;
     }
@@ -300,7 +301,32 @@ static int *dm_xid_flag(const v42_state_t *s)
         free_slot = 0;
     dm_xid[free_slot].s = s;
     dm_xid[free_slot].done = 0;
-    return &dm_xid[free_slot].done;
+    dm_xid[free_slot].t401_ms = 0;
+    return free_slot;
+}
+
+static int *dm_xid_flag(const v42_state_t *s)
+{
+    return &dm_xid[dm_xid_slot(s)].done;
+}
+
+/* datamodem: T401 for this context. V.42 means it to exceed the time from
+   sending a frame to hearing it acknowledged, and spandsp fixes it at the
+   1 s that does on a phone line. Over RTP the round trip alone can be most of
+   that - 772 ms has been seen - and an XID answered a little after 1 s was
+   given up on and then thrown away, while the far end, having answered,
+   went ahead and compressed. src/modem.c sets it from the measured round
+   trip; it is never less than V.42's 1 s. */
+void dm_v42_set_t401(const v42_state_t *s, int ms)
+{
+    dm_xid[dm_xid_slot(s)].t401_ms = ms;
+}
+
+static int dm_t401_ms(const v42_state_t *s)
+{
+    int ms = dm_xid[dm_xid_slot(s)].t401_ms;
+
+    return (ms > T_401) ? ms : T_401;
 }
 
 /* datamodem: did an XID exchange complete, so that what is in s->config is
@@ -658,7 +684,8 @@ static const char *dm_lapm_frame_name(const uint8_t *frame, int len)
    thing that settles what actually happened, and spandsp logs none of it. */
 static void dm_frame_log(v42_state_t *ss, const char *dir, const uint8_t *frame, int len, int ok)
 {
-    char hex[64];
+    char hex[3 * 32 + 1];
+    char txt[32 + 1];
     int i;
     int shown = (len < 8) ? len : 8;
 
@@ -671,6 +698,28 @@ static void dm_frame_log(v42_state_t *ss, const char *dir, const uint8_t *frame,
              (len > 0) ? frame[0] : 0, (len > 1) ? frame[1] : 0,
              (len > 1) ? ((frame[1] >> 4) & 1) : 0,
              len, hex, (len > shown) ? "..." : "");
+
+    /* datamodem: and then all of it, 32 octets a line with the printable
+       ones alongside, for any frame carrying more than its header. Eight
+       octets was enough to name a frame and not enough to see what was in
+       it - whether an I-frame is text or compressed, or what an XID
+       offered. Debug logs only. */
+    if (len <= 3)
+        return;
+    for (int off = 0; off < len; off += 32)
+    {
+        int n = (len - off < 32) ? len - off : 32;
+
+        for (i = 0; i < n; i++)
+        {
+            uint8_t c = frame[off + i];
+
+            sprintf(hex + i * 3, "%02x ", c);
+            txt[i] = (c >= 0x20 && c < 0x7F) ? (char) c : '.';
+        }
+        txt[n] = '\0';
+        span_log(&ss->logging, SPAN_LOG_FLOW, "LAPM %s       %4d: %-96s %s\n", dir, off, hex, txt);
+    }
 }
 /*- End of function --------------------------------------------------------*/
 
@@ -790,14 +839,15 @@ static void t401_expired(v42_state_t *ss)
         /* datamodem: a far end that ignores XID altogether - there are some
            - would otherwise be asked N400 times and never sent the SABME it
            is waiting for, and since the LAPM state is still LAPM_IDLE the
-           retry-exhausted path above reports nothing either. Three XIDs a
-           T401 apart, then establish without negotiating: V.42bis is then
-           off, which is what V.42bis says no negotiation means. */
-        if (s->retry_count > 2)
+           retry-exhausted path above reports nothing either. Two XIDs,
+           then establish without negotiating: V.42bis is then off, which is
+           what V.42bis says no negotiation means - unless the answer turns
+           up late, before the link is up, which rx_unnumbered_rsp_frame
+           still accepts. So the offer in s->config is left alone. */
+        if (s->retry_count > 1)
         {
             span_log(&ss->logging, SPAN_LOG_FLOW, "No answer to XID; establishing without it\n");
             s->configuring = FALSE;
-            ss->config.comp = 0;
             lapm_connect(ss);
             return;
         }
@@ -818,14 +868,14 @@ static void t401_expired(v42_state_t *ss)
             break;
         }
     }
-    ss->bit_timer = ms_to_bits(ss, T_401);
+    ss->bit_timer = ms_to_bits(ss, dm_t401_ms(ss));
     ss->bit_timer_func = t401_expired;
 }
 /*- End of function --------------------------------------------------------*/
 
 static __inline__ void t401_start(v42_state_t *s)
 {
-    s->bit_timer = ms_to_bits(s, T_401);
+    s->bit_timer = ms_to_bits(s, dm_t401_ms(s));
     s->bit_timer_func = t401_expired;
     s->lapm.retry_count = 0;
 }
@@ -889,6 +939,8 @@ static void initiate_negotiation_expired(v42_state_t *s)
        two unanswered XIDs (t401_expired does that). */
     span_log(&s->logging, SPAN_LOG_FLOW, "Start negotiation\n");
     dm_v42_xid_forget(s);
+    /* Count damage from here: what came before was detection, not frames. */
+    dm_v42_fcs_errors = 0;
     if (dm_v42_no_xid)
         lapm_connect(s);
     else
@@ -1314,6 +1366,17 @@ static int rx_unnumbered_rsp_frame(v42_state_t *ss, const uint8_t *frame, int le
                 tx_supervisory_frame(s, s->cmd_addr, LAPM_S_RR, 0);
                 break;
             }
+        }
+        else if (s->state == LAPM_ESTABLISH && !dm_v42_xid_done(ss))
+        {
+            /* datamodem: the answer to an XID we had stopped waiting for.
+               The far end sent it before it could have seen our SABME, so
+               it arrives ahead of the UA, and the far end now believes the
+               parameters agreed - it will compress if V.42bis was. Take it,
+               or it sends compressed data to an end that is not expecting
+               any. */
+            span_log(&ss->logging, SPAN_LOG_FLOW, "XID answered late; taking it\n");
+            receive_xid(ss, frame, len);
         }
         break;
     default:
@@ -1880,7 +1943,11 @@ SPAN_DECLARE(void) v42_restart(v42_state_t *s)
 {
     dm_neg_reset();         /* datamodem: fresh diagnostics per call */
     hdlc_tx_init(&s->lapm.hdlc_tx, FALSE, 1, TRUE, lapm_hdlc_underflow, s);
-    hdlc_rx_init(&s->lapm.hdlc_rx, FALSE, FALSE, 1, lapm_receive, s);
+    /* datamodem: report_bad_frames TRUE. With it FALSE, as upstream has it,
+       the HDLC receiver drops a frame that fails its FCS before LAPM sees
+       it - so the bad-FCS counting and logging in lapm_receive() could never
+       fire, and a damaged answer was indistinguishable from no answer. */
+    hdlc_rx_init(&s->lapm.hdlc_rx, FALSE, TRUE, 1, lapm_receive, s);
 
     if (s->detect)
     {

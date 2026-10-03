@@ -105,6 +105,7 @@ extern int dm_v42_adp_no_ec;
 extern int dm_v42_answer_no_ec;
 extern int dm_v42_no_xid;
 extern int dm_v42_xid_done(const v42_state_t *s);
+extern void dm_v42_set_t401(const v42_state_t *s, int ms);
 #endif
 
 /* How long to leave between attempts at establishment. Long enough that a
@@ -221,6 +222,14 @@ struct dm_modem
      * possibly nothing. Until the link is up, the offer. */
     bool comp_tx;
     bool comp_rx;
+    /* The far end never answered our XID, so nothing was agreed - but some
+     * far ends compress anyway. Until it shows its hand, received data goes
+     * to the terminal as it is and through the decompressor too, its output
+     * thrown away, so that the dictionary is in step if the far end turns
+     * out to be compressing. See v42bis_shadow(). */
+    bool rx_shadow;
+    bool rx_shadow_esc;       /* a 0x00 is held: the next octet decides */
+    bool rx_discard;          /* the decompressor's output is not wanted */
     int v42bis_dict;
     int v42bis_max_string;
     bool lapm_up;
@@ -757,8 +766,79 @@ static void v42bis_decoded(void *user, const uint8_t *buf, int len)
 {
     dm_modem_t *m = user;
 
-    if (len > 0)
+    if (len > 0 && !m->rx_discard)
         deliver_rx(m, buf, (size_t) len);
+}
+
+static void v42bis_feed(dm_modem_t *m, const uint8_t *buf, size_t len, bool discard)
+{
+    if (len == 0)
+        return;
+    m->rx_discard = discard;
+    v42bis_decompress(m->v42bis, buf, (int) len);
+    v42bis_decompress_flush(m->v42bis);
+    m->rx_discard = false;
+}
+
+/* Received data from a far end that never answered our XID.
+ *
+ * V.42bis starts in transparent mode, where data passes through unchanged,
+ * and the only way out of it is the escape character - initially 0x00 -
+ * followed by a command: 0 to enter compressed mode, 1 for a literal escape
+ * character, 2 to reset. So the first 0x00 settles it. Followed by a command
+ * code, the far end is running V.42bis whatever it did not say, and from
+ * then on what it sends goes through the decompressor, whose dictionary has
+ * been kept in step all along. Followed by anything else, it is not, and the
+ * shadow is dropped.
+ *
+ * Met in the field: a BBS whose modem never answered XID, sent its banner in
+ * the clear, then "00 00" and compressed codewords - which, uncompressed,
+ * was a screen of garbage two lines in. */
+static void v42bis_shadow(dm_modem_t *m, const uint8_t *msg, size_t len)
+{
+    size_t start = 0;
+
+    for (size_t i = 0; i < len; i++)
+    {
+        uint8_t c = msg[i];
+
+        if (m->rx_shadow_esc)
+        {
+            static const uint8_t esc = 0x00;
+
+            m->rx_shadow_esc = false;
+            m->rx_shadow = false;
+            if (c <= 2)
+            {
+                /* Everything before the escape was transparent, and has
+                 * been delivered and taught to the dictionary already. */
+                m->comp_rx = true;
+                DM_WARN("modem", "the far end never answered our XID but is sending V.42bis anyway; "
+                                 "decompressing it with the parameters we offered (dictionary %d, "
+                                 "strings up to %d) (tag=%s)",
+                        m->v42bis_dict, m->v42bis_max_string, m->tag);
+                v42bis_feed(m, &esc, 1, false);
+                v42bis_feed(m, msg + i, len - i, false);
+                return;
+            }
+            DM_DEBUG("modem", "the far end sent a 0x00 that is not a V.42bis escape; it is not "
+                              "compressing (tag=%s)", m->tag);
+            deliver_rx(m, &esc, 1);
+            deliver_rx(m, msg + i, len - i);
+            return;
+        }
+        if (c == 0x00)
+        {
+            /* Hold it: alone it means nothing yet. The decompressor is fed
+             * up to here, and the 0x00 with whatever follows it. */
+            deliver_rx(m, msg + start, i - start);
+            v42bis_feed(m, msg + start, i - start, true);
+            m->rx_shadow_esc = true;
+            start = i + 1;
+        }
+    }
+    deliver_rx(m, msg + start, len - start);
+    v42bis_feed(m, msg + start, len - start, true);
 }
 
 /* LAPM wants a frame to send. */
@@ -811,8 +891,11 @@ static void v42_iframe_put(void *user, const uint8_t *msg, int len)
     m->wire_rx += (size_t) len;
     if (m->v42bis != NULL && m->comp_rx)
     {
-        v42bis_decompress(m->v42bis, msg, len);
-        v42bis_decompress_flush(m->v42bis);
+        v42bis_feed(m, msg, (size_t) len, false);
+    }
+    else if (m->v42bis != NULL && m->rx_shadow)
+    {
+        v42bis_shadow(m, msg, (size_t) len);
     }
     else
     {
@@ -868,26 +951,63 @@ static void v42_set_bit_rate(dm_modem_t *m, int rate)
  *
  * Only safe before any data has been exchanged: v42_restart() resets the
  * detection state machine along with everything else. */
+/* The round trip the V.42 timers have to allow for. V.32 measures the real
+ * one during its start-up, and by the time the carrier is up it is known;
+ * for everything else, and before then, the two jitter buffers are the best
+ * estimate there is. RTP paths of 400-800 ms have been met in practice. */
+static int v42_round_trip_ms(dm_modem_t *m)
+{
+    if (m->v32 != NULL)
+    {
+        dm_v32_stats_t vs;
+
+        dm_v32_stats(m->v32, &vs);
+        if (vs.round_trip_ms > m->path_delay_ms)
+            return vs.round_trip_ms;
+    }
+    return m->path_delay_ms;
+}
+
 static void v42_arm(dm_modem_t *m, int rate)
 {
+    int rtd_ms;
+
     if (m->v42 == NULL || rate <= 0)
         return;
+    rtd_ms = v42_round_trip_ms(m);
     /* Before the restart, not after: v42_restart latches T400 from the rate,
      * and a timer already loaded from the wrong one stays wrong. */
     v42_set_bit_rate(m, rate);
+#if defined(DATAMODEM_VENDORED_V42)
+    {
+        /* T401 has to outlast the round trip, or every acknowledgement -
+         * and the XID answer that V.42bis rides on - comes back after we
+         * have given up on it. V.42's 1 s assumes a phone line. Half a
+         * second on top covers sending the frames and the far end thinking
+         * about them; on the 300 ms the jitter buffers alone account for,
+         * that is exactly V.42's 1 s, so nothing changes unless a longer
+         * path has been measured. */
+        int t401 = rtd_ms + 500;
+
+        if (t401 < 1000)
+            t401 = 1000;
+        dm_v42_set_t401(m->v42, t401);
+        DM_DEBUG("modem", "V.42 T401 %d ms, for a %d ms round trip at %d bps (tag=%s)", t401, rtd_ms,
+                 rate, m->tag);
+    }
+#endif
     v42_restart(m->v42);
     /* v42_restart has just armed T400 from the rate above. Replace it with a
      * window sized for this line rate and this audio path - see
      * DM_V42_DETECT_SPEC_MS. */
     if (m->v42->bit_timer > 0)
     {
-        int path_ms = DM_V42_DETECT_SPEC_MS + m->path_delay_ms;
+        int path_ms = DM_V42_DETECT_SPEC_MS + rtd_ms;
         int bits = 2 * DM_V42_DETECT_MIN_BITS + (int) ((int64_t) path_ms * rate / 1000);
 
         DM_DEBUG("modem", "V.42 detection window %d -> %d bit periods (%.2fs at %d bps, "
                           "allowing %dms for the audio path) (tag=%s)",
-                 (int) m->v42->bit_timer, bits, (double) bits / rate, rate,
-                 m->path_delay_ms, m->tag);
+                 (int) m->v42->bit_timer, bits, (double) bits / rate, rate, rtd_ms, m->tag);
         m->v42->bit_timer = bits;
     }
 }
@@ -949,8 +1069,32 @@ static void apply_v42bis_agreement(dm_modem_t *m)
     if (!dm_v42_xid_done(m->v42))
     {
         m->comp_tx = m->comp_rx = false;
+        /* Our own direction stays uncompressed: that is what V.42bis says
+         * no negotiation means, and a far end that is decompressing anyway
+         * passes it through untouched in transparent mode. The other way, be
+         * ready for it to compress regardless - some do. */
+        m->rx_shadow = true;
+        m->rx_shadow_esc = false;
+        if (getenv("DATAMODEM_V42BIS_REGARDLESS") != NULL)
+        {
+            /* Test hook: be that far end - compress, and expect compression,
+             * on nothing but our own offer. */
+            m->comp_tx = m->comp_rx = true;
+            m->rx_shadow = false;
+            DM_WARN("modem", "DATAMODEM_V42BIS_REGARDLESS: running V.42bis without an agreement. "
+                             "This is a test hook.");
+            return;
+        }
         DM_WARN("modem", "the far end never answered our XID, so V.42bis was not negotiated and "
                          "this link runs uncompressed (tag=%s)", m->tag);
+        /* Two very different situations look the same from here: a far end
+         * that does not do XID, and one that answered over a path that
+         * damaged the answer. The second will damage the data too. */
+        if (dm_v42_fcs_errors > 0)
+            DM_WARN("modem", "%u LAPM frame%s arrived damaged meanwhile, so it may well have "
+                             "answered - this path is corrupting frames, which will hurt the data "
+                             "as well (tag=%s)",
+                    dm_v42_fcs_errors, dm_v42_fcs_errors == 1 ? "" : "s", m->tag);
         return;
     }
     p0 = m->v42->config.comp & 3;

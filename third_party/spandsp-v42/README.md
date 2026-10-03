@@ -122,7 +122,7 @@ sets the state to `LAPM_ESTABLISH` so a failure is at least reported. The
 author had already commented the XID out of it.
 
 **Revised by patch 8:** skipping XID entirely turned out to be wrong too —
-see below. Establishment is now XID, then SABME; and SABME anyway if three
+see below. Establishment is now XID, then SABME; and SABME anyway if two
 XIDs go unanswered, which still covers the far end that prompted this.
 
 ### 5. A failed establishment said nothing about why
@@ -209,8 +209,14 @@ Now:
 
 - establishment sends XID (P bit set) carrying what `s->config` holds, which
   `src/modem.c` loads from `--v42bis`, `--v42bis-dict` and
-  `--v42bis-max-string`; SABME follows the XID response, or follows three
-  unanswered XIDs, in which case compression is off;
+  `--v42bis-max-string`; SABME follows the XID response, or follows two
+  unanswered XIDs, in which case compression is off - unless the answer
+  arrives late, before the UA, in which case it is taken: the far end has
+  agreed and will compress whatever we decided in the meantime;
+- T401 is per context, set by `dm_v42_set_t401()` from the round trip
+  `src/modem.c` knows about, never below V.42's 1 s. A fixed 1 s is shorter
+  than some RTP round trips, and an XID answered at 1.1 s over a 772 ms path
+  was given up on and then discarded;
 - `receive_xid()` narrows `s->config` to the agreement — the directions both
   ends want, the smaller dictionary and string length — so a responder
   answers with the agreed values and an initiator records them;
