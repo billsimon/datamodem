@@ -291,7 +291,6 @@ typedef struct
     bool data_on;
     vit_t vit;
     cf_t vit_u[VIT_DEPTH];    /* what went into the decoder, to measure against what came out */
-    int vit_conv;             /* the decoded path, re-encoded, to recover Y0 */
     float vit_mse;
     float snr_trained;
 } rx_t;
@@ -1493,7 +1492,6 @@ static void rx_enter_data(dm_v32_t *v, coding_t coding)
     r->data_rcvd = 0;
     r->prev_y = Y_OF_QUAD[r->prev_q];
     vit_reset(&r->vit);
-    r->vit_conv = 0;
     r->vit_mse = r->mse;
     set_loops(r, 0.01f, 0.03f, 0.0005f, 0.01f);
     r->leak = 1e-5f;
@@ -1680,13 +1678,25 @@ static void symbol_out(dm_v32_t *v)
             {
                 int yy = out >> 2;
                 int qq = v->inv2[r->prev_y][yy];
-                cf_t decided = v->map32[((r->vit_conv & 1) << 4) | out];
+                cf_t held = r->vit_u[r->vit.pos];
+                float e0 = mag2(held - v->map32[out]);
+                float e1 = mag2(held - v->map32[16 | out]);
 
                 /* The slicer's tentative decisions flatter the error at
                  * low SNR, where the nearest of 32 points is often the
-                 * wrong one; measure against what the decoder chose. */
-                r->vit_mse += 0.005f * (mag2(r->vit_u[r->vit.pos] - decided) - r->vit_mse);
-                r->vit_conv = v->vnext[r->vit_conv][yy];
+                 * wrong one; measure against what the decoder chose. It
+                 * decides Y1 Y2 Q3 Q4, which leaves two points, one per
+                 * value of Y0, and the received one is near the right one.
+                 *
+                 * Not by re-running the encoder over the decoder's output
+                 * to recover Y0, which is what this did: the decoder may
+                 * switch to another path, the spliced output is then not
+                 * one the encoder could have produced, and the copy of the
+                 * encoder stays out of step for good - measuring every
+                 * symbol against a point in the wrong subset, about 3 dB,
+                 * while the data was perfect. That fired retrains on a
+                 * line with nothing wrong with it. */
+                r->vit_mse += 0.005f * ((e0 < e1 ? e0 : e1) - r->vit_mse);
                 r->prev_y = yy;
                 deliver(v, qq >> 1);
                 deliver(v, qq & 1);
@@ -2275,7 +2285,12 @@ static void control(dm_v32_t *v, long long n)
     case STG_DATA:
     {
         float snr = rx_snr(v);
-        float poor = (v->rate == 4800) ? 9.0f : (v->tcm ? 13.0f : 16.0f);
+        /* Where each coding stops being worth having: measured back to back
+         * over G.711, the trellis code is at about 1e-2 bit errors by 15 dB
+         * and useless by 13; the 16-point code needs 3 dB more; 4800 is
+         * still clean at 14. A retrain picks the rate again, from what the
+         * line will bear now. */
+        float poor = (v->rate == 4800) ? 11.0f : (v->tcm ? 14.0f : 17.0f);
 
         if (v->pwr < v->ploss)
         {
