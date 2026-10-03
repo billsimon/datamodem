@@ -268,19 +268,75 @@ static __inline__ int set_param(int param, int value, int def)
 }
 /*- End of function --------------------------------------------------------*/
 
+/* datamodem: the outcome of the XID exchange, per V.42 context. spandsp has
+   nowhere in its own state to keep it - the v42_update_config() that would
+   have applied it is commented out - and selftest runs two contexts in one
+   process, so a single global will not do. */
+#define DM_XID_SLOTS 8
+static struct
+{
+    const v42_state_t *s;
+    int done;
+} dm_xid[DM_XID_SLOTS];
+
+/* datamodem: test hook. When set, this end behaves like the far ends that
+   know nothing of XID: it never sends one, establishing straight away with
+   SABME, and silently ignores any it receives - so that the other end's
+   give-up-on-XID path can be exercised. */
+int dm_v42_no_xid = 0;
+
+static int *dm_xid_flag(const v42_state_t *s)
+{
+    int free_slot = -1;
+
+    for (int i = 0; i < DM_XID_SLOTS; i++)
+    {
+        if (dm_xid[i].s == s)
+            return &dm_xid[i].done;
+        if (dm_xid[i].s == NULL && free_slot < 0)
+            free_slot = i;
+    }
+    if (free_slot < 0)
+        free_slot = 0;
+    dm_xid[free_slot].s = s;
+    dm_xid[free_slot].done = 0;
+    return &dm_xid[free_slot].done;
+}
+
+/* datamodem: did an XID exchange complete, so that what is in s->config is
+   what both ends agreed rather than only what we offered? */
+int dm_v42_xid_done(const v42_state_t *s)
+{
+    return *dm_xid_flag(s);
+}
+
+void dm_v42_xid_forget(const v42_state_t *s)
+{
+    *dm_xid_flag(s) = 0;
+}
+
 static int receive_xid(v42_state_t *ss, const uint8_t *frame, int len)
 {
     lapm_state_t *s;
     v42_config_parameters_t config;
     const uint8_t *buf;
     uint8_t group_id;
-    uint16_t group_len;
+    /* datamodem: int, not uint16_t. The checks below for running past the
+       end of a group are "group_len < 0", which an unsigned type can never
+       satisfy, so a malformed parameter length walked off the frame. */
+    int group_len;
     uint32_t param_val;
     uint8_t param_id;
     uint8_t param_len;
+    /* datamodem: what the far end said about V.42bis. A frame with no
+       private group, or no P0 in it, offers no compression - which is
+       V.42bis's default, and what the agreement must then be. */
+    int far_p0 = 0;
+    int far_p1 = 512;
+    int far_p2 = 6;
 
     s = &ss->lapm;
-    if (frame[2] != FI_GENERAL)
+    if (len < 3 || frame[2] != FI_GENERAL)
         return -1;
     memset(&config, 0, sizeof(config));
     /* Skip the header octets */
@@ -357,12 +413,15 @@ static int receive_xid(v42_state_t *ss, const uint8_t *frame, int len)
                     break;
                 case PI_V42BIS_COMPRESSION_REQUEST:
                     config.comp = pack_value(buf, param_len);
+                    far_p0 = config.comp & 3;
                     break;
                 case PI_V42BIS_NUM_CODEWORDS:
                     config.comp_dict_size = pack_value(buf, param_len);
+                    far_p1 = config.comp_dict_size;
                     break;
                 case PI_V42BIS_MAX_STRING_LENGTH:
                     config.comp_max_string = pack_value(buf, param_len);
+                    far_p2 = config.comp_max_string;
                     break;
                 default:
                     break;
@@ -375,11 +434,31 @@ static int receive_xid(v42_state_t *ss, const uint8_t *frame, int len)
         }
     }
     //v42_update_config(ss, &config);
+
+    /* datamodem: V.42bis 7.2 - the responder answers with the directions both
+       ends want and the smaller of each parameter, and that is what both then
+       use. Upstream discarded the far end's values, answered with its own,
+       and compressed regardless - so a far end that negotiated "no
+       compression", or a smaller dictionary, received data it could not
+       decode. Doing it here suits both roles: as responder, s->config is
+       what the XID response we are about to send carries; as initiator,
+       the response is already the agreement and taking it again changes
+       nothing. */
+    span_log(&ss->logging, SPAN_LOG_FLOW, "XID from the far end: V.42bis P0=%d P1=%d P2=%d\n",
+             far_p0, far_p1, far_p2);
+    ss->config.comp &= far_p0;
+    if (far_p1 < ss->config.comp_dict_size)
+        ss->config.comp_dict_size = far_p1;
+    if (far_p2 < ss->config.comp_max_string)
+        ss->config.comp_max_string = far_p2;
+    span_log(&ss->logging, SPAN_LOG_FLOW, "XID agreed: V.42bis P0=%d P1=%d P2=%d\n",
+             ss->config.comp, ss->config.comp_dict_size, ss->config.comp_max_string);
+    *dm_xid_flag(ss) = 1;
     return 0;
 }
 /*- End of function --------------------------------------------------------*/
 
-static void transmit_xid(v42_state_t *ss, uint8_t addr)
+static void transmit_xid(v42_state_t *ss, uint8_t addr, int pf)
 {
     lapm_state_t *s;
     uint8_t *buf;
@@ -397,7 +476,9 @@ static void transmit_xid(v42_state_t *ss, uint8_t addr)
 
     /* Figure 11/V.42 */
     *buf++ = addr;
-    *buf++ = LAPM_U_XID | LAPM_FRAMETYPE_U;
+    /* datamodem: P set on the command, so the far end knows an answer is
+       wanted, and F on the response mirroring it - as for SABME and UA. */
+    *buf++ = LAPM_U_XID | LAPM_FRAMETYPE_U | pf;
     /* Format identifier subfield */
     *buf++ = FI_GENERAL;
     len += 3;
@@ -706,7 +787,21 @@ static void t401_expired(v42_state_t *ss)
     s->retry_count++;
     if (s->configuring)
     {
-        transmit_xid(ss, s->cmd_addr);
+        /* datamodem: a far end that ignores XID altogether - there are some
+           - would otherwise be asked N400 times and never sent the SABME it
+           is waiting for, and since the LAPM state is still LAPM_IDLE the
+           retry-exhausted path above reports nothing either. Three XIDs a
+           T401 apart, then establish without negotiating: V.42bis is then
+           off, which is what V.42bis says no negotiation means. */
+        if (s->retry_count > 2)
+        {
+            span_log(&ss->logging, SPAN_LOG_FLOW, "No answer to XID; establishing without it\n");
+            s->configuring = FALSE;
+            ss->config.comp = 0;
+            lapm_connect(ss);
+            return;
+        }
+        transmit_xid(ss, s->cmd_addr, LAPM_U_PF);
     }
     else
     {
@@ -785,8 +880,19 @@ static void initiate_negotiation_expired(v42_state_t *s)
        XID out of it. Nothing is lost by skipping the negotiation: spandsp
        never applies the negotiated values anyway, its config fields being
        compile-time constants the XID exchange does not update. */
+    /* datamodem, later: but the XID was right to send - it was only wrong
+       to send nothing else. V.42bis is negotiated in it and nowhere else,
+       and without it compression is off by definition, however both ends
+       were configured; real V.42 modems open with it and some refuse a bare
+       SABME with DM until it has happened. So: XID, and SABME as soon as
+       the response arrives (rx_unnumbered_rsp_frame does that), or after
+       two unanswered XIDs (t401_expired does that). */
     span_log(&s->logging, SPAN_LOG_FLOW, "Start negotiation\n");
-    lapm_connect(s);
+    dm_v42_xid_forget(s);
+    if (dm_v42_no_xid)
+        lapm_connect(s);
+    else
+        lapm_config(s);
     lapm_hdlc_underflow(s);
 }
 /*- End of function --------------------------------------------------------*/
@@ -1098,9 +1204,11 @@ static int rx_unnumbered_cmd_frame(v42_state_t *ss, const uint8_t *frame, int le
         }
         break;
     case LAPM_U_XID:
+        if (dm_v42_no_xid)
+            break;
         /* Exchange general ID info */
         receive_xid(ss, frame, len);
-        transmit_xid(ss, s->rsp_addr);
+        transmit_xid(ss, s->rsp_addr, frame[1] & LAPM_U_PF);
         break;
     case LAPM_U_TEST:
         /* TODO: */
@@ -1362,7 +1470,7 @@ static int lapm_config(v42_state_t *ss)
         s->local_busy = TRUE;
         tx_supervisory_frame(s, s->cmd_addr, LAPM_S_RNR, 1);
     }
-    transmit_xid(ss, s->cmd_addr);
+    transmit_xid(ss, s->cmd_addr, LAPM_U_PF);
     t401_start(ss);
     return 0;
 }
@@ -1717,6 +1825,10 @@ int dm_v42_reconnect(v42_state_t *ss)
     if (ss->lapm.state != LAPM_IDLE)
         return -1;
     dm_v42_disconnect_cause[0] = '\0';
+    /* If the parameters were never agreed, agreeing them may be exactly
+       what the far end is waiting for. */
+    if (!dm_v42_no_xid && !dm_v42_xid_done(ss))
+        return lapm_config(ss);
     return lapm_connect(ss);
 }
 /*- End of function --------------------------------------------------------*/

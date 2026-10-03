@@ -19,9 +19,10 @@
  * Three things about spandsp's V.42 shape this design. It hardcodes the bit
  * rate its timers are derived from, so they have to be corrected or nothing
  * interoperates; its detection window assumes a copper pair and is too short
- * for an audio path with a jitter buffer at each end; and its XID exchange
- * does not actually negotiate the V.42bis dictionary parameters, so both
- * ends have to be configured to agree on them. */
+ * for an audio path with a jitter buffer at each end; and it did not really
+ * negotiate V.42bis in its XID exchange, which the vendored copy now does -
+ * so what --v42bis asks for is an offer, and the link runs whatever the far
+ * end agreed to. */
 #ifndef DATAMODEM_MODEM_H
 #define DATAMODEM_MODEM_H
 

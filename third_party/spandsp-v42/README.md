@@ -119,10 +119,11 @@ Two spandsp ends never notice, because spandsp answers its own XID.
 
 `lapm_connect()` is what was wanted — it sends the SABME, starts T401, and
 sets the state to `LAPM_ESTABLISH` so a failure is at least reported. The
-author had already commented the XID out of it. Nothing is lost by
-skipping the negotiation: spandsp never applies the negotiated values
-anyway, its `config` fields being compile-time constants that the XID
-exchange does not update.
+author had already commented the XID out of it.
+
+**Revised by patch 8:** skipping XID entirely turned out to be wrong too —
+see below. Establishment is now XID, then SABME; and SABME anyway if three
+XIDs go unanswered, which still covers the far end that prompted this.
 
 ### 5. A failed establishment said nothing about why
 
@@ -192,6 +193,37 @@ logged as such rather than vanishing.
 `lapm_receive()` also indexed `frame[1]` before checking that two octets had
 arrived; a zero- or one-octet frame with a passing FCS read off the end of
 the buffer. It now returns early.
+
+### 8. XID is where V.42bis is negotiated, and spandsp ignored it
+
+V.42bis is agreed in the XID exchange and nowhere else; without one,
+compression is off. Upstream's `receive_xid()` parsed the far end's values
+and then discarded them (the call to apply them is commented out), answered
+with its own fixed values — compression in one direction, a 512 codeword
+dictionary, 6-character strings — and compressed both ways regardless. With
+patch 4 no XID was sent at all. Against a real modem that means either a DM
+in answer to a SABME it was not expecting yet, or a link it believes is
+uncompressed carrying compressed data.
+
+Now:
+
+- establishment sends XID (P bit set) carrying what `s->config` holds, which
+  `src/modem.c` loads from `--v42bis`, `--v42bis-dict` and
+  `--v42bis-max-string`; SABME follows the XID response, or follows three
+  unanswered XIDs, in which case compression is off;
+- `receive_xid()` narrows `s->config` to the agreement — the directions both
+  ends want, the smaller dictionary and string length — so a responder
+  answers with the agreed values and an initiator records them;
+  `dm_v42_xid_done()` says whether an exchange happened, and `src/modem.c`
+  sets V.42bis up from the result when the link comes up;
+- an XID response mirrors the command's P bit in F;
+- the group length in the parser was a `uint16_t` checked with `< 0`, so a
+  malformed parameter length walked off the end of the frame. It is an
+  `int`.
+
+`dm_v42_no_xid` (from `DATAMODEM_V42_NO_XID`) makes an end behave like the
+far ends that know nothing of XID — never sending one, ignoring any received
+— so the other end's fallback can be tested.
 
 ### The test hook
 

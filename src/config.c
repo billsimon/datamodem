@@ -107,9 +107,9 @@ static const opt_def_t OPTS[] = {
             "seconds to keep trying to establish V.42 before falling back (default 10)"),
     BOOL_OPT("v42bis", v42bis, "V.42bis compression; needs --v42"),
     INT_OPT("v42bis-dict", v42bis_dict, 512, 4096,
-            "V.42bis dictionary size in codewords (default 2048); both ends must match"),
+            "most V.42bis dictionary to offer, in codewords (default 2048); the far end may take less"),
     INT_OPT("v42bis-max-string", v42bis_max_string, 6, 250,
-            "V.42bis longest dictionary string (default 32); both ends must match"),
+            "longest V.42bis string to offer (default 32); the far end may take less"),
 
     /* Session */
     KEY_OPT("escape-char", escape_char,
@@ -769,9 +769,9 @@ void dm_usage(void)
            "when the far end does not answer it:\n"
            "  --v42 detect     try V.42, fall back to direct async if nobody answers\n"
            "  --v42 require    try V.42, give up on the call if nobody answers\n"
-           "  --v42bis         add compression (needs --v42; both ends must agree on\n"
-           "                   --v42bis-dict and --v42bis-max-string, as V.42 does not\n"
-           "                   actually negotiate them)\n\n");
+           "  --v42bis         offer compression too (needs --v42); the far end may\n"
+           "                   decline it, or take less than --v42bis-dict and\n"
+           "                   --v42bis-max-string offer\n\n");
     printf("Examples:\n"
            "  export DATAMODEM_PASSWORD=...\n"
            "  datamodem +15551234567 --server sip.example.com --username 1001\n\n"

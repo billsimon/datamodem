@@ -321,7 +321,8 @@ CONNECT 300 V.42             # error corrected
 CONNECT 300 V.42/V.42bis     # error corrected and compressed
 ```
 
-`--v42bis` requires `--v42`, and is refused without it. Compression on an
+`--v42bis` requires `--v42`, and is refused without it. It is an offer: the
+far end may take less of it, or none - see below. Compression on an
 uncorrected link is worse than no compression: both ends build a shared
 dictionary as they go, so a single corrupted byte desynchronises them and
 everything after it is garbage rather than one bad character.
@@ -687,23 +688,39 @@ acknowledgement timer is one second — every frame would be abandoned before
 it finished transmitting. V.42 was written for symmetric modems at 1200 bps
 and up; V.23 predates it and the combination never existed.
 
-### Two things spandsp still does not do
+### V.42bis is negotiated, in the XID exchange
 
-**Its XID exchange does not negotiate the V.42bis parameters.** The dictionary
-size and maximum string length it advertises are compile-time constants that
-the handshake never updates, so there is nothing to agree on — **both ends
-must be configured to match**, or the dictionaries diverge and the session
-turns to noise:
+V.42bis has exactly one place where the two ends agree on it: the XID frame
+the calling modem sends before it asks for the link with SABME, and the
+answer that comes back. Whether to compress, in which directions, the
+dictionary size and the longest string all go in it, and V.42bis is clear
+that **without that exchange compression is off**, however either end was
+configured.
+
+spandsp got this wrong in three ways, all fixed in `third_party/spandsp-v42`:
+it threw away the far end's XID and answered with its own fixed values; those
+values were one-direction compression with a 512 codeword dictionary whatever
+`--v42bis` said; and an earlier fix here, to get a bare SABME out to far ends
+that never answered XID, stopped sending XID at all. So two datamodems
+compressed at each other on trust, and a real modem that accepted the link
+had agreed to no compression and received a stream it could not decode -
+while some real modems, waiting for the XID that real modems send, refused
+the SABME outright with DM.
+
+Now the caller sends XID first, offering what `--v42bis`, `--v42bis-dict` and
+`--v42bis-max-string` say; the answer carries the smaller of each and only
+the directions both ends want; and that is what runs:
 
 ```
---v42bis-dict 2048           # codewords, 512-4096
---v42bis-max-string 32       # 6-250
+info [modem] V.42bis agreed: dictionary 1024, strings up to 16, both directions
+warn [modem] the far end declined V.42bis in the XID exchange; error correction only
 ```
 
-The defaults are 2048 and 32, which is what real modems shipped with and
-about three times better than the 512/6 that spandsp's own XID advertises.
-If you are talking to third-party equipment that follows the XID, set
-`--v42bis-dict 512 --v42bis-max-string 6` on our side to match.
+`--v42bis-dict` and `--v42bis-max-string` are therefore ceilings, not
+something both ends have to match (the defaults, 2048 and 32, are what real
+modems shipped with). A far end that never answers XID gets three of them a
+second apart, then a SABME, and an uncompressed link with a warning saying
+why. `--log-level debug` prints both ends' XID values and every LAPM frame.
 
 **Detection traffic is real junk to a far end that is not listening for it.**
 The ODP pattern will show up as perhaps a hundred garbage characters before

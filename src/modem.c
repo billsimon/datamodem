@@ -103,6 +103,8 @@ extern int dm_v42_refuse_sabme;
 extern unsigned dm_v42_fcs_errors;
 extern int dm_v42_adp_no_ec;
 extern int dm_v42_answer_no_ec;
+extern int dm_v42_no_xid;
+extern int dm_v42_xid_done(const v42_state_t *s);
 #endif
 
 /* How long to leave between attempts at establishment. Long enough that a
@@ -214,6 +216,13 @@ struct dm_modem
     bool v42_peer_declined;    /* spandsp's detection gave up on the far end */
     v42_state_t *v42;
     v42bis_state_t *v42bis;
+    /* What the XID exchange agreed, which is what V.42bis actually runs
+     * with - possibly less than was offered, possibly one direction only,
+     * possibly nothing. Until the link is up, the offer. */
+    bool comp_tx;
+    bool comp_rx;
+    int v42bis_dict;
+    int v42bis_max_string;
     bool lapm_up;
     bool v42_fell_back;        /* gave up on V.42 and went back to raw async */
     int v42_timeout_s;
@@ -761,7 +770,7 @@ static int v42_iframe_get(void *user, uint8_t *msg, int max_len)
     if (max_len <= 0)
         return 0;
 
-    if (m->v42bis != NULL)
+    if (m->v42bis != NULL && m->comp_tx)
     {
         if (dm_ring_space(&m->comp_out) >= DM_COMP_HEADROOM)
         {
@@ -800,7 +809,7 @@ static void v42_iframe_put(void *user, const uint8_t *msg, int len)
     if (len <= 0)
         return; /* status codes are reported through here too */
     m->wire_rx += (size_t) len;
-    if (m->v42bis != NULL)
+    if (m->v42bis != NULL && m->comp_rx)
     {
         v42bis_decompress(m->v42bis, msg, len);
         v42bis_decompress_flush(m->v42bis);
@@ -817,7 +826,11 @@ static const char *protocol_name(const dm_modem_t *m)
         return "async";
     if (!m->lapm_up)
         return "negotiating";
-    return (m->v42bis != NULL) ? "V.42/V.42bis" : "V.42";
+    if (m->v42bis == NULL || (!m->comp_tx && !m->comp_rx))
+        return "V.42";
+    if (m->comp_tx && m->comp_rx)
+        return "V.42/V.42bis";
+    return m->comp_tx ? "V.42/V.42bis (sending only)" : "V.42/V.42bis (receiving only)";
 }
 
 /* spandsp measures every V.42 timer in bit periods - the detection timeout
@@ -915,6 +928,83 @@ static bool v42_retry_establishment(dm_modem_t *m, const char *why)
 #endif
 }
 
+/* LAPM is up: make V.42bis whatever the XID exchange agreed, before a byte
+ * has gone through it.
+ *
+ * V.42bis is negotiated there and nowhere else. The far end may take a
+ * smaller dictionary or shorter strings than we offered, compress in one
+ * direction only, or not at all - and if no XID was exchanged at all, V.42bis
+ * says compression is off. Running the compressor on what we merely offered,
+ * as this used to, hands a far end that agreed to less a stream it cannot
+ * decode. Called from v42_status() with the lock held. */
+static void apply_v42bis_agreement(dm_modem_t *m)
+{
+#if defined(DATAMODEM_VENDORED_V42)
+    int p0;
+    int p1;
+    int p2;
+
+    if (m->v42bis == NULL)
+        return;
+    if (!dm_v42_xid_done(m->v42))
+    {
+        m->comp_tx = m->comp_rx = false;
+        DM_WARN("modem", "the far end never answered our XID, so V.42bis was not negotiated and "
+                         "this link runs uncompressed (tag=%s)", m->tag);
+        return;
+    }
+    p0 = m->v42->config.comp & 3;
+    p1 = m->v42->config.comp_dict_size;
+    p2 = m->v42->config.comp_max_string;
+    /* P0 is written from the side of whoever sent the XID command, which is
+     * the calling modem: bit 0 is caller to answerer, bit 1 the reverse. */
+    m->comp_tx = (p0 & (m->calling ? 1 : 2)) != 0;
+    m->comp_rx = (p0 & (m->calling ? 2 : 1)) != 0;
+    if (!m->comp_tx && !m->comp_rx)
+    {
+        DM_WARN("modem", "the far end declined V.42bis in the XID exchange; error correction "
+                         "only (tag=%s)", m->tag);
+        return;
+    }
+    if (p1 != m->v42bis_dict || p2 != m->v42bis_max_string)
+    {
+        v42bis_state_t *agreed;
+
+        if (p1 < V42BIS_MIN_DICTIONARY_SIZE || p1 > V42BIS_MAX_CODEWORDS ||
+            p2 < V42BIS_MIN_STRING_SIZE || p2 > V42BIS_MAX_STRING_SIZE)
+        {
+            m->comp_tx = m->comp_rx = false;
+            DM_WARN("modem", "the far end agreed V.42bis with a dictionary of %d and strings of %d, "
+                             "which V.42bis does not allow; running uncompressed (tag=%s)",
+                    p1, p2, m->tag);
+            return;
+        }
+        agreed = v42bis_init(NULL, V42BIS_P0_BOTH_DIRECTIONS, p1, p2, v42bis_encoded, m,
+                             DM_LAPM_MAX_FRAME, v42bis_decoded, m, V42BIS_MAX_OUTPUT_LENGTH);
+        if (agreed == NULL)
+        {
+            m->comp_tx = m->comp_rx = false;
+            DM_ERROR("modem", "could not set V.42bis up as agreed; running uncompressed (tag=%s)", m->tag);
+            return;
+        }
+        v42bis_compression_control(agreed, V42BIS_COMPRESSION_MODE_DYNAMIC);
+        v42bis_release(m->v42bis);
+        v42bis_free(m->v42bis);
+        m->v42bis = agreed;
+        m->v42bis_dict = p1;
+        m->v42bis_max_string = p2;
+    }
+    DM_INFO("modem", "V.42bis agreed: dictionary %d, strings up to %d, %s (tag=%s)", p1, p2,
+            (m->comp_tx && m->comp_rx) ? "both directions"
+                                       : (m->comp_tx ? "our direction only" : "their direction only"),
+            m->tag);
+#else
+    /* The system libspandsp neither sends XID nor applies one, so there is
+     * no agreement to apply; both ends must simply be configured alike. */
+    m->comp_tx = m->comp_rx = (m->v42bis != NULL);
+#endif
+}
+
 static void v42_status(void *user, int status)
 {
     dm_modem_t *m = user;
@@ -929,6 +1019,7 @@ static void v42_status(void *user, int status)
     case SIG_STATUS_LINK_CONNECTED:
         if (!m->lapm_up)
         {
+            apply_v42bis_agreement(m);
             m->lapm_up = true;
             /* What the parallel framer collected was V.42's own detection
              * pattern, not data. */
@@ -1537,6 +1628,12 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
                                  "a test hook.");
             }
         }
+        if (getenv("DATAMODEM_V42_NO_XID") != NULL)
+        {
+            dm_v42_no_xid = 1;
+            DM_WARN("modem", "DATAMODEM_V42_NO_XID: this end will establish V.42 without an XID "
+                             "exchange. This is a test hook.");
+        }
         if (getenv("DATAMODEM_V42_ANSWER_NO_EC") != NULL)
         {
             dm_v42_answer_no_ec = 1;
@@ -1564,6 +1661,13 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
             return NULL;
         }
         v42_set_status_callback(m->v42, v42_status, m);
+        /* What our XID offers. spandsp's own default is compression in one
+         * direction only, with a 512 codeword dictionary and 6-character
+         * strings, whatever --v42bis says; and with --v42bis off it should
+         * offer none at all. */
+        m->v42->config.comp = params->v42bis ? V42BIS_P0_BOTH_DIRECTIONS : 0;
+        m->v42->config.comp_dict_size = params->v42bis_dict;
+        m->v42->config.comp_max_string = params->v42bis_max_string;
         /* spandsp gives the V.42 context its own logging state and sets it
          * to silent, and there is no accessor to reach it. Without this,
          * every word V.42 has to say about why a negotiation went wrong -
@@ -1595,14 +1699,13 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
                 return NULL;
             }
             v42bis_compression_control(m->v42bis, V42BIS_COMPRESSION_MODE_DYNAMIC);
-
-            /* spandsp's XID exchange carries no compression parameters, so
-             * there is nothing to negotiate these against - both ends have
-             * to be told the same numbers. Worth saying out loud, because
-             * getting it wrong produces garbage rather than a clean failure. */
-            DM_INFO("modem", "V.42bis dictionary %d codewords, max string %d - the far end must be "
-                             "configured to match, as V.42 does not negotiate these",
-                    params->v42bis_dict, params->v42bis_max_string);
+            /* An offer. The XID exchange decides what actually runs - see
+             * apply_v42bis_agreement(). */
+            m->comp_tx = m->comp_rx = true;
+            m->v42bis_dict = params->v42bis_dict;
+            m->v42bis_max_string = params->v42bis_max_string;
+            DM_DEBUG("modem", "offering V.42bis with a dictionary of %d codewords and strings up to %d "
+                              "(tag=%s)", params->v42bis_dict, params->v42bis_max_string, m->tag);
         }
     }
 
