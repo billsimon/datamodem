@@ -68,8 +68,8 @@ typedef struct
     bool user_phone;               /* append ;user=phone to the request URI */
 
     /* Modem */
-    char modulation[16];           /* v22bis | v22 | v21 | bell103 | v23 */
-    int bit_rate;                  /* 2400 | 1200 for V.22bis; ignored elsewhere */
+    char modulation[16];           /* v32 | v22bis | v22 | v21 | bell103 | v23 */
+    int bit_rate;                  /* V.32 9600 | 4800, V.22bis 2400 | 1200, 0 = the most it can do */
     char guard_tone[8];            /* none | 550 | 1800 (V.22bis answerer only) */
     int data_bits;                 /* 5..8 */
     char parity[8];                /* none | even | odd */

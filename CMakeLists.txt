@@ -76,6 +76,7 @@ add_executable(datamodem
   src/sip.c
   src/tty.c
   src/util.c
+  src/v32.c
 )
 
 target_include_directories(datamodem PRIVATE
@@ -129,6 +130,10 @@ target_link_libraries(datamodem PRIVATE
   PkgConfig::SPANDSP
   Threads::Threads
 )
+if(NOT APPLE)
+  # v32.c is our own signal processing, not spandsp's; glibc keeps libm apart.
+  target_link_libraries(datamodem PRIVATE m)
+endif()
 
 if(OPENSSL_FOUND)
   target_link_libraries(datamodem PRIVATE OpenSSL::SSL OpenSSL::Crypto)

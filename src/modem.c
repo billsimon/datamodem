@@ -2,6 +2,7 @@
 #include "datamodem/log.h"
 #include "datamodem/ring.h"
 #include "datamodem/util.h"
+#include "datamodem/v32.h"
 
 #include <inttypes.h>
 #include <pthread.h>
@@ -29,8 +30,14 @@
 /* A dropped carrier is not automatically the end of the call: real lines
  * glitch, and a V.22bis pair will retrain in under two seconds when they do.
  * Only a carrier that stays away this long counts as NO CARRIER. Longer than
- * a retrain takes, shorter than anyone's patience. */
+ * a retrain takes, shorter than anyone's patience.
+ *
+ * V.32 gets longer. Its retrain is the whole start-up procedure again - the
+ * tone exchange, two training sequences each sized to the round trip, and
+ * the rate exchange - which is about four seconds on a 200 ms path and more
+ * on a longer one. */
 #define DM_CARRIER_GRACE_MS 4000
+#define DM_CARRIER_GRACE_V32_MS 12000
 
 /* Staging for compressor output waiting to be packed into LAPM frames.
  * Generous: V.42bis in transparent mode can expand slightly, and a frame is
@@ -147,7 +154,8 @@ typedef enum
     DM_MOD_V22,
     DM_MOD_V21,
     DM_MOD_BELL103,
-    DM_MOD_V23
+    DM_MOD_V23,
+    DM_MOD_V32
 } dm_mod_t;
 
 typedef enum
@@ -167,6 +175,7 @@ struct dm_modem
     bool calling;
     int offered_rate;
     int tx_bit_rate;         /* what we transmit at; V.23 differs by direction */
+    int carrier_grace_ms;
     int guard;
     int data_bits;
     int parity;              /* ASYNC_PARITY_* */
@@ -185,6 +194,7 @@ struct dm_modem
     modem_connect_tones_rx_state_t *tone_rx;
 
     /* Data pumps. Exactly one family is live. */
+    dm_v32_t *v32;
     v22bis_state_t *v22;
     fsk_tx_state_t *fsk_tx;
     fsk_rx_state_t *fsk_rx;
@@ -328,6 +338,8 @@ static bool parse_modulation(const char *s, dm_mod_t *out)
         *out = DM_MOD_BELL103;
     else if (strcasecmp(s, "v23") == 0 || strcasecmp(s, "v.23") == 0)
         *out = DM_MOD_V23;
+    else if (strcasecmp(s, "v32") == 0 || strcasecmp(s, "v.32") == 0)
+        *out = DM_MOD_V32;
     else
         return false;
     return true;
@@ -347,6 +359,8 @@ static const char *modulation_name(dm_mod_t m)
         return "bell103";
     case DM_MOD_V23:
         return "v23";
+    case DM_MOD_V32:
+        return "v32";
     }
     return "?";
 }
@@ -442,6 +456,23 @@ static int ans_tone_type(dm_mod_t mod)
     return (mod == DM_MOD_BELL103) ? MODEM_CONNECT_TONES_BELL_ANS : MODEM_CONNECT_TONES_ANS;
 }
 
+/* What --bit-rate 0, the default, means for each modulation: the most it
+ * can do. */
+static int default_rate(dm_mod_t mod)
+{
+    switch (mod)
+    {
+    case DM_MOD_V32:
+        return 9600;
+    case DM_MOD_V22BIS:
+        return 2400;
+    case DM_MOD_V22:
+        return 1200;
+    default:
+        return 300;
+    }
+}
+
 bool dm_modem_params_check(const dm_modem_params_t *p, char *err, size_t err_len)
 {
     dm_mod_t mod;
@@ -449,7 +480,7 @@ bool dm_modem_params_check(const dm_modem_params_t *p, char *err, size_t err_len
 
     if (!parse_modulation(p->modulation, &mod))
     {
-        snprintf(err, err_len, "unknown modulation '%s'; use v22bis, v22, v21, bell103 or v23",
+        snprintf(err, err_len, "unknown modulation '%s'; use v32, v22bis, v22, v21, bell103 or v23",
                  p->modulation ? p->modulation : "");
         return false;
     }
@@ -463,9 +494,15 @@ bool dm_modem_params_check(const dm_modem_params_t *p, char *err, size_t err_len
         snprintf(err, err_len, "guard tone must be none, 550 or 1800");
         return false;
     }
-    if (mod == DM_MOD_V22BIS && p->bit_rate != 1200 && p->bit_rate != 2400)
+    if (mod == DM_MOD_V22BIS && p->bit_rate != 0 && p->bit_rate != 1200 && p->bit_rate != 2400)
     {
         snprintf(err, err_len, "V.22bis runs at 1200 or 2400 bps, not %d", p->bit_rate);
+        return false;
+    }
+    if (mod == DM_MOD_V32 && p->bit_rate != 0 && p->bit_rate != 4800 && p->bit_rate != 9600)
+    {
+        snprintf(err, err_len, "V.32 runs at 9600 or 4800 bps, not %d (2400 is left for further "
+                               "study by the Recommendation)", p->bit_rate);
         return false;
     }
     if (p->data_bits < 5 || p->data_bits > 8)
@@ -1013,6 +1050,14 @@ static void note_connected(dm_modem_t *m)
         m->tx_bit_rate = m->bit_rate;
         v42_set_bit_rate(m, m->tx_bit_rate);
     }
+    else if (m->v32 != NULL)
+    {
+        /* Likewise V.32, which may have settled on 4800, and a retrain can
+         * change it in either direction. */
+        m->bit_rate = dm_v32_bit_rate(m->v32);
+        m->tx_bit_rate = m->bit_rate;
+        v42_set_bit_rate(m, m->tx_bit_rate);
+    }
 
     if (first)
     {
@@ -1067,6 +1112,8 @@ static void rx_status(void *user, int status)
         m->retrains++;
         if (m->v22 != NULL)
             m->bit_rate = v22bis_get_current_bit_rate(m->v22);
+        else if (m->v32 != NULL)
+            m->bit_rate = dm_v32_bit_rate(m->v32);
         DM_INFO("modem", "retrained at %d bps (tag=%s, %u so far)", m->bit_rate, m->tag, m->retrains);
         /* A link that settled below what we offered and will not hold is the
          * signature of the two ends having disagreed about the rate. V.22bis
@@ -1086,7 +1133,7 @@ static void rx_status(void *user, int status)
             m->carrier_down_ms = dm_now_ms();
             m->phase = DM_PHASE_TRAINING;
             DM_DEBUG("modem", "carrier dropped, allowing %dms for a retrain (tag=%s)",
-                     DM_CARRIER_GRACE_MS, m->tag);
+                     m->carrier_grace_ms, m->tag);
         }
         break;
 
@@ -1130,6 +1177,47 @@ static void rx_put_bit(void *user, int bit)
         async_rx_put_bit(m->arx, bit);
     }
     async_rx_put_bit(m->arx_monitor, bit);
+}
+
+/* V.32 reports its handshake in its own terms; this puts them in the ones
+ * rx_status already understands. Called with the lock held, from inside
+ * dm_v32_tx or dm_v32_rx. */
+static void v32_event(void *user, dm_v32_event_t ev)
+{
+    dm_modem_t *m = user;
+
+    switch (ev)
+    {
+    case DM_V32_TRAINED:
+        /* The first time is a connection; after that, a retrain that came
+         * good - possibly at a different rate. */
+        if (m->connected)
+            rx_status(m, SIG_STATUS_MODEM_RETRAIN_OCCURRED);
+        rx_status(m, SIG_STATUS_TRAINING_SUCCEEDED);
+        break;
+
+    case DM_V32_RETRAINING:
+    case DM_V32_CARRIER_DOWN:
+        /* Either way no data crosses until the retrain completes, and
+         * either way it gets the grace period to do so. */
+        rx_status(m, SIG_STATUS_CARRIER_DOWN);
+        break;
+
+    case DM_V32_TRAINING_FAILED:
+        rx_status(m, SIG_STATUS_TRAINING_FAILED);
+        break;
+
+    case DM_V32_CLEARDOWN:
+        /* The two ends found no rate in common, which no retrain will
+         * change. */
+        if (!m->carrier_lost)
+        {
+            m->carrier_lost = true;
+            m->phase = DM_PHASE_DOWN;
+            DM_ERROR("modem", "the V.32 rate exchange called for a cleardown (tag=%s)", m->tag);
+        }
+        break;
+    }
 }
 
 /* spandsp's V.42 never reports that detection has failed - point it at a far
@@ -1342,6 +1430,8 @@ static void start_pump(dm_modem_t *m, const char *why)
     if (m->pump_started)
         return;
     m->pump_started = true;
+    if (m->v32 != NULL)
+        dm_v32_start(m->v32);
     m->phase = DM_PHASE_TRAINING;
     dm_log_event(DM_LOG_INFO, "modem", "training", "tag=%s modulation=%s role=%s offered_rate=%d why=%s",
                  m->tag, m->mod_name, m->calling ? "originate" : "answer", m->offered_rate, why);
@@ -1373,7 +1463,9 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     m->v14 = params->v14;
     m->tx_power = (float) params->tx_power;
     m->path_delay_ms = params->path_delay_ms;
-    m->offered_rate = (m->mod == DM_MOD_V22) ? 1200 : params->bit_rate;
+    m->offered_rate = (m->mod == DM_MOD_V22 || params->bit_rate == 0) ? default_rate(m->mod)
+                                                                      : params->bit_rate;
+    m->carrier_grace_ms = (m->mod == DM_MOD_V32) ? DM_CARRIER_GRACE_V32_MS : DM_CARRIER_GRACE_MS;
     m->tx_bit_rate = m->offered_rate;
     if (is_fsk(m->mod))
     {
@@ -1528,6 +1620,37 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
         fsk_tx_power(m->fsk_tx, m->tx_power);
         fsk_rx_set_modem_status_handler(m->fsk_rx, rx_status, m);
     }
+    else if (m->mod == DM_MOD_V32)
+    {
+        dm_v32_params_t vp;
+
+        memset(&vp, 0, sizeof(vp));
+        vp.calling = m->calling;
+        vp.max_rate = m->offered_rate;
+        /* Test hook, not an option: every 9600 bit/s V.32 modem has to be
+         * able to fall back to the nonredundant 16-point code (1e), and this
+         * is how that path gets exercised against ourselves. */
+        vp.trellis = (getenv("DATAMODEM_V32_NO_TRELLIS") == NULL);
+        /* Running, silent, through the wait for the answer tone below, so
+         * that it can hear AC from an answering modem that sends none. */
+        vp.listen_first = m->calling && params->answer_wait_s > 0;
+        if (!vp.trellis)
+            DM_WARN("modem", "DATAMODEM_V32_NO_TRELLIS: this end will not offer trellis coding. "
+                             "This is a test hook.");
+        vp.tx_power = m->tx_power;
+        vp.tag = m->tag;
+        vp.get_bit = tx_get_bit;
+        vp.put_bit = rx_put_bit;
+        vp.event = v32_event;
+        vp.user = m;
+        m->v32 = dm_v32_create(&vp);
+        if (m->v32 == NULL)
+        {
+            DM_ERROR("modem", "could not start the %s data pump", m->mod_name);
+            dm_modem_destroy(m);
+            return NULL;
+        }
+    }
     else
     {
         m->v22 = v22bis_init(NULL, m->offered_rate, m->guard, m->calling ? TRUE : FALSE, tx_get_bit, m,
@@ -1567,6 +1690,13 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     }
     m->wait_samples = params->answer_wait_s * DM_SAMPLE_RATE;
     m->ans_tail_samples = params->answer_tail_ms * DM_SAMPLE_RATE / 1000;
+    /* V.32 does not have to sit the answer tone out. 5.4.1 has the caller
+     * start AA once it has heard ANS for a second, and its receiver is
+     * listening for AC at 600 and 3000 Hz, which 2100 Hz cannot be mistaken
+     * for. An answering modem that does V.32 automode (Annex A) listens for
+     * AA during its answer tone and is waiting for it. */
+    if (m->mod == DM_MOD_V32)
+        m->ans_tail_samples = DM_SAMPLE_RATE;
 
     /* The answer tone has to finish before the calling modem starts, and
      * starting early does not work: 2100 Hz sits close enough to the
@@ -1600,7 +1730,11 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     }
     else if (m->answer_tone_samples > 0)
     {
-        m->tone_tx = modem_connect_tones_tx_init(NULL, MODEM_CONNECT_TONES_ANS);
+        /* V.32 has an echo canceller of its own, and the network's would
+         * fight it: the phase reversals every 450 ms are V.25's signal for
+         * echo cancellers along the path to stand aside. */
+        m->tone_tx = modem_connect_tones_tx_init(NULL, (m->mod == DM_MOD_V32) ? MODEM_CONNECT_TONES_ANS_PR
+                                                                              : MODEM_CONNECT_TONES_ANS);
         if (m->tone_tx == NULL)
         {
             DM_ERROR("modem", "could not start the answer tone generator");
@@ -1632,6 +1766,7 @@ void dm_modem_destroy(dm_modem_t *m)
         return;
 
     pthread_mutex_lock(&m->lock);
+    dm_v32_free(m->v32);
     if (m->v22 != NULL)
     {
         v22bis_release(m->v22);
@@ -1780,10 +1915,34 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
         apply_rate_ceiling(m);
     if (m->phase == DM_PHASE_ANSWER_TONE)
     {
-        if (m->tone_tx != NULL)
-            n = modem_connect_tones_tx(m->tone_tx, samples, max_count);
-        if (n < max_count)
-            memset(samples + n, 0, (size_t) (max_count - n) * sizeof(int16_t));
+        if (m->v32 != NULL && m->calling)
+        {
+            /* Silence, unless a calling tone has been asked for - but it
+             * keeps the V.32 receiver's clock running, so that it can hear
+             * AC if the answering modem sends that without an answer tone. */
+            int16_t tone[160];
+            int k = 0;
+
+            dm_v32_tx(m->v32, samples, max_count);
+            while (m->tone_tx != NULL && k < max_count)
+            {
+                int chunk = (max_count - k > 160) ? 160 : max_count - k;
+                int got = modem_connect_tones_tx(m->tone_tx, tone, chunk);
+
+                for (int i = 0; i < got; i++)
+                    samples[k + i] = saturate16((int32_t) samples[k + i] + tone[i]);
+                k += chunk;
+            }
+            if (dm_v32_started(m->v32))
+                start_pump(m, m->answer_tone_seen ? "AC heard" : "AC heard without an answer tone");
+        }
+        else
+        {
+            if (m->tone_tx != NULL)
+                n = modem_connect_tones_tx(m->tone_tx, samples, max_count);
+            if (n < max_count)
+                memset(samples + n, 0, (size_t) (max_count - n) * sizeof(int16_t));
+        }
         n = max_count;
 
         /* Transitions happen on frame boundaries. At 20 ms a frame that is
@@ -1823,7 +1982,7 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
         check_rate_agreement(m);
 
         if (m->carrier_down_ms != 0 && !m->carrier_lost &&
-            dm_now_ms() - m->carrier_down_ms > DM_CARRIER_GRACE_MS)
+            dm_now_ms() - m->carrier_down_ms > m->carrier_grace_ms)
         {
             m->carrier_lost = true;
             m->phase = DM_PHASE_DOWN;
@@ -1832,7 +1991,9 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
                          m->bytes_rx);
         }
 
-        if (m->v22 != NULL)
+        if (m->v32 != NULL)
+            n = dm_v32_tx(m->v32, samples, max_count);
+        else if (m->v22 != NULL)
             n = v22bis_tx(m->v22, samples, max_count);
         else if (m->fsk_tx != NULL)
             n = fsk_tx(m->fsk_tx, samples, max_count);
@@ -1882,6 +2043,8 @@ void dm_modem_rx(dm_modem_t *m, const int16_t *samples, int count)
     }
     if (m->phase == DM_PHASE_ANSWER_TONE && m->calling)
     {
+        if (m->v32 != NULL)
+            dm_v32_rx(m->v32, samples, count);
         if (m->tone_rx != NULL && !m->answer_tone_seen)
         {
             modem_connect_tones_rx(m->tone_rx, samples, count);
@@ -1900,6 +2063,10 @@ void dm_modem_rx(dm_modem_t *m, const int16_t *samples, int count)
                 }
             }
         }
+    }
+    else if (m->v32 != NULL)
+    {
+        dm_v32_rx(m->v32, samples, count);
     }
     else if (m->v22 != NULL)
     {
@@ -1924,7 +2091,9 @@ void dm_modem_rx_missing(dm_modem_t *m, int count)
         pthread_mutex_unlock(&m->lock);
         return;
     }
-    if (m->phase == DM_PHASE_ANSWER_TONE)
+    if (m->v32 != NULL)
+        dm_v32_rx_fillin(m->v32, count); /* its clock runs through the answer tone too */
+    else if (m->phase == DM_PHASE_ANSWER_TONE)
         ; /* nothing useful to fake into a tone detector */
     else if (m->v22 != NULL)
         v22bis_rx_fillin(m->v22, count);
@@ -2005,7 +2174,22 @@ void dm_modem_status(dm_modem_t *m, dm_modem_status_t *out)
     out->wire_tx = m->wire_tx;
     out->wire_rx = m->wire_rx;
     out->retrains = m->retrains;
-    if (m->v22 != NULL)
+    if (m->v32 != NULL)
+    {
+        dm_v32_stats_t vs;
+
+        dm_v32_stats(m->v32, &vs);
+        out->rx_power = vs.rx_power;
+        out->snr_db = vs.snr_db;
+        out->line_trellis = vs.trellis;
+        out->round_trip_ms = vs.round_trip_ms;
+        out->echo_cancelling = vs.echo_canceller;
+        out->echo_delay_ms = vs.echo_delay_ms;
+        out->echo_return_loss_db = vs.echo_return_loss_db;
+        out->echo_cancelled_db = vs.echo_cancelled_db;
+        out->train_stage = vs.stage;
+    }
+    else if (m->v22 != NULL)
         out->rx_power = v22bis_rx_signal_power(m->v22);
     else if (m->fsk_rx != NULL)
         out->rx_power = fsk_rx_signal_power(m->fsk_rx);
@@ -2087,16 +2271,137 @@ int64_t dm_modem_since_rx_ms(dm_modem_t *m)
 #define SELFTEST_MAX_SECONDS 120
 #define SELFTEST_BYTES 512
 
-static void pump_audio(dm_modem_t *from, dm_modem_t *to, int16_t *buf)
-{
-    int n = dm_modem_tx(from, buf, SELFTEST_CHUNK);
+/* The line between the two modems. By default a perfect one - each modem
+ * hears exactly what the other sent, in the same 20 ms frame - which is
+ * what tells a modulation problem from a line problem.
+ *
+ * DATAMODEM_SELFTEST_LINE describes a worse one, for the things a perfect
+ * line cannot exercise: "delay=150,echo=-10,noise=-40,ulaw". delay is one
+ * way, in ms, as two jitter buffers and a network would make it; echo puts
+ * each modem's own signal back into its receiver that many dB down, a whole
+ * round trip later, the way the far end's hybrid does on a call into the
+ * telephone network; noise is white noise in dBm0; ulaw passes everything
+ * through G.711. A test hook, not an option - it is how V.32's echo
+ * canceller and round-trip measurement get tested without a phone line. */
+#define SELFTEST_LINE_MAX (SELFTEST_CHUNK * 128) /* 2.5 s of each direction */
 
-    if (n < SELFTEST_CHUNK)
+typedef struct
+{
+    int delay;                /* one way, samples */
+    int echo_delay;           /* samples */
+    float echo_gain;          /* 0 = no echo */
+    bool ulaw;
+    awgn_state_t *noise;
+    int16_t hist[2][SELFTEST_LINE_MAX];
+    long pos;
+} selftest_line_t;
+
+static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
+{
+    const char *spec = getenv("DATAMODEM_SELFTEST_LINE");
+    char buf[256];
+    char *tok;
+    char *save = NULL;
+    double delay_ms = 0.0;
+    double echo_db = 0.0;
+    double noise_db = 0.0;
+    bool echo = false;
+
+    memset(ln, 0, sizeof(*ln));
+    snprintf(desc, desc_len, "perfect");
+    if (spec == NULL || *spec == '\0')
+        return true;
+
+    snprintf(buf, sizeof(buf), "%s", spec);
+    for (tok = strtok_r(buf, ", ", &save); tok != NULL; tok = strtok_r(NULL, ", ", &save))
     {
-        memset(buf + n, 0, (size_t) (SELFTEST_CHUNK - n) * sizeof(int16_t));
-        n = SELFTEST_CHUNK;
+        if (strncmp(tok, "delay=", 6) == 0)
+            delay_ms = atof(tok + 6);
+        else if (strncmp(tok, "echo=", 5) == 0)
+        {
+            echo_db = atof(tok + 5);
+            echo = true;
+        }
+        else if (strncmp(tok, "noise=", 6) == 0)
+            noise_db = atof(tok + 6);
+        else if (strcmp(tok, "ulaw") == 0)
+            ln->ulaw = true;
+        else
+        {
+            DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise= or ulaw", tok);
+            return false;
+        }
     }
-    dm_modem_rx(to, buf, n);
+    ln->delay = (int) (delay_ms * DM_SAMPLE_RATE / 1000.0);
+    /* Back from the far end's line card: twice the one-way path, plus a
+     * millisecond of local loop. */
+    ln->echo_delay = 2 * ln->delay + DM_SAMPLE_RATE / 1000;
+    if (ln->echo_delay >= SELFTEST_LINE_MAX - SELFTEST_CHUNK)
+    {
+        DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: a %.0f ms delay is longer than the selftest's "
+                             "line can hold", delay_ms);
+        return false;
+    }
+    if (echo)
+        ln->echo_gain = powf(10.0f, (float) echo_db / 20.0f);
+    if (noise_db < 0.0)
+        ln->noise = awgn_init_dbm0(NULL, 1234567, (float) noise_db);
+    snprintf(desc, desc_len, "delay %.0f ms each way, echo %s, noise %s, %s", delay_ms,
+             echo ? "on" : "none", ln->noise ? "on" : "none", ln->ulaw ? "G.711 mu-law" : "linear");
+    if (echo)
+        snprintf(desc + strlen(desc), desc_len - strlen(desc), " (echo %.0f dB, noise %.0f dBm0)",
+                 echo_db, noise_db);
+    return true;
+}
+
+static void selftest_line_free(selftest_line_t *ln)
+{
+    if (ln->noise != NULL)
+        awgn_free(ln->noise);
+}
+
+/* One 20 ms frame each way. Both transmit before either receives, which is
+ * the order pjmedia's conference bridge calls a port in - and V.32 measures
+ * the round trip on the assumption that it is. */
+static void selftest_line_run(selftest_line_t *ln, dm_modem_t *caller, dm_modem_t *answerer)
+{
+    int16_t out[2][SELFTEST_CHUNK];
+    int16_t in[2][SELFTEST_CHUNK];
+    dm_modem_t *end[2] = { caller, answerer };
+
+    for (int e = 0; e < 2; e++)
+    {
+        int n = dm_modem_tx(end[e], out[e], SELFTEST_CHUNK);
+
+        if (n < SELFTEST_CHUNK)
+            memset(out[e] + n, 0, (size_t) (SELFTEST_CHUNK - n) * sizeof(int16_t));
+    }
+    for (int i = 0; i < SELFTEST_CHUNK; i++)
+    {
+        long t = ln->pos + i;
+
+        ln->hist[0][t % SELFTEST_LINE_MAX] = out[0][i];
+        ln->hist[1][t % SELFTEST_LINE_MAX] = out[1][i];
+        for (int e = 0; e < 2; e++)
+        {
+            float x = (t >= ln->delay) ? ln->hist[1 - e][(t - ln->delay) % SELFTEST_LINE_MAX] : 0.0f;
+
+            if (ln->echo_gain > 0.0f && t >= ln->echo_delay)
+                x += ln->echo_gain * ln->hist[e][(t - ln->echo_delay) % SELFTEST_LINE_MAX];
+            if (ln->noise != NULL)
+                x += awgn(ln->noise);
+            if (x > 32767.0f)
+                x = 32767.0f;
+            else if (x < -32768.0f)
+                x = -32768.0f;
+            in[e][i] = (int16_t) lrintf(x);
+            if (ln->ulaw)
+                in[e][i] = ulaw_to_linear(linear_to_ulaw(in[e][i]));
+        }
+    }
+    ln->pos += SELFTEST_CHUNK;
+    dm_modem_rx(answerer, in[1], SELFTEST_CHUNK);
+    dm_modem_rx(caller, in[0], SELFTEST_CHUNK);
 }
 
 static void fill_pattern(unsigned char *p, size_t n, unsigned seed)
@@ -2160,7 +2465,8 @@ int dm_modem_selftest(const dm_config_t *cfg)
     size_t in_queued = 0;
     size_t got_out_len = 0;
     size_t got_in_len = 0;
-    int16_t buf[SELFTEST_CHUNK];
+    static selftest_line_t line;
+    char line_desc[160];
     long iterations = 0;
     const long max_iterations = (long) SELFTEST_MAX_SECONDS * DM_SAMPLE_RATE / SELFTEST_CHUNK;
     long connected_at = -1;
@@ -2169,6 +2475,8 @@ int dm_modem_selftest(const dm_config_t *cfg)
     int rc = DM_EXIT_OK;
     int64_t started;
 
+    if (!selftest_line_init(&line, line_desc, sizeof(line_desc)))
+        return DM_EXIT_CONFIG;
     dm_modem_params_from_config(cfg, true, "selftest-call", &call_params);
     dm_modem_params_from_config(cfg, false, "selftest-answer", &ans_params);
 
@@ -2178,6 +2486,7 @@ int dm_modem_selftest(const dm_config_t *cfg)
     {
         dm_modem_destroy(caller);
         dm_modem_destroy(answerer);
+        selftest_line_free(&line);
         return DM_EXIT_CONFIG;
     }
 
@@ -2191,6 +2500,8 @@ int dm_modem_selftest(const dm_config_t *cfg)
 
     DM_INFO("selftest", "looping two %s modems back to back, %d bytes each way", cfg->modulation,
             SELFTEST_BYTES);
+    if (line.delay > 0 || line.echo_gain > 0.0f || line.noise != NULL || line.ulaw)
+        DM_INFO("selftest", "the line between them: %s", line_desc);
     started = dm_now_real_ms();
 
     while (iterations < max_iterations)
@@ -2201,8 +2512,7 @@ int dm_modem_selftest(const dm_config_t *cfg)
          * the carrier grace period, the idle timeout - behaves here the way
          * it will on a call. */
         dm_clock_advance_ms(SELFTEST_CHUNK * 1000 / DM_SAMPLE_RATE);
-        pump_audio(caller, answerer, buf);
-        pump_audio(answerer, caller, buf);
+        selftest_line_run(&line, caller, answerer);
 
         /* Only start pushing data once both ends have a usable link - which
          * with V.42 means LAPM is up, not merely that a carrier exists. That
@@ -2301,5 +2611,6 @@ int dm_modem_selftest(const dm_config_t *cfg)
 
     dm_modem_destroy(caller);
     dm_modem_destroy(answerer);
+    selftest_line_free(&line);
     return rc;
 }

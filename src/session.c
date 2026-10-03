@@ -303,6 +303,24 @@ static void print_info(dm_session_t *s)
     if (st.retrains)
         dm_tty_message("retrains    %u", st.retrains);
     dm_tty_message("rx level    %.1f dBm0", (double) st.rx_power);
+    if (st.train_stage != NULL)
+    {
+        /* V.32: what its receiver and echo canceller make of the line. */
+        dm_tty_message("coding      %s", st.bit_rate == 9600 ? (st.line_trellis ? "trellis, 32 points"
+                                                                               : "nonredundant, 16 points")
+                                                             : "4 points");
+        dm_tty_message("snr         %.1f dB", (double) st.snr_db);
+        if (st.round_trip_ms >= 0)
+            dm_tty_message("round trip  %d ms", st.round_trip_ms);
+        if (st.echo_cancelling)
+            dm_tty_message("echo        %.1f ms back, %.1f dB down, cancelled a further %.1f dB",
+                           (double) st.echo_delay_ms, (double) st.echo_return_loss_db,
+                           (double) st.echo_cancelled_db);
+        else
+            dm_tty_message("echo        none heard");
+        if (st.phase != DM_PHASE_DATA)
+            dm_tty_message("handshake   %s", st.train_stage);
+    }
     {
         dm_link_quality_t q;
 
@@ -843,7 +861,17 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
         if (cfg->max_retrains > 0 && st.retrains >= (unsigned) cfg->max_retrains)
         {
             dm_tty_message("NO CARRIER");
-            if (st.offered_rate > 0 && st.bit_rate < st.offered_rate)
+            if (st.train_stage != NULL)
+                /* V.32 agrees its rate explicitly, so the ends cannot
+                 * disagree about it the way V.22bis's can; and each retrain
+                 * already picks the rate the line will bear. One that still
+                 * will not hold has a line problem. */
+                DM_ERROR("session",
+                         "the link retrained %u times at %d bps and will not hold (%.1f dB SNR) - "
+                         "the audio path is too poor for V.32. --modulation v22bis or v21 ask far "
+                         "less of it.",
+                         st.retrains, st.bit_rate, (double) st.snr_db);
+            else if (st.offered_rate > 0 && st.bit_rate < st.offered_rate)
                 DM_ERROR("session",
                          "the link retrained %u times and will not hold. It settled at %d bps "
                          "having offered %d, which usually means the two ends disagreed about "
@@ -949,7 +977,7 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
                 DM_WARN("session",
                         "the audio path lost %u%% of its packets - that is a transport problem, "
                         "not a modem one. Check nothing is transcoding away from G.711, and try "
-                        "--modulation v21, which survives a path that V.22bis cannot.",
+                        "--modulation v21, which survives a path that V.32 and V.22bis cannot.",
                         pct);
         }
     }

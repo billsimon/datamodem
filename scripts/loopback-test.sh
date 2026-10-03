@@ -16,7 +16,7 @@ CALL_PORT=${CALL_PORT:-5070}
 ANS_RTP=${ANS_RTP:-4100}
 CALL_RTP=${CALL_RTP:-4200}
 MODULATION=${MODULATION:-v21}
-BITRATE=${BITRATE:-2400}   # only V.22bis looks at this
+BITRATE=${BITRATE:-}       # V.32 and V.22bis; empty means the most the modulation can do
 MESSAGE=${MESSAGE:-"hello from the calling modem"}
 # Extra flags for each end, so the same script can drive the asymmetric
 # cases: V.42 offered by one side only, and so on.
@@ -37,8 +37,11 @@ trap cleanup EXIT
     exit 1
 }
 
-echo "==> in-memory selftest first ($MODULATION at $BITRATE)"
-"$BIN" selftest --modulation "$MODULATION" --bit-rate "$BITRATE"
+RATE_FLAGS=()
+[ -n "$BITRATE" ] && RATE_FLAGS=(--bit-rate "$BITRATE")
+
+echo "==> in-memory selftest first ($MODULATION${BITRATE:+ at $BITRATE})"
+"$BIN" selftest --modulation "$MODULATION" ${RATE_FLAGS[@]+"${RATE_FLAGS[@]}"}
 
 echo "==> starting the answering modem on port $ANS_PORT"
 # The answering side echoes whatever it is sent back at the caller, which is
@@ -50,7 +53,7 @@ echo "==> starting the answering modem on port $ANS_PORT"
     --local-port "$ANS_PORT" \
     --rtp-port "$ANS_RTP" \
     --modulation "$MODULATION" \
-    --bit-rate "$BITRATE" \
+    ${RATE_FLAGS[@]+"${RATE_FLAGS[@]}"} \
     --idle-timeout 20 \
     --max-call 120 \
     --log-file "$WORK/answer.log" \
@@ -72,7 +75,7 @@ printf '%s\r\n' "$MESSAGE" | "$BIN" "sip:ans@127.0.0.1:$ANS_PORT" \
     --local-port "$CALL_PORT" \
     --rtp-port "$CALL_RTP" \
     --modulation "$MODULATION" \
-    --bit-rate "$BITRATE" \
+    ${RATE_FLAGS[@]+"${RATE_FLAGS[@]}"} \
     --idle-timeout 15 \
     --max-call 120 \
     --log-file "$WORK/dial.log" \

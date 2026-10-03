@@ -75,8 +75,10 @@ static const opt_def_t OPTS[] = {
 
     /* Modem */
     STR_OPT("modulation", modulation,
-            "v22bis | v22 | v23 | v21 | bell103 (default v21; v22bis is 2400 bps)"),
-    INT_OPT("bit-rate", bit_rate, 1200, 2400, "V.22bis rate ceiling: 2400 or 1200 (default 2400)"),
+            "v32 | v22bis | v22 | v23 | v21 | bell103 (default v21; v32 is 9600 bps, v22bis 2400)"),
+    INT_OPT("bit-rate", bit_rate, 0, 9600,
+            "rate ceiling: 9600 or 4800 for v32, 2400 or 1200 for v22bis (default 0, the most "
+            "the modulation can do)"),
     STR_OPT("guard-tone", guard_tone,
             "none | 550 | 1800; the answering modem's guard tone (default none)"),
     INT_OPT("data-bits", data_bits, 5, 8, "character length (default 8)"),
@@ -161,7 +163,7 @@ void dm_config_defaults(dm_config_t *cfg)
     cfg->rtp_port_range = 100;
     cfg->jitter_buffer_ms = 150;
 
-    cfg->bit_rate = 2400;
+    cfg->bit_rate = 0;
     cfg->data_bits = 8;
     cfg->stop_bits = 1;
     cfg->v14 = true;
@@ -758,9 +760,10 @@ void dm_usage(void)
     printf("Logs go to stderr so that stdout carries only the remote system's output:\n"
            "  datamodem 5551234 > session.log      keeps a clean transcript\n"
            "  datamodem 5551234 --log-file dm.log  keeps the terminal clean\n\n");
-    printf("Modulations: v22bis (2400), v22 (1200), v23 (1200 down / 75 up), v21 and\n"
-           "bell103 (300). The default is v21 because 300 bps FSK gets through an audio\n"
-           "path that QAM will not; use --modulation v22bis when the line is good.\n\n");
+    printf("Modulations: v32 (9600/4800), v22bis (2400), v22 (1200), v23 (1200 down /\n"
+           "75 up), v21 and bell103 (300). The default is v21 because 300 bps FSK gets\n"
+           "through an audio path that QAM will not; use --modulation v32 or v22bis when\n"
+           "the line is good.\n\n");
     printf("V.42 error correction and V.42bis compression are available on top of any of\n"
            "them, and are off by default because the V.42 handshake puts junk on the line\n"
            "when the far end does not answer it:\n"
@@ -778,6 +781,6 @@ void dm_usage(void)
            "      --v42 detect --v42bis\n\n"
            "  echo -e 'help\\r' | datamodem 5551234 --server sip.example.com --username 1001\n\n"
            "  datamodem answer --server sip.example.com --username 1001 --password ...\n\n"
-           "  datamodem selftest --modulation v22bis --bit-rate 2400\n\n");
+           "  datamodem selftest --modulation v32\n\n");
     print_options();
 }

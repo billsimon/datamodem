@@ -140,12 +140,13 @@ int main(int argc, char *argv[])
     }
     if (cfg.command == DM_CMD_VERSION)
     {
-        printf("datamodem %s (spandsp data pumps over SIP/G.711)\n", DATAMODEM_VERSION);
+        printf("datamodem %s (softmodem data pumps over SIP/G.711)\n", DATAMODEM_VERSION);
         printf("  build      %s, %s\n", DATAMODEM_BUILD_TYPE, DATAMODEM_BUILD_DATE);
         printf("  compiler   %s on %s\n", DATAMODEM_BUILD_COMPILER, DATAMODEM_BUILD_SYSTEM);
         printf("  spandsp    %s\n", DATAMODEM_SPANDSP_VERSION);
         printf("  pjproject  %s\n", DATAMODEM_PJPROJECT_VERSION);
-        printf("  modems     V.22bis 2400/1200, V.22 1200, V.21 300, Bell 103 300, V.23 1200/75\n");
+        printf("  modems     V.32 9600/4800, V.22bis 2400/1200, V.22 1200, V.21 300, Bell 103 300,\n"
+               "             V.23 1200/75\n");
         return DM_EXIT_OK;
     }
 
