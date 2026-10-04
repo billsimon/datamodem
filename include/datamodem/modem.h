@@ -4,7 +4,8 @@
  * spandsp supplies the duplex data modems it implements: V.22bis
  * (2400/1200), V.22 (1200), V.21 and Bell 103 (300), and V.23 (1200/75
  * split). V.32 (9600/4800) and V.32bis (to 14400) are our own - spandsp has
- * neither - and live in v32.c. There is no V.34 or V.90.
+ * neither - and live in v32.c; so is V.34 (to 33600), in v34.c and the
+ * v34_*.c files beside it. There is no V.90.
  *
  * V.22bis needs the sources in third_party/spandsp-v22bis to be built in;
  * the V.22bis in most packaged libspandsp builds trains and then carries
@@ -46,8 +47,9 @@ typedef enum
 typedef struct
 {
     bool calling;              /* true when we placed the call (originate) */
-    const char *modulation;    /* v32bis | v32 | v22bis | v22 | v21 | bell103 | v23 */
-    int bit_rate;              /* V.32bis 14400 | 12000 | 9600 | 7200 | 4800, V.32 9600 | 4800,
+    const char *modulation;    /* v34 | v32bis | v32 | v22bis | v22 | v21 | bell103 | v23 */
+    int bit_rate;              /* V.34 2400 .. 33600 in steps of 2400 (a ceiling),
+                                * V.32bis 14400 | 12000 | 9600 | 7200 | 4800, V.32 9600 | 4800,
                                 * V.22bis 2400 | 1200; 0 = the most it can do */
     const char *guard_tone;    /* none | 550 | 1800 */
     int data_bits;             /* 5..8 */
@@ -73,7 +75,10 @@ typedef struct
     dm_modem_phase_t phase;
     const char *phase_text;
     const char *modulation;    /* what we actually ran */
-    int bit_rate;              /* negotiated rate once trained, else the offered one */
+    int bit_rate;              /* negotiated rate once trained, else the offered one; V.34: receive */
+    int tx_bit_rate;           /* V.34 only: what we transmit at, which may differ */
+    int symbol_rate;           /* V.34 only: the far end's symbol rate, and ours */
+    int tx_symbol_rate;
     int offered_rate;          /* what we asked for; below it means a down-negotiation */
     bool connected;            /* training succeeded at least once */
     bool carrier_lost;         /* carrier came up and then went away */

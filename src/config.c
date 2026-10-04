@@ -75,10 +75,10 @@ static const opt_def_t OPTS[] = {
 
     /* Modem */
     STR_OPT("modulation", modulation,
-            "v32bis | v32 | v22bis | v22 | v23 | v21 | bell103 (default v21; v32bis is 14400 bps, "
-            "v32 9600, v22bis 2400)"),
-    INT_OPT("bit-rate", bit_rate, 0, 14400,
-            "rate ceiling: 14400, 12000, 9600, 7200 or 4800 for v32bis, 9600 or 4800 for v32, 2400 "
+            "v34 | v32bis | v32 | v22bis | v22 | v23 | v21 | bell103 (default v21; v34 is up to 33600 "
+            "bps, v32bis 14400, v32 9600, v22bis 2400)"),
+    INT_OPT("bit-rate", bit_rate, 0, 33600,
+            "rate ceiling: a multiple of 2400 up to 33600 for v34, 14400, 12000, 9600, 7200 or 4800 for v32bis, 9600 or 4800 for v32, 2400 "
             "or 1200 for v22bis (default 0, the most the modulation can do)"),
     STR_OPT("guard-tone", guard_tone,
             "none | 550 | 1800; the answering modem's guard tone (default none)"),

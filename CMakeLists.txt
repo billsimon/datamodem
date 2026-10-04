@@ -77,6 +77,10 @@ add_executable(datamodem
   src/tty.c
   src/util.c
   src/v32.c
+  src/v34.c
+  src/v34_codec.c
+  src/v34_dsp.c
+  src/v34_info.c
 )
 
 target_include_directories(datamodem PRIVATE
@@ -183,6 +187,19 @@ if(APPLE)
     "-framework AudioUnit"
   )
 endif()
+
+# The parts of V.34 that have to agree with the far end bit for bit -
+# framing, shell mapping, the encoder and decoder, INFO and MP - tested on
+# their own. `ctest` or build/v34test.
+enable_testing()
+add_executable(v34test tests/v34_test.c src/v34_codec.c src/v34_info.c src/v34_dsp.c src/log.c src/util.c)
+target_include_directories(v34test PRIVATE src include)
+target_compile_options(v34test PRIVATE -Wall -Wextra -Wno-unused-parameter -Wshadow)
+target_link_libraries(v34test PRIVATE Threads::Threads)
+if(NOT APPLE)
+  target_link_libraries(v34test PRIVATE m)
+endif()
+add_test(NAME v34 COMMAND v34test)
 
 install(TARGETS datamodem RUNTIME DESTINATION bin)
 install(FILES examples/datamodem.conf DESTINATION share/datamodem/examples)

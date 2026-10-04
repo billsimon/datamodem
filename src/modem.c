@@ -3,6 +3,7 @@
 #include "datamodem/ring.h"
 #include "datamodem/util.h"
 #include "datamodem/v32.h"
+#include "datamodem/v34.h"
 
 #include <inttypes.h>
 #include <pthread.h>
@@ -46,6 +47,10 @@
  * on a longer one. */
 #define DM_CARRIER_GRACE_MS 4000
 #define DM_CARRIER_GRACE_V32_MS 12000
+/* V.34's retrain goes back through Phase 2 - tones, probing, two training
+ * sequences sized to the round trip, and the MP exchange - which is longer
+ * again. */
+#define DM_CARRIER_GRACE_V34_MS 15000
 
 /* Staging for compressor output waiting to be packed into LAPM frames.
  * Generous: V.42bis in transparent mode can expand slightly, and a frame is
@@ -167,7 +172,8 @@ typedef enum
     DM_MOD_BELL103,
     DM_MOD_V23,
     DM_MOD_V32,
-    DM_MOD_V32BIS
+    DM_MOD_V32BIS,
+    DM_MOD_V34
 } dm_mod_t;
 
 typedef enum
@@ -207,6 +213,7 @@ struct dm_modem
 
     /* Data pumps. Exactly one family is live. */
     dm_v32_t *v32;
+    dm_v34_t *v34;
     v22bis_state_t *v22;
     fsk_tx_state_t *fsk_tx;
     fsk_rx_state_t *fsk_rx;
@@ -374,6 +381,8 @@ static bool parse_modulation(const char *s, dm_mod_t *out)
         *out = DM_MOD_V32;
     else if (strcasecmp(s, "v32bis") == 0 || strcasecmp(s, "v.32bis") == 0)
         *out = DM_MOD_V32BIS;
+    else if (strcasecmp(s, "v34") == 0 || strcasecmp(s, "v.34") == 0)
+        *out = DM_MOD_V34;
     else
         return false;
     return true;
@@ -397,6 +406,8 @@ static const char *modulation_name(dm_mod_t m)
         return "v32";
     case DM_MOD_V32BIS:
         return "v32bis";
+    case DM_MOD_V34:
+        return "v34";
     }
     return "?";
 }
@@ -504,6 +515,8 @@ static int default_rate(dm_mod_t mod)
 {
     switch (mod)
     {
+    case DM_MOD_V34:
+        return 33600;
     case DM_MOD_V32BIS:
         return 14400;
     case DM_MOD_V32:
@@ -524,7 +537,7 @@ bool dm_modem_params_check(const dm_modem_params_t *p, char *err, size_t err_len
 
     if (!parse_modulation(p->modulation, &mod))
     {
-        snprintf(err, err_len, "unknown modulation '%s'; use v32bis, v32, v22bis, v22, v21, bell103 or v23",
+        snprintf(err, err_len, "unknown modulation '%s'; use v34, v32bis, v32, v22bis, v22, v21, bell103 or v23",
                  p->modulation ? p->modulation : "");
         return false;
     }
@@ -553,6 +566,11 @@ bool dm_modem_params_check(const dm_modem_params_t *p, char *err, size_t err_len
         p->bit_rate != 9600 && p->bit_rate != 12000 && p->bit_rate != 14400)
     {
         snprintf(err, err_len, "V.32bis runs at 14400, 12000, 9600, 7200 or 4800 bps, not %d", p->bit_rate);
+        return false;
+    }
+    if (mod == DM_MOD_V34 && p->bit_rate != 0 && (p->bit_rate < 2400 || p->bit_rate > 33600 || p->bit_rate % 2400))
+    {
+        snprintf(err, err_len, "V.34 runs at multiples of 2400 bps from 2400 to 33600, not %d", p->bit_rate);
         return false;
     }
     if (p->data_bits < 5 || p->data_bits > 8)
@@ -1027,6 +1045,14 @@ static int v42_round_trip_ms(dm_modem_t *m)
         if (vs.round_trip_ms > m->path_delay_ms)
             return vs.round_trip_ms;
     }
+    if (m->v34 != NULL)
+    {
+        dm_v34_stats_t vs;
+
+        dm_v34_stats(m->v34, &vs);
+        if (vs.round_trip_ms > m->path_delay_ms)
+            return vs.round_trip_ms;
+    }
     return m->path_delay_ms;
 }
 
@@ -1341,6 +1367,14 @@ static void note_connected(dm_modem_t *m)
         m->tx_bit_rate = m->bit_rate;
         v42_set_bit_rate(m, m->tx_bit_rate);
     }
+    else if (m->v34 != NULL)
+    {
+        /* V.34's two directions need not run at the same rate. What we
+         * report is what we receive at; V.42's timers go by what we send. */
+        m->bit_rate = dm_v34_rx_rate(m->v34);
+        m->tx_bit_rate = dm_v34_tx_rate(m->v34);
+        v42_set_bit_rate(m, m->tx_bit_rate);
+    }
 
     if (first)
     {
@@ -1397,6 +1431,8 @@ static void rx_status(void *user, int status)
             m->bit_rate = v22bis_get_current_bit_rate(m->v22);
         else if (m->v32 != NULL)
             m->bit_rate = dm_v32_bit_rate(m->v32);
+        else if (m->v34 != NULL)
+            m->bit_rate = dm_v34_rx_rate(m->v34);
         DM_INFO("modem", "retrained at %d bps (tag=%s, %u so far)", m->bit_rate, m->tag, m->retrains);
         /* A link that settled below what we offered and will not hold is the
          * signature of the two ends having disagreed about the rate. V.22bis
@@ -1473,6 +1509,17 @@ static void v32_test_renegotiate(dm_modem_t *m)
                          "(tag=%s)", m->tag);
 }
 
+/* DATAMODEM_V34_RENEGOTIATE: the same, for V.34's 11.6. */
+static void v34_test_renegotiate(dm_modem_t *m)
+{
+    if (m->reneg_after_ms <= 0 || !m->connected || m->carrier_lost ||
+        dm_now_ms() - m->connect_ms < m->reneg_after_ms)
+        return;
+    m->reneg_after_ms = 0;
+    if (!dm_v34_renegotiate(m->v34, m->reneg_rate))
+        DM_WARN("modem", "DATAMODEM_V34_RENEGOTIATE: could not ask - not in data (tag=%s)", m->tag);
+}
+
 /* V.32 reports its handshake in its own terms; this puts them in the ones
  * rx_status already understands. Called with the lock held, from inside
  * dm_v32_tx or dm_v32_rx. */
@@ -1518,6 +1565,48 @@ static void v32_event(void *user, dm_v32_event_t ev)
             m->carrier_lost = true;
             m->phase = DM_PHASE_DOWN;
             DM_ERROR("modem", "the V.32 rate exchange called for a cleardown (tag=%s)", m->tag);
+        }
+        break;
+    }
+}
+
+/* V.34's events in the terms rx_status understands, as for V.32. */
+static void v34_event(void *user, dm_v34_event_t ev)
+{
+    dm_modem_t *m = user;
+
+    switch (ev)
+    {
+    case DM_V34_TRAINED:
+        if (m->connected)
+            rx_status(m, SIG_STATUS_MODEM_RETRAIN_OCCURRED);
+        rx_status(m, SIG_STATUS_TRAINING_SUCCEEDED);
+        break;
+    case DM_V34_RETRAINING:
+    case DM_V34_CARRIER_DOWN:
+        rx_status(m, SIG_STATUS_CARRIER_DOWN);
+        break;
+    case DM_V34_TRAINING_FAILED:
+        rx_status(m, SIG_STATUS_TRAINING_FAILED);
+        break;
+    case DM_V34_RATE_CHANGED:
+        m->bit_rate = dm_v34_rx_rate(m->v34);
+        m->tx_bit_rate = dm_v34_tx_rate(m->v34);
+        m->carrier_down_ms = 0;
+        m->phase = DM_PHASE_DATA;
+        v42_set_bit_rate(m, m->tx_bit_rate);
+        DM_INFO("modem", "rate changed to %d bps in, %d out (tag=%s)", m->bit_rate, m->tx_bit_rate, m->tag);
+        break;
+    case DM_V34_CLEARDOWN:
+    case DM_V34_NOT_V34:
+        if (!m->carrier_lost)
+        {
+            m->carrier_lost = true;
+            m->phase = DM_PHASE_DOWN;
+            DM_ERROR("modem", "%s (tag=%s)",
+                     ev == DM_V34_NOT_V34 ? "the far end does not do V.34 (no V.8 exchange)"
+                                          : "the V.34 connection was cleared down",
+                     m->tag);
         }
         break;
     }
@@ -1768,7 +1857,9 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     m->path_delay_ms = params->path_delay_ms;
     m->offered_rate = (m->mod == DM_MOD_V22 || params->bit_rate == 0) ? default_rate(m->mod)
                                                                       : params->bit_rate;
-    m->carrier_grace_ms = is_v32(m->mod) ? DM_CARRIER_GRACE_V32_MS : DM_CARRIER_GRACE_MS;
+    m->carrier_grace_ms = is_v32(m->mod)             ? DM_CARRIER_GRACE_V32_MS
+                          : (m->mod == DM_MOD_V34) ? DM_CARRIER_GRACE_V34_MS
+                                                   : DM_CARRIER_GRACE_MS;
     m->tx_bit_rate = m->offered_rate;
     if (is_fsk(m->mod))
     {
@@ -2000,6 +2091,66 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
             return NULL;
         }
     }
+    else if (m->mod == DM_MOD_V34)
+    {
+        dm_v34_params_t vp;
+
+        memset(&vp, 0, sizeof(vp));
+        vp.calling = m->calling;
+        vp.max_rate = m->offered_rate;
+        vp.tx_power = m->tx_power;
+        vp.lapm = m->v42_mode != DM_V42_OFF;
+        /* Test hook, not an option: a mask of the symbol rates to allow,
+         * bit 0 2400 ... bit 5 3429, so that each can be exercised. */
+        if (getenv("DATAMODEM_V34_SYMBOL_RATES") != NULL)
+        {
+            vp.symbol_rates = (unsigned) strtoul(getenv("DATAMODEM_V34_SYMBOL_RATES"), NULL, 0);
+            DM_WARN("modem", "DATAMODEM_V34_SYMBOL_RATES=0x%x: only those symbol rates. This is a test hook.",
+                    vp.symbol_rates);
+        }
+        /* Test hooks: "high" or "low", and 0 to 10 - what this end asks the
+         * far end to transmit with, whatever probing says. */
+        vp.pre_emphasis = -1;
+        if (getenv("DATAMODEM_V34_CARRIER") != NULL)
+        {
+            vp.carrier = strcmp(getenv("DATAMODEM_V34_CARRIER"), "high") == 0 ? 2 : 1;
+            DM_WARN("modem", "DATAMODEM_V34_CARRIER: asking for the %s carrier. This is a test hook.",
+                    vp.carrier == 2 ? "high" : "low");
+        }
+        if (getenv("DATAMODEM_V34_PRE_EMPHASIS") != NULL)
+        {
+            vp.pre_emphasis = atoi(getenv("DATAMODEM_V34_PRE_EMPHASIS"));
+            DM_WARN("modem", "DATAMODEM_V34_PRE_EMPHASIS: asking for filter %d. This is a test hook.",
+                    vp.pre_emphasis);
+        }
+        vp.tag = m->tag;
+        vp.get_bit = tx_get_bit;
+        vp.put_bit = rx_put_bit;
+        vp.event = v34_event;
+        {
+            const char *rn = getenv("DATAMODEM_V34_RENEGOTIATE");
+            double secs = 0.0;
+            int rate = 0;
+            char role[16] = "";
+
+            if (rn != NULL && sscanf(rn, "%lf:%d:%15s", &secs, &rate, role) >= 2 && secs > 0.0 &&
+                (strcmp(role, "answer") == 0) == !m->calling)
+            {
+                m->reneg_after_ms = (int) (secs * 1000.0);
+                m->reneg_rate = rate;
+                DM_WARN("modem", "DATAMODEM_V34_RENEGOTIATE: this end will ask for at most %d bps inbound %.1f "
+                                 "seconds into the call. This is a test hook.", rate, secs);
+            }
+        }
+        vp.user = m;
+        m->v34 = dm_v34_create(&vp);
+        if (m->v34 == NULL)
+        {
+            DM_ERROR("modem", "could not start the %s data pump", m->mod_name);
+            dm_modem_destroy(m);
+            return NULL;
+        }
+    }
     else
     {
         m->v22 = v22bis_init(NULL, m->offered_rate, m->guard, m->calling ? TRUE : FALSE, tx_get_bit, m,
@@ -2032,7 +2183,7 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
      * every piece of equipment on the far end expects; the calling end waits
      * to hear one before it bothers training. */
     m->answer_tone_samples = params->answer_tone_ms * DM_SAMPLE_RATE / 1000;
-    if (m->mod == DM_MOD_BELL103)
+    if (m->mod == DM_MOD_BELL103 || m->mod == DM_MOD_V34)
     {
         /* Nothing to send: the answering carrier is the tone. */
         m->answer_tone_samples = 0;
@@ -2065,7 +2216,9 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
      * way a QAM one can - it either sees a carrier or it does not. */
     if (m->calling)
     {
-        if (m->wait_samples > 0 && m->mod != DM_MOD_BELL103)
+        /* V.34's answer tone is V.8's ANSam, and listening for it is the
+         * data pump's own business. */
+        if (m->wait_samples > 0 && m->mod != DM_MOD_BELL103 && m->mod != DM_MOD_V34)
         {
             m->tone_rx = modem_connect_tones_rx_init(NULL, ans_tone_type(m->mod), NULL, NULL);
             if (params->calling_tone)
@@ -2116,6 +2269,7 @@ void dm_modem_destroy(dm_modem_t *m)
 
     pthread_mutex_lock(&m->lock);
     dm_v32_free(m->v32);
+    dm_v34_free(m->v34);
     if (m->v22 != NULL)
     {
         v22bis_release(m->v22);
@@ -2345,6 +2499,11 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
             v32_test_renegotiate(m);
             n = dm_v32_tx(m->v32, samples, max_count);
         }
+        else if (m->v34 != NULL)
+        {
+            v34_test_renegotiate(m);
+            n = dm_v34_tx(m->v34, samples, max_count);
+        }
         else if (m->v22 != NULL)
             n = v22bis_tx(m->v22, samples, max_count);
         else if (m->fsk_tx != NULL)
@@ -2446,6 +2605,10 @@ void dm_modem_rx(dm_modem_t *m, const int16_t *samples, int count)
     {
         dm_v32_rx(m->v32, samples, count);
     }
+    else if (m->v34 != NULL)
+    {
+        dm_v34_rx(m->v34, samples, count);
+    }
     else if (m->v22 != NULL)
     {
         v22bis_rx(m->v22, samples, count);
@@ -2472,6 +2635,8 @@ void dm_modem_rx_missing(dm_modem_t *m, int count)
     }
     if (m->v32 != NULL)
         dm_v32_rx_fillin(m->v32, count); /* its clock runs through the answer tone too */
+    else if (m->v34 != NULL)
+        dm_v34_rx_fillin(m->v34, count);
     else if (m->phase == DM_PHASE_ANSWER_TONE)
         ; /* nothing useful to fake into a tone detector */
     else if (m->v22 != NULL)
@@ -2570,6 +2735,25 @@ void dm_modem_status(dm_modem_t *m, dm_modem_status_t *out)
         out->echo_return_loss_db = vs.echo_return_loss_db;
         out->echo_cancelled_db = vs.echo_cancelled_db;
         out->train_stage = vs.stage;
+    }
+    else if (m->v34 != NULL)
+    {
+        dm_v34_stats_t vs;
+
+        dm_v34_stats(m->v34, &vs);
+        out->rx_power = vs.rx_power;
+        out->snr_db = vs.snr_db;
+        out->line_trellis = true;
+        out->renegotiations = vs.renegotiations;
+        out->round_trip_ms = vs.round_trip_ms;
+        out->echo_cancelling = vs.echo_canceller;
+        out->echo_delay_ms = vs.echo_delay_ms;
+        out->echo_return_loss_db = vs.echo_return_loss_db;
+        out->echo_cancelled_db = vs.echo_cancelled_db;
+        out->train_stage = vs.stage;
+        out->tx_bit_rate = vs.tx_rate;
+        out->symbol_rate = vs.rx_symbol_rate;
+        out->tx_symbol_rate = vs.tx_symbol_rate;
     }
     else if (m->v22 != NULL)
         out->rx_power = v22bis_rx_signal_power(m->v22);
