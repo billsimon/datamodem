@@ -266,6 +266,18 @@ The frame log also showed P/F from the wrong bit for I and S frames - bit 4
 of the control octet, which is the U frame's P/F but part of N(S) or the
 frame type in the others. It now reads the second control octet for those.
 
+### 10. Being busy was a secret
+
+`v42_set_local_busy_status()` only set a flag. The far end, told nothing,
+went on sending; every I-frame that arrived was thrown away unanswered, and
+it found out only by polling after T401 - and when the condition cleared,
+nothing said so until its next poll, and the frames thrown away were
+recovered only by timing out again. Now it sends an RNR on entering the busy
+condition (8.4.7) and, on leaving it, an RR - or a REJ if anything was
+discarded meanwhile (remembered per context, alongside the XID result), so
+that it is sent again at once. `src/modem.c` sets the condition when its
+receive queue is nearly full and clears it once it has drained.
+
 ### The test hook
 
 `dm_v42_refuse_sabme` makes the answering end refuse that many SABMEs with

@@ -25,6 +25,14 @@
 #define DM_TX_QUEUE_MIN 256
 #define DM_RX_QUEUE 65536
 
+/* Under V.42 the receive queue need never overflow: when it is this close to
+ * full, LAPM tells the far end to wait (RNR), and it is let go again once
+ * there is this much room. The gap stops it flapping; what arrives meanwhile
+ * - a decompressed frame at most - is far less than either. Without V.42
+ * there is no way to ask, and the oldest bytes go. */
+#define DM_RX_BUSY_FREE 16384
+#define DM_RX_READY_FREE 32768
+
 #define DM_SAMPLE_RATE 8000
 
 /* A dropped carrier is not automatically the end of the call: real lines
@@ -234,6 +242,7 @@ struct dm_modem
     int v42bis_dict;
     int v42bis_max_string;
     bool lapm_up;
+    bool rx_busy;              /* LAPM told the far end to wait: our receive queue is full */
     bool v42_fell_back;        /* gave up on V.42 and went back to raw async */
     int v42_timeout_s;
     int64_t v42_deadline_ms;   /* 0 until the carrier is up */
@@ -1228,6 +1237,7 @@ static void v42_status(void *user, int status)
         if (m->lapm_up)
         {
             m->lapm_up = false;
+            m->rx_busy = false;
             DM_WARN("modem", "the far end closed the error-corrected link (tag=%s)", m->tag);
         }
         else if (!m->v42_peer_declined && !m->v42_fell_back)
@@ -2370,6 +2380,32 @@ static void fire_wake_locked(dm_modem_t *m)
         m->wake(m->wake_user);
 }
 
+/* Receive flow control under V.42: see DM_RX_BUSY_FREE. Once per audio
+ * frame, on the media thread with the lock held - not from inside LAPM's own
+ * delivery callback, which is where the queue fills. */
+static void rx_flow_control(dm_modem_t *m)
+{
+    size_t free_space;
+
+    if (m->v42 == NULL || !m->lapm_up)
+        return;
+    free_space = dm_ring_space(&m->rx);
+    if (!m->rx_busy && free_space < DM_RX_BUSY_FREE)
+    {
+        m->rx_busy = true;
+        v42_set_local_busy_status(m->v42, TRUE);
+        DM_DEBUG("modem", "receive queue nearly full (%zu bytes free); asking the far end to wait "
+                          "(tag=%s)",
+                 free_space, m->tag);
+    }
+    else if (m->rx_busy && free_space >= DM_RX_READY_FREE)
+    {
+        m->rx_busy = false;
+        v42_set_local_busy_status(m->v42, FALSE);
+        DM_DEBUG("modem", "receive queue drained; letting the far end go on (tag=%s)", m->tag);
+    }
+}
+
 void dm_modem_rx(dm_modem_t *m, const int16_t *samples, int count)
 {
     if (m == NULL || count <= 0)
@@ -2418,6 +2454,7 @@ void dm_modem_rx(dm_modem_t *m, const int16_t *samples, int count)
     {
         fsk_rx(m->fsk_rx, samples, count);
     }
+    rx_flow_control(m);
     fire_wake_locked(m);
     pthread_mutex_unlock(&m->lock);
 }
@@ -2441,6 +2478,7 @@ void dm_modem_rx_missing(dm_modem_t *m, int count)
         v22bis_rx_fillin(m->v22, count);
     else if (m->fsk_rx != NULL)
         fsk_rx_fillin(m->fsk_rx, count);
+    rx_flow_control(m);
     pthread_mutex_unlock(&m->lock);
 }
 
@@ -2841,6 +2879,12 @@ int dm_modem_selftest(const dm_config_t *cfg)
      * a LAPM that threw away every RR it was sent passed this test for as
      * long as it did; one way, like a download, they cannot. */
     size_t nbytes_in;
+    /* DATAMODEM_SELFTEST_STALL=n, a test hook: two seconds after the link
+     * comes up, stop reading what arrives at the answerer for n seconds - a
+     * slow terminal, or the AT prompt - so that the receive queue fills and
+     * V.42 has to hold the far end off rather than lose data. */
+    long stall_from = -1;
+    long stall_until = -1;
     unsigned char *sent_out;
     unsigned char *sent_in;
     unsigned char *got_out;
@@ -2903,6 +2947,10 @@ int dm_modem_selftest(const dm_config_t *cfg)
         dm_modem_destroy(caller);
         dm_modem_destroy(answerer);
         selftest_line_free(&line);
+        free(sent_out);
+        free(sent_in);
+        free(got_out);
+        free(got_in);
         return DM_EXIT_CONFIG;
     }
 
@@ -2979,6 +3027,13 @@ int dm_modem_selftest(const dm_config_t *cfg)
             {
                 dm_modem_status(caller, &cs);
                 connected_at = iterations;
+                if (getenv("DATAMODEM_SELFTEST_STALL") != NULL)
+                {
+                    stall_from = iterations + 2L * DM_SAMPLE_RATE / SELFTEST_CHUNK;
+                    stall_until = stall_from +
+                                  atol(getenv("DATAMODEM_SELFTEST_STALL")) * DM_SAMPLE_RATE / SELFTEST_CHUNK;
+                    max_iterations += stall_until - stall_from;
+                }
                 DM_INFO("selftest", "link up after %.1f simulated seconds (%s)",
                         (double) iterations * SELFTEST_CHUNK / DM_SAMPLE_RATE, cs.protocol);
             }
@@ -2986,7 +3041,11 @@ int dm_modem_selftest(const dm_config_t *cfg)
             in_queued += dm_modem_send(answerer, sent_in + in_queued, nbytes_in - in_queued);
         }
 
-        if (got_out_len < nbytes * 2)
+        if (iterations == stall_from)
+            DM_INFO("selftest", "the answerer stops reading");
+        if (iterations == stall_until)
+            DM_INFO("selftest", "the answerer reads again");
+        if (got_out_len < nbytes * 2 && (iterations < stall_from || iterations >= stall_until))
             got_out_len += dm_modem_recv(answerer, got_out + got_out_len, nbytes * 2 - got_out_len);
         if (got_in_len < nbytes * 2)
             got_in_len += dm_modem_recv(caller, got_in + got_in_len, nbytes * 2 - got_in_len);

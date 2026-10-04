@@ -51,9 +51,11 @@ datamodem version
 ```
 
 Every flag can also come from the environment as `DATAMODEM_<FLAG_IN_CAPS>`,
-or from a `--config` file as `key = value`. Command line wins, then the
-environment, then the file. `datamodem help` lists all of them;
-`examples/datamodem.conf` is a commented starting point.
+or from a `--config` file as `key = value`, where `#` starts a comment -
+at the start of a line, or after a space or tab once there is a value, so
+`escape-char = #` and a password containing `#` mean what they say. Command
+line wins, then the environment, then the file. `datamodem help` lists all
+of them; `examples/datamodem.conf` is a commented starting point.
 
 ```
 export DATAMODEM_PASSWORD=...
@@ -87,6 +89,13 @@ datamodem 5551234 --log-file dm.log    # a clean terminal
 The modem result codes — `CONNECT`, `NO CARRIER`, `OK` — and the `AT`
 conversation are local, not remote, so they follow you: stdout when stdout is
 your terminal, stderr when it has been redirected somewhere.
+
+A slow log cannot hurt the call. Lines from the media and SIP threads are
+queued and written by a thread of their own, so a log that stops accepting
+writes - a terminal over a bad link, a pipe nobody is reading - costs log
+lines (counted, and said so when it recovers) rather than audio. Before
+this, a debug log into a full pipe stalled the modem mid-frame and dropped
+the call.
 
 ### The escape sequence
 
@@ -871,6 +880,16 @@ acknowledges, and T401 runs from the first unacknowledged frame, which
 together put the same transfer at line speed. This was there all along, at
 every rate.
 
+**Received data is not dropped when the terminal falls behind.** The
+receive queue holds 64 KB, which at the AT prompt - where nothing is read -
+or into a slow pipe fills within seconds of a compressed download. Under
+V.42 the far end is now asked to wait when it is nearly full (an RNR) and
+let go once it has drained, and anything it sent meanwhile is asked for
+again, so nothing is lost however long the wait. Upstream's
+`v42_set_local_busy_status()` set the flag and told nobody. Without V.42
+there is no way to ask, and the oldest data still goes, as it would on a
+real modem.
+
 **Detection traffic is real junk to a far end that is not listening for it.**
 The ODP pattern will show up as perhaps a hundred garbage characters before
 the fallback happens. Real modems had the same problem, and it is the reason
@@ -1040,6 +1059,11 @@ DATAMODEM_SELFTEST_BYTES=200000 ./build/datamodem selftest --modulation v32bis
 # cannot ride on I-frames, so LAPM has to get its RRs right
 DATAMODEM_SELFTEST_ONEWAY=1 ./build/datamodem selftest --modulation v32bis --v42 require
 
+# the answerer stops reading for 60 seconds, two seconds in: the receive
+# queue fills, and V.42 has to hold the caller off without losing a byte
+DATAMODEM_SELFTEST_STALL=60 DATAMODEM_SELFTEST_ONEWAY=1 DATAMODEM_SELFTEST_BYTES=200000 \
+    ./build/datamodem selftest --modulation v32bis --v42 require
+
 # V.32bis rate renegotiation, which a clean line never needs: the calling
 # end asks for 9600 five seconds in ("5:9600:answer" for the answering end)
 DATAMODEM_V32_RENEGOTIATE=5:9600 DATAMODEM_SELFTEST_BYTES=50000 \
@@ -1126,7 +1150,8 @@ are actually off while connected and actually back on afterwards, and drives
   detector and the AT interpreter.
 - `ring.c` — the two byte queues across the thread boundary. The transmit
   queue holds about four seconds of line time, and not polling stdin when it
-  is full is the whole of the flow control.
+  is full is the whole of the flow control that way; the other way, the
+  64 KB receive queue holds the far end off through V.42 when it fills.
 - `config.c`, `log.c`, `tty.c`, `util.c` — options, logging, raw mode, and the
   small shared pieces.
 

@@ -3,7 +3,9 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
@@ -15,6 +17,32 @@ static FILE *g_out = NULL;       /* NULL means stderr, resolved at use */
 static bool g_own_out = false;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Writing a line can block - a terminal over a slow link, a pipe nobody is
+ * reading, a disk - and lines come from the pjmedia thread too, holding the
+ * modem's lock in the middle of a 20 ms frame. A stall there is a gap in the
+ * audio. So a line from any thread but the main one is formatted and queued,
+ * and a logger thread writes it out; one from the main thread, which waits
+ * on the terminal anyway, is written at once - after whatever is queued, so
+ * nothing comes out of order. If the queue ever fills, lines are dropped and
+ * counted rather than waited for.
+ *
+ * g_io serialises writing to the sink, and is always taken before g_lock,
+ * which guards the queue and the settings. */
+#define LOG_QUEUE_BYTES (1024 * 1024)
+#define LOG_LINE_MAX 8192
+
+static pthread_mutex_t g_io = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_queued = PTHREAD_COND_INITIALIZER;
+static unsigned char g_queue[LOG_QUEUE_BYTES];
+static size_t g_q_head;
+static size_t g_q_len;
+static unsigned long g_q_dropped;
+static pthread_t g_main;
+static bool g_have_main = false;
+static pthread_t g_writer;
+static bool g_writer_running = false;
+static bool g_writer_stop = false;
+
 static const char *const LEVEL_NAMES[] = {"error", "warn", "info", "debug", "trace"};
 
 static FILE *sink(void)
@@ -25,6 +53,11 @@ static FILE *sink(void)
 void dm_log_init(dm_log_level_t level, bool json)
 {
     pthread_mutex_lock(&g_lock);
+    if (!g_have_main)
+    {
+        g_main = pthread_self();
+        g_have_main = true;
+    }
     g_level = level;
     g_json = json;
     /* Line buffering keeps ordering sane when the log is a pipe or a file
@@ -42,28 +75,158 @@ bool dm_log_set_file(const char *path, char *err, size_t err_len)
         snprintf(err, err_len, "cannot open log file '%s': %s", path, strerror(errno));
         return false;
     }
-    setvbuf(f, NULL, _IOLBF, 0);
+    setvbuf(f, NULL, _IOFBF, 0);
 
+    pthread_mutex_lock(&g_io);
     pthread_mutex_lock(&g_lock);
     if (g_own_out && g_out != NULL)
         fclose(g_out);
     g_out = f;
     g_own_out = true;
     pthread_mutex_unlock(&g_lock);
+    pthread_mutex_unlock(&g_io);
     return true;
+}
+
+/* ------------------------------------------------------------ the queue */
+
+/* Callers hold g_lock. */
+static void q_copy_in(const void *src, size_t n)
+{
+    size_t tail = (g_q_head + g_q_len) % LOG_QUEUE_BYTES;
+    size_t first = LOG_QUEUE_BYTES - tail;
+
+    if (first > n)
+        first = n;
+    memcpy(g_queue + tail, src, first);
+    memcpy(g_queue, (const unsigned char *) src + first, n - first);
+    g_q_len += n;
+}
+
+static void q_copy_out(void *dst, size_t n)
+{
+    size_t first = LOG_QUEUE_BYTES - g_q_head;
+
+    if (first > n)
+        first = n;
+    memcpy(dst, g_queue + g_q_head, first);
+    memcpy((unsigned char *) dst + first, g_queue, n - first);
+    g_q_head = (g_q_head + n) % LOG_QUEUE_BYTES;
+    g_q_len -= n;
+}
+
+/* A record is its length, then the line. Callers hold g_lock. */
+static bool q_push(const char *line, size_t len)
+{
+    uint32_t n = (uint32_t) len;
+
+    if (g_q_len + sizeof(n) + len > LOG_QUEUE_BYTES)
+    {
+        g_q_dropped++;
+        return false;
+    }
+    q_copy_in(&n, sizeof(n));
+    q_copy_in(line, len);
+    return true;
+}
+
+static size_t q_pop(char *out)
+{
+    uint32_t n;
+
+    if (g_q_len == 0)
+        return 0;
+    q_copy_out(&n, sizeof(n));
+    q_copy_out(out, n);
+    return n;
+}
+
+/* Everything queued, written out. Callers hold g_io, and not g_lock. */
+static void drain_locked_io(FILE *f)
+{
+    static char line[LOG_LINE_MAX + 64];
+    unsigned long dropped;
+
+    for (;;)
+    {
+        size_t n;
+
+        pthread_mutex_lock(&g_lock);
+        n = q_pop(line);
+        dropped = g_q_dropped;
+        g_q_dropped = 0;
+        pthread_mutex_unlock(&g_lock);
+        if (dropped > 0)
+            fprintf(f, "\r(%lu log lines dropped: the log could not keep up)\n", dropped);
+        if (n == 0)
+            break;
+        fwrite(line, 1, n, f);
+    }
+}
+
+static void *writer_main(void *arg)
+{
+    (void) arg;
+    for (;;)
+    {
+        bool stop;
+
+        pthread_mutex_lock(&g_lock);
+        while (g_q_len == 0 && g_q_dropped == 0 && !g_writer_stop)
+            pthread_cond_wait(&g_queued, &g_lock);
+        stop = g_writer_stop && g_q_len == 0;
+        pthread_mutex_unlock(&g_lock);
+        if (stop)
+            break;
+
+        pthread_mutex_lock(&g_io);
+        drain_locked_io(sink());
+        fflush(sink());
+        pthread_mutex_unlock(&g_io);
+    }
+    return NULL;
+}
+
+/* Everything queued so far, written out now: at exit, and before anything
+ * that is about to make the log's last words matter. */
+static void log_flush(void)
+{
+    pthread_mutex_lock(&g_io);
+    drain_locked_io(sink());
+    fflush(sink());
+    pthread_mutex_unlock(&g_io);
 }
 
 void dm_log_close(void)
 {
+    bool join;
+
     pthread_mutex_lock(&g_lock);
+    join = g_writer_running;
+    g_writer_stop = true;
+    pthread_cond_signal(&g_queued);
+    pthread_mutex_unlock(&g_lock);
+    if (join)
+        pthread_join(g_writer, NULL);
+
+    pthread_mutex_lock(&g_io);
+    drain_locked_io(sink());
+    pthread_mutex_lock(&g_lock);
+    g_writer_running = false;
+    g_writer_stop = false;
     if (g_own_out && g_out != NULL)
     {
         fflush(g_out);
         fclose(g_out);
     }
+    else
+    {
+        fflush(sink());
+    }
     g_out = NULL;
     g_own_out = false;
     pthread_mutex_unlock(&g_lock);
+    pthread_mutex_unlock(&g_io);
 }
 
 /* The session prints CONNECT/OK/NO CARRIER on stdout. When the diagnostics
@@ -172,15 +335,16 @@ static void rtrim(char *s)
 static void emit(dm_log_level_t level, const char *component, const char *event, const char *msg)
 {
     char ts[40];
-    FILE *f;
+    /* Per thread rather than on the stack, which in pjsip's threads is not
+     * ours to size. */
+    static __thread char line[LOG_LINE_MAX];
+    int n;
 
     if (!dm_log_enabled(level))
         return;
 
     timestamp(ts, sizeof(ts));
 
-    pthread_mutex_lock(&g_lock);
-    f = sink();
     if (g_json)
     {
         char emsg[4096];
@@ -191,13 +355,14 @@ static void emit(dm_log_level_t level, const char *component, const char *event,
         if (event != NULL)
         {
             json_escape(event, eevent, sizeof(eevent));
-            fprintf(f, "{\"ts\":\"%s\",\"level\":\"%s\",\"component\":\"%s\",\"event\":\"%s\",\"msg\":\"%s\"}\n",
-                    ts, dm_log_level_name(level), ecomp, eevent, emsg);
+            n = snprintf(line, sizeof(line),
+                         "{\"ts\":\"%s\",\"level\":\"%s\",\"component\":\"%s\",\"event\":\"%s\",\"msg\":\"%s\"}\n",
+                         ts, dm_log_level_name(level), ecomp, eevent, emsg);
         }
         else
         {
-            fprintf(f, "{\"ts\":\"%s\",\"level\":\"%s\",\"component\":\"%s\",\"msg\":\"%s\"}\n", ts,
-                    dm_log_level_name(level), ecomp, emsg);
+            n = snprintf(line, sizeof(line), "{\"ts\":\"%s\",\"level\":\"%s\",\"component\":\"%s\",\"msg\":\"%s\"}\n",
+                         ts, dm_log_level_name(level), ecomp, emsg);
         }
     }
     else
@@ -205,11 +370,53 @@ static void emit(dm_log_level_t level, const char *component, const char *event,
         /* A leading CR because the terminal may be in raw mode with a partial
          * line of remote output on it; without it the log line starts wherever
          * the cursor happened to be. Harmless in a file. */
-        fprintf(f, "\r%s %-5s [%s] %s\n", ts, dm_log_level_name(level),
-                component ? component : "datamodem", msg);
+        n = snprintf(line, sizeof(line), "\r%s %-5s [%s] %s\n", ts, dm_log_level_name(level),
+                     component ? component : "datamodem", msg);
     }
-    fflush(f);
+    if (n < 0)
+        return;
+    if ((size_t) n >= sizeof(line))
+    {
+        n = (int) sizeof(line) - 1;
+        line[n - 1] = '\n';
+    }
+
+    if (!g_have_main || pthread_equal(pthread_self(), g_main))
+    {
+        FILE *f;
+
+        pthread_mutex_lock(&g_io);
+        f = sink();
+        drain_locked_io(f);
+        fwrite(line, 1, (size_t) n, f);
+        fflush(f);
+        pthread_mutex_unlock(&g_io);
+        return;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    if (!g_writer_running && !g_writer_stop)
+    {
+        if (pthread_create(&g_writer, NULL, writer_main, NULL) == 0)
+        {
+            g_writer_running = true;
+            atexit(log_flush);
+        }
+    }
+    if (g_writer_running)
+    {
+        q_push(line, (size_t) n);
+        pthread_cond_signal(&g_queued);
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
     pthread_mutex_unlock(&g_lock);
+
+    /* No thread to hand it to: write it ourselves, as before. */
+    pthread_mutex_lock(&g_io);
+    fwrite(line, 1, (size_t) n, sink());
+    fflush(sink());
+    pthread_mutex_unlock(&g_io);
 }
 
 void dm_logf(dm_log_level_t level, const char *component, const char *fmt, ...)

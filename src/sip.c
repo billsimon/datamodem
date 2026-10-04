@@ -45,6 +45,14 @@ typedef struct
     int64_t last_rx_change_ms;
 } dm_call_t;
 
+/* Threads. pjsua calls the on_* callbacks on its own worker threads, while
+ * the main thread places, waits on and clears the call; everything both of
+ * them touch - the registration result, the inbound hand-off, g.active and
+ * the fields of the call it points to - is under g.lock. Two rules keep that
+ * deadlock-free whatever locks pjsua holds when it calls us: no pjsua
+ * function is called with g.lock held, and a call context is only freed
+ * after g.active stops pointing at it, under the lock, so a callback that
+ * finds its context still active holds it alive until it lets go. */
 static struct
 {
     bool started;
@@ -69,11 +77,58 @@ static pj_str_t pjs(const char *s)
     return r;
 }
 
-static void signal_change(void)
+/* The main thread is waiting in dm_sip_wait_ms() for something to change.
+ * Callers hold g.lock. */
+static void signal_change_locked(void)
 {
-    pthread_mutex_lock(&g.lock);
     pthread_cond_broadcast(&g.cond);
+}
+
+/* The context of a pjsua call, locked, if it is still the call we are
+ * running - or NULL, unlocked, if it is not: not ours, or already cleared. */
+static dm_call_t *call_lock(pjsua_call_id call_id)
+{
+    dm_call_t *c = pjsua_call_get_user_data(call_id);
+
+    pthread_mutex_lock(&g.lock);
+    if (c == NULL || c != g.active)
+    {
+        pthread_mutex_unlock(&g.lock);
+        return NULL;
+    }
+    return c;
+}
+
+static void call_unlock(void)
+{
     pthread_mutex_unlock(&g.lock);
+}
+
+/* The main thread's view of the call, all at once. */
+typedef struct
+{
+    bool exists;
+    bool media_active;
+    bool answered;
+    bool disconnected;
+    pjsua_call_id call_id;
+} call_view_t;
+
+static call_view_t call_view(void)
+{
+    call_view_t v = { false, false, false, false, PJSUA_INVALID_ID };
+
+    pthread_mutex_lock(&g.lock);
+    if (g.active != NULL)
+    {
+        v.exists = true;
+        v.media_active = g.active->media_active;
+        v.answered = g.active->answered;
+        v.disconnected = g.active->disconnected;
+        v.call_id = g.active->call_id;
+    }
+    pthread_mutex_unlock(&g.lock);
+    return v;
 }
 
 void dm_sip_wait_ms(int ms)
@@ -206,10 +261,16 @@ static dm_call_t *call_create(dm_modem_t *modem, bool inbound)
     return c;
 }
 
+/* The caller has already taken c out of g.active, under the lock. */
 static void call_destroy(dm_call_t *c)
 {
     if (c == NULL)
         return;
+    /* pjsua may still hold the call - a BYE that was never answered - and
+     * would hand this pointer to the next callback. */
+    if (c->call_id != PJSUA_INVALID_ID && pjsua_call_is_active(c->call_id) &&
+        pjsua_call_get_user_data(c->call_id) == c)
+        pjsua_call_set_user_data(c->call_id, NULL);
     if (c->slot != PJSUA_INVALID_ID)
         pjsua_conf_remove_port(c->slot);
     if (c->pool != NULL)
@@ -235,7 +296,7 @@ static void arm_if_ready(dm_call_t *c)
 
 static void on_call_state(pjsua_call_id call_id, pjsip_event *e)
 {
-    dm_call_t *c = pjsua_call_get_user_data(call_id);
+    dm_call_t *c;
     pjsua_call_info ci;
 
     (void) e;
@@ -245,6 +306,7 @@ static void on_call_state(pjsua_call_id call_id, pjsip_event *e)
     DM_INFO("sip", "call %d state %.*s (%d %.*s)", (int) call_id, (int) ci.state_text.slen,
             ci.state_text.ptr, ci.last_status, (int) ci.last_status_text.slen, ci.last_status_text.ptr);
 
+    c = call_lock(call_id);
     if (c == NULL)
         return;
 
@@ -258,33 +320,44 @@ static void on_call_state(pjsua_call_id call_id, pjsip_event *e)
         c->answered = true;
         arm_if_ready(c);
     }
-
     if (ci.state == PJSIP_INV_STATE_DISCONNECTED)
-    {
         c->disconnected = true;
-        pjsua_call_set_user_data(call_id, NULL);
-    }
-    signal_change();
+    signal_change_locked();
+    call_unlock();
 }
 
 static void on_call_media_state(pjsua_call_id call_id)
 {
-    dm_call_t *c = pjsua_call_get_user_data(call_id);
+    dm_call_t *c;
     pjsua_call_info ci;
+    pjsua_conf_port_id slot;
 
-    if (c == NULL || pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS)
+    if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS)
         return;
 
     if (ci.media_status == PJSUA_CALL_MEDIA_ACTIVE)
     {
         pjmedia_transport_info tp_info;
 
-        pjsua_conf_connect(ci.conf_slot, c->slot);
-        pjsua_conf_connect(c->slot, ci.conf_slot);
+        c = call_lock(call_id);
+        if (c == NULL)
+            return;
+        slot = c->slot;
+        call_unlock();
+
+        /* Not under the lock: see the comment on g. */
+        pjsua_conf_connect(ci.conf_slot, slot);
+        pjsua_conf_connect(slot, ci.conf_slot);
+
+        c = call_lock(call_id);
+        if (c == NULL)
+            return;
         c->media_active = true;
         /* The RTP watchdog only starts counting once there is media to wait for. */
         c->last_rx_change_ms = dm_now_ms();
         arm_if_ready(c);
+        signal_change_locked();
+        call_unlock();
 
         pjmedia_transport_info_init(&tp_info);
         if (pjsua_call_get_med_transport_info(call_id, 0, &tp_info) == PJ_SUCCESS)
@@ -297,7 +370,6 @@ static void on_call_media_state(pjsua_call_id call_id)
         {
             DM_INFO("sip", "media active on call %d, modem attached", (int) call_id);
         }
-        signal_change();
     }
     else
     {
@@ -310,6 +382,7 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     pjsua_call_info ci;
     pjsua_call_setting answer_cfg;
     dm_call_t *c;
+    dm_modem_t *modem;
     char from[200];
 
     (void) acc_id;
@@ -322,34 +395,48 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     }
     snprintf(from, sizeof(from), "%.*s", (int) ci.remote_info.slen, ci.remote_info.ptr);
 
+    /* Claim the modem, under the lock, so that dm_sip_answer() giving up
+     * and this call arriving cannot both have it. */
+    pthread_mutex_lock(&g.lock);
     if (!g.inbound_enabled || g.pending_modem == NULL)
     {
+        pthread_mutex_unlock(&g.lock);
         DM_INFO("sip", "rejecting inbound call from %s: not accepting calls", from);
         pjsua_call_hangup(call_id, PJSIP_SC_NOT_ACCEPTABLE_HERE, NULL, NULL);
         return;
     }
     if (g.active != NULL)
     {
+        pthread_mutex_unlock(&g.lock);
         DM_WARN("sip", "rejecting inbound call from %s: another call is in progress", from);
         pjsua_call_hangup(call_id, PJSIP_SC_BUSY_HERE, NULL, NULL);
         return;
     }
+    modem = g.pending_modem;
+    g.pending_modem = NULL;
+    g.inbound_enabled = false; /* one call per run */
+    pthread_mutex_unlock(&g.lock);
 
     DM_INFO("sip", "inbound call %d from %s, answering", (int) call_id, from);
 
-    c = call_create(g.pending_modem, true);
+    c = call_create(modem, true);
     if (c == NULL)
     {
         DM_ERROR("sip", "could not attach the modem, rejecting call %d", (int) call_id);
         pjsua_call_hangup(call_id, PJSIP_SC_INTERNAL_SERVER_ERROR, NULL, NULL);
+        pthread_mutex_lock(&g.lock);
+        g.pending_modem = modem;
+        g.inbound_enabled = true;
+        pthread_mutex_unlock(&g.lock);
         return;
     }
     c->call_id = call_id;
     snprintf(c->remote_uri, sizeof(c->remote_uri), "%s", from);
-    g.active = c;
-    g.pending_modem = NULL;
-    g.inbound_enabled = false; /* one call per run */
+    /* Before it is active, so no callback can find it half set up. */
     pjsua_call_set_user_data(call_id, c);
+    pthread_mutex_lock(&g.lock);
+    g.active = c;
+    pthread_mutex_unlock(&g.lock);
 
     modem_call_setting(&answer_cfg);
     pjsua_call_answer2(call_id, &answer_cfg, 180, NULL, NULL);
@@ -357,9 +444,14 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     /* We just sent the 200; there is no ringback to mistake for a carrier on
      * an inbound call. on_call_state will confirm, but do not make the modem
      * wait for it. */
-    c->answered = true;
-    arm_if_ready(c);
-    signal_change();
+    c = call_lock(call_id);
+    if (c != NULL)
+    {
+        c->answered = true;
+        arm_if_ready(c);
+        signal_change_locked();
+        call_unlock();
+    }
 }
 
 /* pjmedia adds a telephone-event (RFC 2833) payload to every audio stream at
@@ -416,21 +508,34 @@ static void on_reg_state2(pjsua_acc_id acc_id, pjsua_reg_info *info)
 {
     struct pjsip_regc_cbparam *rp = info->cbparam;
 
-    (void) acc_id;
-    g.reg_done = true;
-    g.reg_ok = (rp->code / 100 == 2) && rp->expiration > 0;
+    bool ok = (rp->code / 100 == 2) && rp->expiration > 0;
 
-    if (g.reg_ok)
+    (void) acc_id;
+    pthread_mutex_lock(&g.lock);
+    g.reg_done = true;
+    g.reg_ok = ok;
+    signal_change_locked();
+    pthread_mutex_unlock(&g.lock);
+
+    if (ok)
         DM_INFO("sip", "registered as %s (expires in %ds)", g.cfg.username, (int) rp->expiration);
     else if (rp->code / 100 == 2)
         DM_INFO("sip", "unregistered (%d)", rp->code);
     else
         DM_ERROR("sip", "registration failed: %d %.*s", rp->code, (int) rp->reason.slen, rp->reason.ptr);
-
-    signal_change();
 }
 
 /* ------------------------------------------------------------------ setup */
+
+static bool reg_finished(void)
+{
+    bool done;
+
+    pthread_mutex_lock(&g.lock);
+    done = g.reg_done;
+    pthread_mutex_unlock(&g.lock);
+    return done;
+}
 
 static int pjsip_level_for(const dm_config_t *cfg)
 {
@@ -695,29 +800,44 @@ int dm_sip_start(const dm_config_t *cfg)
     DM_INFO("sip", "registering %s at %s", id_uri, cfg->server);
     {
         int64_t deadline = dm_now_ms() + (int64_t) cfg->reg_timeout_s * 1000;
-        while (!g.reg_done && dm_now_ms() < deadline)
+
+        while (!reg_finished() && dm_now_ms() < deadline)
             dm_sip_wait_ms(200);
     }
-    if (!g.reg_done)
+    if (!reg_finished())
     {
         DM_ERROR("sip", "no answer to REGISTER within %ds", cfg->reg_timeout_s);
         return DM_EXIT_SIP;
     }
-    if (!g.reg_ok)
-        return DM_EXIT_SIP;
-    return DM_EXIT_OK;
+    {
+        bool ok;
+
+        pthread_mutex_lock(&g.lock);
+        ok = g.reg_ok;
+        pthread_mutex_unlock(&g.lock);
+        return ok ? DM_EXIT_OK : DM_EXIT_SIP;
+    }
 }
 
 void dm_sip_stop(void)
 {
+    dm_call_t *c;
+    bool hang_up;
+
     if (!g.started)
         return;
-    if (g.active != NULL)
+    pthread_mutex_lock(&g.lock);
+    c = g.active;
+    g.active = NULL;
+    g.pending_modem = NULL;
+    g.inbound_enabled = false;
+    hang_up = (c != NULL && c->call_id != PJSUA_INVALID_ID && !c->disconnected);
+    pthread_mutex_unlock(&g.lock);
+    if (c != NULL)
     {
-        if (g.active->call_id != PJSUA_INVALID_ID && !g.active->disconnected)
-            pjsua_call_hangup(g.active->call_id, 0, NULL, NULL);
-        call_destroy(g.active);
-        g.active = NULL;
+        if (hang_up)
+            pjsua_call_hangup(c->call_id, 0, NULL, NULL);
+        call_destroy(c);
     }
     if (g.acc_id != PJSUA_INVALID_ID && g.cfg.do_register)
         pjsua_acc_set_registration(g.acc_id, PJ_FALSE);
@@ -782,7 +902,7 @@ int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem)
     pj_status_t status;
     int64_t deadline;
 
-    if (g.active != NULL)
+    if (call_view().exists)
     {
         DM_ERROR("dial", "another call is already in progress");
         return DM_EXIT_INTERNAL;
@@ -799,7 +919,9 @@ int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem)
     if (c == NULL)
         return DM_EXIT_INTERNAL;
     snprintf(c->remote_uri, sizeof(c->remote_uri), "%s", uri);
+    pthread_mutex_lock(&g.lock);
     g.active = c;
+    pthread_mutex_unlock(&g.lock);
 
     modem_call_setting(&call_cfg);
 
@@ -818,37 +940,56 @@ int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem)
     dst = pjs(uri);
     DM_INFO("dial", "calling %s", uri);
 
+    /* pjsua takes c as the call's user data here, and its callbacks can run
+     * before this returns; they find c through it, and it is already
+     * active. */
     status = pjsua_call_make_call(g.acc_id, &dst, &call_cfg, c, &msg_data, &call_id);
     if (status != PJ_SUCCESS)
     {
         log_pj_error("pjsua_call_make_call", status);
+        pthread_mutex_lock(&g.lock);
         g.active = NULL;
+        pthread_mutex_unlock(&g.lock);
         call_destroy(c);
         return DM_EXIT_CALL;
     }
+    pthread_mutex_lock(&g.lock);
     c->call_id = call_id;
+    pthread_mutex_unlock(&g.lock);
 
     deadline = dm_now_ms() + (int64_t) cfg->connect_timeout_s * 1000;
-    while (!c->disconnected && !(c->media_active && c->answered) && dm_now_ms() < deadline)
-        dm_sip_wait_ms(100);
-
-    if (c->media_active && c->answered)
-        return DM_EXIT_OK;
-
-    if (!c->disconnected)
+    for (;;)
     {
-        DM_ERROR("dial", "no answer within %ds", cfg->connect_timeout_s);
-        pjsua_call_hangup(call_id, PJSIP_SC_REQUEST_TIMEOUT, NULL, NULL);
+        call_view_t v = call_view();
+
+        if (v.media_active && v.answered)
+            return DM_EXIT_OK;
+        if (v.disconnected)
         {
-            int64_t grace = dm_now_ms() + DM_HANGUP_GRACE_MS;
-            while (!c->disconnected && dm_now_ms() < grace)
-                dm_sip_wait_ms(100);
+            int status_code;
+            char reason[sizeof(c->last_reason)];
+
+            pthread_mutex_lock(&g.lock);
+            status_code = c->last_status;
+            snprintf(reason, sizeof(reason), "%s", c->last_reason);
+            pthread_mutex_unlock(&g.lock);
+            DM_ERROR("dial", "call failed: %d %s", status_code, reason);
+            return DM_EXIT_CALL;
         }
-        return DM_EXIT_TIMEOUT;
+        if (dm_now_ms() >= deadline)
+            break;
+        dm_sip_wait_ms(100);
     }
 
-    DM_ERROR("dial", "call failed: %d %s", c->last_status, c->last_reason);
-    return DM_EXIT_CALL;
+    DM_ERROR("dial", "no answer within %ds", cfg->connect_timeout_s);
+    pjsua_call_hangup(call_id, PJSIP_SC_REQUEST_TIMEOUT, NULL, NULL);
+    {
+        int64_t grace = dm_now_ms() + DM_HANGUP_GRACE_MS;
+
+        while (!call_view().disconnected && dm_now_ms() < grace)
+            dm_sip_wait_ms(100);
+    }
+    return DM_EXIT_TIMEOUT;
 }
 
 /* --------------------------------------------------------------- inbound  */
@@ -859,47 +1000,70 @@ int dm_sip_answer(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomic
                            ? dm_now_ms() + (int64_t) cfg->answer_timeout_s * 1000
                            : 0;
 
+    pthread_mutex_lock(&g.lock);
     if (g.active != NULL)
     {
+        pthread_mutex_unlock(&g.lock);
         DM_ERROR("answer", "another call is already in progress");
         return DM_EXIT_INTERNAL;
     }
-
     g.pending_modem = modem;
     g.inbound_enabled = true;
+    pthread_mutex_unlock(&g.lock);
     DM_INFO("answer", "waiting for an inbound call%s", deadline ? "" : " (ctrl-c to stop)");
 
     while (*stop == 0)
     {
-        dm_call_t *c = g.active;
+        dm_call_t *gone = NULL;
+        int status_code = 0;
+        char reason[128] = "";
+        bool up = false;
 
-        if (c != NULL)
+        pthread_mutex_lock(&g.lock);
+        if (g.active != NULL)
         {
-            if (c->media_active && c->answered)
-                return DM_EXIT_OK;
-            if (c->disconnected)
+            if (g.active->media_active && g.active->answered)
             {
-                DM_ERROR("answer", "the caller hung up before media came up (%d %s)", c->last_status,
-                         c->last_reason);
-                call_destroy(c);
+                up = true;
+            }
+            else if (g.active->disconnected)
+            {
+                gone = g.active;
+                status_code = gone->last_status;
+                snprintf(reason, sizeof(reason), "%s", gone->last_reason);
                 g.active = NULL;
                 g.pending_modem = modem;
                 g.inbound_enabled = true;
-                continue;
             }
+        }
+        pthread_mutex_unlock(&g.lock);
+
+        if (up)
+            return DM_EXIT_OK;
+        if (gone != NULL)
+        {
+            DM_ERROR("answer", "the caller hung up before media came up (%d %s)", status_code, reason);
+            call_destroy(gone);
+            continue;
         }
         if (deadline != 0 && dm_now_ms() > deadline)
         {
+            /* A call claimed in the same instant is left for
+             * dm_sip_hangup() and dm_sip_stop() to clear. */
+            pthread_mutex_lock(&g.lock);
             g.inbound_enabled = false;
             g.pending_modem = NULL;
+            pthread_mutex_unlock(&g.lock);
             DM_ERROR("answer", "no call arrived within %ds", cfg->answer_timeout_s);
             return DM_EXIT_TIMEOUT;
         }
         dm_sip_wait_ms(200);
     }
 
+    pthread_mutex_lock(&g.lock);
     g.inbound_enabled = false;
     g.pending_modem = NULL;
+    pthread_mutex_unlock(&g.lock);
     return DM_EXIT_CALL;
 }
 
@@ -907,37 +1071,46 @@ int dm_sip_answer(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomic
 
 bool dm_sip_call_ended(void)
 {
-    return g.active == NULL || g.active->disconnected;
+    call_view_t v = call_view();
+
+    return !v.exists || v.disconnected;
 }
 
 int64_t dm_sip_since_rtp_ms(void)
 {
-    dm_call_t *c = g.active;
+    call_view_t v = call_view();
     pjsua_stream_stat stat;
     int64_t now = dm_now_ms();
+    int64_t since = -1;
 
-    if (c == NULL || !c->media_active || c->disconnected)
+    if (!v.exists || !v.media_active || v.disconnected || v.call_id == PJSUA_INVALID_ID)
         return -1;
-    if (pjsua_call_get_stream_stat(c->call_id, 0, &stat) != PJ_SUCCESS)
+    if (pjsua_call_get_stream_stat(v.call_id, 0, &stat) != PJ_SUCCESS)
         return -1;
 
-    if (stat.rtcp.rx.pkt != c->last_rx_pkts)
+    pthread_mutex_lock(&g.lock);
+    if (g.active != NULL)
     {
-        c->last_rx_pkts = stat.rtcp.rx.pkt;
-        c->last_rx_change_ms = now;
+        if (stat.rtcp.rx.pkt != g.active->last_rx_pkts)
+        {
+            g.active->last_rx_pkts = stat.rtcp.rx.pkt;
+            g.active->last_rx_change_ms = now;
+        }
+        since = now - g.active->last_rx_change_ms;
     }
-    return now - c->last_rx_change_ms;
+    pthread_mutex_unlock(&g.lock);
+    return since;
 }
 
 bool dm_sip_link_quality(dm_link_quality_t *q)
 {
-    dm_call_t *c = g.active;
+    call_view_t v = call_view();
     pjsua_stream_stat stat;
 
     memset(q, 0, sizeof(*q));
-    if (c == NULL || !c->media_active || c->call_id == PJSUA_INVALID_ID)
+    if (!v.exists || !v.media_active || v.call_id == PJSUA_INVALID_ID)
         return false;
-    if (pjsua_call_get_stream_stat(c->call_id, 0, &stat) != PJ_SUCCESS)
+    if (pjsua_call_get_stream_stat(v.call_id, 0, &stat) != PJ_SUCCESS)
         return false;
 
     q->rx_packets = stat.rtcp.rx.pkt;
@@ -952,25 +1125,30 @@ bool dm_sip_link_quality(dm_link_quality_t *q)
 
 void dm_sip_hangup(dm_call_result_t *result)
 {
-    dm_call_t *c = g.active;
+    call_view_t v = call_view();
+    dm_call_t *c;
 
     if (result != NULL)
         memset(result, 0, sizeof(*result));
-    if (c == NULL)
+    if (!v.exists)
         return;
 
-    if (!c->disconnected && c->call_id != PJSUA_INVALID_ID)
+    if (!v.disconnected && v.call_id != PJSUA_INVALID_ID)
     {
         int64_t grace;
 
-        DM_INFO("sip", "clearing call %d", (int) c->call_id);
-        pjsua_call_hangup(c->call_id, PJSIP_SC_OK, NULL, NULL);
+        DM_INFO("sip", "clearing call %d", (int) v.call_id);
+        pjsua_call_hangup(v.call_id, PJSIP_SC_OK, NULL, NULL);
         grace = dm_now_ms() + DM_HANGUP_GRACE_MS;
-        while (!c->disconnected && dm_now_ms() < grace)
+        while (!call_view().disconnected && dm_now_ms() < grace)
             dm_sip_wait_ms(100);
     }
 
-    if (result != NULL)
+    /* Out of g.active first: from here no callback will touch it. */
+    pthread_mutex_lock(&g.lock);
+    c = g.active;
+    g.active = NULL;
+    if (c != NULL && result != NULL)
     {
         result->connected = c->media_active;
         result->sip_status = c->last_status;
@@ -979,7 +1157,6 @@ void dm_sip_hangup(dm_call_result_t *result)
         result->duration_ms =
             (int) (dm_now_ms() - (c->answered_ms ? c->answered_ms : c->started_ms));
     }
-
-    g.active = NULL;
+    pthread_mutex_unlock(&g.lock);
     call_destroy(c);
 }

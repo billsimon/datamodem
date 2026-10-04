@@ -278,6 +278,7 @@ static struct
     const v42_state_t *s;
     int done;
     int t401_ms;
+    int busy_discarded;     /* I-frames thrown away while we were busy (patch 10) */
 } dm_xid[DM_XID_SLOTS];
 
 /* datamodem: test hook. When set, this end behaves like the far ends that
@@ -302,6 +303,7 @@ static int dm_xid_slot(const v42_state_t *s)
     dm_xid[free_slot].s = s;
     dm_xid[free_slot].done = 0;
     dm_xid[free_slot].t401_ms = 0;
+    dm_xid[free_slot].busy_discarded = 0;
     return free_slot;
 }
 
@@ -1106,6 +1108,9 @@ static void receive_information_frame(v42_state_t *ss, const uint8_t *frame, int
         /* 8.4.7 */
         if ((frame[2] & 0x1))
             tx_supervisory_frame(s, s->rsp_addr, LAPM_S_RNR, 1);
+        /* datamodem: remembered, so that leaving the busy condition asks
+           for it again - see v42_set_local_busy_status(). */
+        dm_xid[dm_xid_slot(ss)].busy_discarded = 1;
         return;
     }
     /* NS sequence error */
@@ -1944,10 +1949,38 @@ SPAN_DECLARE(int) v42_tx_bit(void *user_data)
 
 SPAN_DECLARE(int) v42_set_local_busy_status(v42_state_t *s, int busy)
 {
+    lapm_state_t *l = &s->lapm;
     int previous_busy;
+    int slot = dm_xid_slot(s);
 
-    previous_busy = s->lapm.local_busy;
-    s->lapm.local_busy = busy;
+    busy = (busy)  ?  TRUE  :  FALSE;
+    previous_busy = l->local_busy;
+    l->local_busy = busy;
+    /* datamodem: and tell the far end (8.4.7). Upstream only set the flag, so
+       the far end went on sending, every I-frame was thrown away unanswered,
+       and it found out only by polling after T401 - and then, when the
+       condition cleared, nothing said so until its next poll, and the frames
+       thrown away were recovered only by timing out again. Now an RNR goes
+       out on entering the busy condition, and on leaving it an RR - or a REJ
+       if anything was discarded meanwhile, so that it is sent again at
+       once. */
+    if (l->state == LAPM_DATA  &&  busy != previous_busy)
+    {
+        if (busy)
+        {
+            tx_supervisory_frame(l, l->rsp_addr, LAPM_S_RNR, 0);
+        }
+        else if (dm_xid[slot].busy_discarded)
+        {
+            tx_supervisory_frame(l, l->rsp_addr, LAPM_S_REJ, 0);
+            l->rejected = TRUE;
+        }
+        else
+        {
+            tx_supervisory_frame(l, l->rsp_addr, LAPM_S_RR, 0);
+        }
+        dm_xid[slot].busy_discarded = 0;
+    }
     return previous_busy;
 }
 /*- End of function --------------------------------------------------------*/

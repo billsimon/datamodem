@@ -375,6 +375,24 @@ static char *trim(char *s)
     return s;
 }
 
+/* "media-timeout = 20   # seconds": a # after whitespace, with something
+ * already in front of it, starts a comment. Only then - so that
+ * `escape-char = #` and a password like `abc#123` still mean what they say. */
+static void strip_comment(char *value)
+{
+    if (*value == '\0')
+        return;
+    for (char *p = value + 1; *p != '\0'; p++)
+    {
+        if (*p == '#' && (p[-1] == ' ' || p[-1] == '\t'))
+        {
+            *p = '\0';
+            trim(value);
+            return;
+        }
+    }
+}
+
 bool dm_config_apply_file(dm_config_t *cfg, const char *path, char *err, size_t err_len)
 {
     FILE *f = fopen(path, "r");
@@ -406,6 +424,7 @@ bool dm_config_apply_file(dm_config_t *cfg, const char *path, char *err, size_t 
         }
         *eq = '\0';
         value = trim(eq + 1);
+        strip_comment(value);
         key = trim(key);
         /* Tolerate leading dashes so a config file can be copy-pasted flags. */
         while (*key == '-')
