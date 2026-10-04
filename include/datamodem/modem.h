@@ -3,8 +3,8 @@
  *
  * spandsp supplies the duplex data modems it implements: V.22bis
  * (2400/1200), V.22 (1200), V.21 and Bell 103 (300), and V.23 (1200/75
- * split). V.32 (9600/4800) is our own - spandsp has none - and lives in
- * v32.c. There is no V.34 or V.90.
+ * split). V.32 (9600/4800) and V.32bis (to 14400) are our own - spandsp has
+ * neither - and live in v32.c. There is no V.34 or V.90.
  *
  * V.22bis needs the sources in third_party/spandsp-v22bis to be built in;
  * the V.22bis in most packaged libspandsp builds trains and then carries
@@ -46,8 +46,9 @@ typedef enum
 typedef struct
 {
     bool calling;              /* true when we placed the call (originate) */
-    const char *modulation;    /* v32 | v22bis | v22 | v21 | bell103 | v23 */
-    int bit_rate;              /* V.32 9600 | 4800, V.22bis 2400 | 1200; 0 = the most it can do */
+    const char *modulation;    /* v32bis | v32 | v22bis | v22 | v21 | bell103 | v23 */
+    int bit_rate;              /* V.32bis 14400 | 12000 | 9600 | 7200 | 4800, V.32 9600 | 4800,
+                                * V.22bis 2400 | 1200; 0 = the most it can do */
     const char *guard_tone;    /* none | 550 | 1800 */
     int data_bits;             /* 5..8 */
     const char *parity;        /* none | even | odd */
@@ -97,10 +98,12 @@ typedef struct
     unsigned retrains;
     float rx_power;            /* received signal level, dBm0 */
 
-    /* V.32 only; train_stage is NULL for everything else. */
+    /* V.32 and V.32bis only; train_stage is NULL for everything else. */
     const char *train_stage;   /* where the handshake is */
     float snr_db;              /* the receiver's own estimate */
-    bool line_trellis;         /* 9600 is trellis coded */
+    bool line_trellis;         /* the rate in use is trellis coded */
+    bool line_v32bis;          /* both ends are V.32bis; false when the far end is only V.32 */
+    unsigned renegotiations;   /* V.32bis rate changes without a retrain */
     int round_trip_ms;         /* measured during start-up, -1 if not yet */
     bool echo_cancelling;      /* an echo of our own signal was found and is being removed */
     float echo_delay_ms;

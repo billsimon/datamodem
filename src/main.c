@@ -145,8 +145,8 @@ int main(int argc, char *argv[])
         printf("  compiler   %s on %s\n", DATAMODEM_BUILD_COMPILER, DATAMODEM_BUILD_SYSTEM);
         printf("  spandsp    %s\n", DATAMODEM_SPANDSP_VERSION);
         printf("  pjproject  %s\n", DATAMODEM_PJPROJECT_VERSION);
-        printf("  modems     V.32 9600/4800, V.22bis 2400/1200, V.22 1200, V.21 300, Bell 103 300,\n"
-               "             V.23 1200/75\n");
+        printf("  modems     V.32bis 14400-4800, V.32 9600/4800, V.22bis 2400/1200, V.22 1200,\n"
+               "             V.21 300, Bell 103 300, V.23 1200/75\n");
         return DM_EXIT_OK;
     }
 

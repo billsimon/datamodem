@@ -305,10 +305,33 @@ static void print_info(dm_session_t *s)
     dm_tty_message("rx level    %.1f dBm0", (double) st.rx_power);
     if (st.train_stage != NULL)
     {
-        /* V.32: what its receiver and echo canceller make of the line. */
-        dm_tty_message("coding      %s", st.bit_rate == 9600 ? (st.line_trellis ? "trellis, 32 points"
-                                                                               : "nonredundant, 16 points")
-                                                             : "4 points");
+        /* V.32 and V.32bis: what the receiver and echo canceller make of
+         * the line. */
+        const char *coding = "4 points";
+
+        switch (st.bit_rate)
+        {
+        case 14400:
+            coding = "trellis, 128 points";
+            break;
+        case 12000:
+            coding = "trellis, 64 points";
+            break;
+        case 9600:
+            coding = st.line_trellis ? "trellis, 32 points" : "nonredundant, 16 points";
+            break;
+        case 7200:
+            coding = "trellis, 16 points";
+            break;
+        default:
+            break;
+        }
+        dm_tty_message("coding      %s%s", coding,
+                       (strcmp(st.modulation, "v32bis") == 0 && !st.line_v32bis && st.bit_rate > 0)
+                           ? " (the far end is V.32, not V.32bis)"
+                           : "");
+        if (st.renegotiations)
+            dm_tty_message("rate changes %u, without retraining", st.renegotiations);
         dm_tty_message("snr         %.1f dB", (double) st.snr_db);
         if (st.round_trip_ms >= 0)
             dm_tty_message("round trip  %d ms", st.round_trip_ms);
@@ -868,9 +891,10 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
                  * will not hold has a line problem. */
                 DM_ERROR("session",
                          "the link retrained %u times at %d bps and will not hold (%.1f dB SNR) - "
-                         "the audio path is too poor for V.32. --modulation v22bis or v21 ask far "
+                         "the audio path is too poor for %s. --modulation v22bis or v21 ask far "
                          "less of it.",
-                         st.retrains, st.bit_rate, (double) st.snr_db);
+                         st.retrains, st.bit_rate, (double) st.snr_db,
+                         strcmp(st.modulation, "v32bis") == 0 ? "V.32bis" : "V.32");
             else if (st.offered_rate > 0 && st.bit_rate < st.offered_rate)
                 DM_ERROR("session",
                          "the link retrained %u times and will not hold. It settled at %d bps "

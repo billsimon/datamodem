@@ -1,6 +1,17 @@
-/* ITU-T V.32 (03/93): 9600 and 4800 bit/s duplex, by echo cancellation.
+/* ITU-T V.32 (03/93): 9600 and 4800 bit/s duplex, by echo cancellation, and
+ * ITU-T V.32 bis (02/91), which adds 14 400, 12 000 and 7200 bit/s and a way
+ * of changing rate without retraining.
  *
- * Section and table numbers in the comments are the Recommendation's.
+ * Section and table numbers in the comments are V.32's unless they say "bis".
+ * The two share almost everything: the line signal, the scramblers, the
+ * start-up and retrain procedures, the trellis code (Figure 1/V.32 bis is
+ * Figure 2/V.32) and the 9600 bit/s constellation (Figure 2-3/V.32 bis is
+ * Figure 3/V.32, point for point). V.32 bis differs in the rate signal's
+ * meaning (Table 5/V.32 bis), in three more constellations, and in the rate
+ * renegotiation procedure of its section 8. Which rules a call runs under is
+ * settled by the rate signals: a V.32 bis modem marks its own with B4 and B8
+ * both set, and the moment either end's lacks them, both work to V.32 (Table
+ * 5/V.32 bis, Note 1).
  *
  * The signal path, transmit side:
  *
@@ -92,6 +103,7 @@ typedef float complex cf_t;
 #define EC_MU_FAST 0.5f
 #define EC_MU_SETTLED 0.03f
 #define EC_MU_SLOW 0.002f
+#define EC_MU_FLOOR 0.0002f
 
 /* Timeouts are kept in receive samples. */
 #define SECONDS(s) ((long long) ((s) * 8000.0))
@@ -134,13 +146,56 @@ static const int8_t MAP32[32][2] = {
     { -1, -4 }, {  3,  0 }, { -1,  0 }, { -1,  4 },
 };
 
+/* V.32 bis Figures 2-4, 2-2 and 2-1: 7200, 12 000 and 14 400 bit/s, indexed
+ * by Y0 Y1 Y2 Q3 ... with Y0 the most significant bit, as MAP32 is. These are
+ * in half units - Figure 2-1 needs them - so A, B, C and D sit at (-6, -2)
+ * and its rotations here, where the figures put them, and every constellation
+ * comes out with the same mean energy as the others to within 0.2 dB. Points
+ * checked against the figures; the same constellations are V.17's, and these
+ * agree with spandsp's tables for it. */
+static const int8_t MAP16T[16][2] = {
+    {  6, -6 }, { -2,  2 }, { -6,  6 }, {  2, -2 }, {  6,  2 }, { -2, -6 }, { -6, -2 }, {  2,  6 },
+    { -2,  6 }, {  6, -2 }, {  2, -6 }, { -6,  2 }, { -6, -6 }, {  2,  2 }, {  6,  6 }, { -2, -2 },
+};
+
+static const int8_t MAP64[64][2] = {
+    {  7,  1 }, {  3,  5 }, {  7, -7 }, { -5,  5 }, {  3, -3 }, { -1,  1 }, { -1, -7 }, { -5, -3 },
+    { -7, -1 }, { -3, -5 }, { -7,  7 }, {  5, -5 }, { -3,  3 }, {  1, -1 }, {  1,  7 }, {  5,  3 },
+    { -1,  5 }, { -5,  1 }, {  7,  5 }, { -5, -7 }, {  3,  1 }, { -1, -3 }, {  7, -3 }, {  3, -7 },
+    {  1, -5 }, {  5, -1 }, { -7, -5 }, {  5,  7 }, { -3, -1 }, {  1,  3 }, { -7,  3 }, { -3,  7 },
+    { -5, -1 }, { -1, -5 }, { -5,  7 }, {  7, -5 }, { -1,  3 }, {  3, -1 }, {  3,  7 }, {  7,  3 },
+    {  5,  1 }, {  1,  5 }, {  5, -7 }, { -7,  5 }, {  1, -3 }, { -3,  1 }, { -3, -7 }, { -7, -3 },
+    {  1, -7 }, {  5, -3 }, { -7, -7 }, {  5,  5 }, { -3, -3 }, {  1,  1 }, { -7,  1 }, { -3,  5 },
+    { -1,  7 }, { -5,  3 }, {  7,  7 }, { -5, -5 }, {  3,  3 }, { -1, -1 }, {  7, -1 }, {  3, -5 },
+};
+
+static const int8_t MAP128[128][2] = {
+    { -8, -3 }, {  8, -3 }, {  4, -3 }, {  4, -7 }, { -4, -3 }, { -4, -7 }, {  0, -3 }, {  0, -7 },
+    { -8,  1 }, {  8,  1 }, {  4,  1 }, {  4,  5 }, { -4,  1 }, { -4,  5 }, {  0,  1 }, {  0,  5 },
+    {  8,  3 }, { -8,  3 }, { -4,  3 }, { -4,  7 }, {  4,  3 }, {  4,  7 }, {  0,  3 }, {  0,  7 },
+    {  8, -1 }, { -8, -1 }, { -4, -1 }, { -4, -5 }, {  4, -1 }, {  4, -5 }, {  0, -1 }, {  0, -5 },
+    {  2, -9 }, {  2,  7 }, {  2,  3 }, {  6,  3 }, {  2, -5 }, {  6, -5 }, {  2, -1 }, {  6, -1 },
+    { -2, -9 }, { -2,  7 }, { -2,  3 }, { -6,  3 }, { -2, -5 }, { -6, -5 }, { -2, -1 }, { -6, -1 },
+    { -2,  9 }, { -2, -7 }, { -2, -3 }, { -6, -3 }, { -2,  5 }, { -6,  5 }, { -2,  1 }, { -6,  1 },
+    {  2,  9 }, {  2, -7 }, {  2, -3 }, {  6, -3 }, {  2,  5 }, {  6,  5 }, {  2,  1 }, {  6,  1 },
+    {  9,  2 }, { -7,  2 }, { -3,  2 }, { -3,  6 }, {  5,  2 }, {  5,  6 }, {  1,  2 }, {  1,  6 },
+    {  9, -2 }, { -7, -2 }, { -3, -2 }, { -3, -6 }, {  5, -2 }, {  5, -6 }, {  1, -2 }, {  1, -6 },
+    { -9, -2 }, {  7, -2 }, {  3, -2 }, {  3, -6 }, { -5, -2 }, { -5, -6 }, { -1, -2 }, { -1, -6 },
+    { -9,  2 }, {  7,  2 }, {  3,  2 }, {  3,  6 }, { -5,  2 }, { -5,  6 }, { -1,  2 }, { -1,  6 },
+    { -3,  8 }, { -3, -8 }, { -3, -4 }, { -7, -4 }, { -3,  4 }, { -7,  4 }, { -3,  0 }, { -7,  0 },
+    {  1,  8 }, {  1, -8 }, {  1, -4 }, {  5, -4 }, {  1,  4 }, {  5,  4 }, {  1,  0 }, {  5,  0 },
+    {  3, -8 }, {  3,  8 }, {  3,  4 }, {  7,  4 }, {  3, -4 }, {  7, -4 }, {  3,  0 }, {  7,  0 },
+    { -1, -8 }, { -1,  8 }, { -1,  4 }, { -5,  4 }, { -1, -4 }, { -5, -4 }, { -1,  0 }, { -5,  0 },
+};
+
 /* Y1 Y2 names a quadrant, and at 4800 the point in it (Table 1, last
  * column): 00 A, 01 B, 11 C, 10 D. */
 static const uint8_t QUAD_OF_Y[4] = { ST_A, ST_B, ST_D, ST_C };
 static const uint8_t Y_OF_QUAD[4] = { 0, 1, 3, 2 };
 
 /* Table 1/V.32, [Q1 Q2][previous Y1 Y2] -> Y1 Y2: a quadrant rotation of
- * +90, 0, +180 or +270 degrees. For 4800 and the nonredundant 9600. */
+ * +90, 0, +180 or +270 degrees. For 4800 and the nonredundant 9600. V.32 bis
+ * numbers the two tables the other way round: this is its Table 2. */
 static const uint8_t TABLE1[4][4] = {
     { 1, 3, 0, 2 },
     { 0, 1, 2, 3 },
@@ -148,7 +203,8 @@ static const uint8_t TABLE1[4][4] = {
     { 2, 0, 3, 1 },
 };
 
-/* Table 2/V.32, the same for the trellis coded 9600. */
+/* Table 2/V.32, the same for the trellis coded 9600 - and Table 1/V.32 bis,
+ * for every trellis coded rate. */
 static const uint8_t TABLE2[4][4] = {
     { 0, 1, 2, 3 },
     { 1, 0, 3, 2 },
@@ -160,6 +216,8 @@ static const uint8_t TABLE2[4][4] = {
 #define RW_B(k) ((uint16_t) (1u << (15 - (k))))
 #define RW_SYNC (RW_B(7) | RW_B(11) | RW_B(15))
 #define RW_HEAD (RW_B(0) | RW_B(1) | RW_B(2) | RW_B(3))
+/* Table 5/V.32 bis, Note 1: both set, or the call runs as V.32. */
+#define RW_BIS (RW_B(4) | RW_B(8))
 
 /* ----------------------------------------------------------------- types */
 
@@ -178,12 +236,49 @@ typedef enum
     SEG_DATA
 } seg_t;
 
+/* In order of preference: where two ends have more than one in common, the
+ * highest numbered one wins. */
 typedef enum
 {
     CODE_4800 = 0,
-    CODE_9600U,    /* 16 points, nonredundant */
-    CODE_9600T     /* 32 points, trellis coded */
+    CODE_7200T,    /* V.32 bis: 16 points, trellis coded */
+    CODE_9600U,    /* V.32: 16 points, nonredundant */
+    CODE_9600T,    /* 32 points, trellis coded */
+    CODE_12000T,   /* V.32 bis: 64 points */
+    CODE_14400T,   /* V.32 bis: 128 points */
+    CODE_COUNT
 } coding_t;
+
+#define CBIT(c) (1u << (c))
+#define SET_V32 (CBIT(CODE_4800) | CBIT(CODE_9600U) | CBIT(CODE_9600T))
+#define SET_BIS (CBIT(CODE_4800) | CBIT(CODE_7200T) | CBIT(CODE_9600T) | CBIT(CODE_12000T) | CBIT(CODE_14400T))
+
+typedef struct
+{
+    int rate;
+    int bits;                 /* data bits per symbol, Q1 Q2 included */
+    bool tcm;
+    const char *name;
+    /* The SNR, in dB, that our receiver has to have trained at for us to
+     * offer the coding, and the SNR below which, once it is running, it has
+     * stopped being worth having. Measured back to back through G.711 with
+     * a -10 dB echo, a minute each way: the offer is a dB above where the
+     * coding stopped making errors at all, and "poor" where it reaches about
+     * one in ten thousand. Each is no more than 0.3 dB from what training
+     * predicted. The trellis code is worth 3 dB over the 16-point 9600, and
+     * each further bit per symbol costs 3. */
+    float offer_db;
+    float poor_db;
+} coding_info_t;
+
+static const coding_info_t CODING[CODE_COUNT] = {
+    [CODE_4800] = { 4800, 2, false, "4800", 0.0f, 11.0f },
+    [CODE_7200T] = { 7200, 3, true, "7200 (trellis coded)", 15.0f, 13.0f },
+    [CODE_9600U] = { 9600, 4, false, "9600 (16 points, uncoded)", 22.0f, 19.5f },
+    [CODE_9600T] = { 9600, 4, true, "9600 (trellis coded)", 19.0f, 17.0f },
+    [CODE_12000T] = { 12000, 5, true, "12000 (trellis coded)", 22.0f, 20.0f },
+    [CODE_14400T] = { 14400, 6, true, "14400 (trellis coded)", 25.5f, 23.0f },
+};
 
 typedef struct
 {
@@ -213,10 +308,12 @@ typedef struct
     uint16_t word;            /* the rate signal being sent */
     int wbit;
     bool e_pending;
+    long long e_min;          /* E not before this many symbols of the rate signal */
     uint16_t eword;
     coding_t coding;
     bool data_on;
     bool scrambled;
+    bool rn;                  /* the rate signal is renegotiation's R4 or R5 (8/V.32 bis) */
 } tx_t;
 
 typedef enum
@@ -227,7 +324,8 @@ typedef enum
     RX_TRN_ALIGN,  /* the start of TRN, finding exactly where it began */
     RX_TRN_DA,     /* training against the known TRN sequence */
     RX_RATE,       /* rate signals, 4800 bit/s */
-    RX_DATA
+    RX_DATA,
+    RX_RN_PRE      /* a renegotiation preamble (8/V.32 bis), finding where it ends */
 } rx_mode_t;
 
 typedef struct
@@ -293,6 +391,12 @@ typedef struct
     cf_t vit_u[VIT_DEPTH];    /* what went into the decoder, to measure against what came out */
     float vit_mse;
     float snr_trained;
+
+    /* Listening for the far end's renegotiation preamble while in data. */
+    cf_t pre_prev;
+    int pre_run;
+    int pre_count;
+    int pre_tail;
 } rx_t;
 
 typedef struct
@@ -325,6 +429,7 @@ typedef struct
     float w[EC_TAPS];
     float mu;
     long long fast_from;
+    long long slow_from;
     long long corr_start;
     int corr_lmax;
     double *corr;
@@ -350,6 +455,10 @@ typedef enum
     STG_A_WAIT_E,       /* S S-bar TRN R3 out, waiting for the caller's E */
     STG_A_B1,
     STG_DATA,
+    STG_RN_SEND,        /* V.32 bis rate renegotiation: we asked; preamble and R4 out, waiting for R5 */
+    STG_RN_RESP,        /* the far end asked; its preamble heard, waiting for its R4 */
+    STG_RN_WAIT_E,      /* rate signals exchanged, E sent or on its way; waiting for the far end's */
+    STG_RN_B1,          /* the new rate agreed; 24 symbols of scrambled ones each way */
     STG_DEAD
 } stage_t;
 
@@ -359,13 +468,24 @@ static const char *const STAGE_NAMES[] = {
     "training again, rates offered", "waiting for E", "scrambled ones",
     "AC, waiting for AA", "CA, measuring the round trip", "AC, waiting for silence",
     "R1, waiting for S", "training on the caller", "R3, waiting for E", "scrambled ones",
-    "data", "cleared down"
+    "data", "changing rate, waiting for R5", "changing rate, waiting for R4",
+    "changing rate, waiting for E", "changing rate, scrambled ones", "cleared down"
 };
 
 struct dm_v32
 {
     bool calling;
-    int max_rate;
+    bool bis;                 /* we are a V.32 bis modem */
+    bool far_bis;             /* and so is the far end, by its rate signals */
+    unsigned enabled;         /* the codings we will run, CBIT()s */
+    unsigned rn_offer;        /* our R4 or R5 */
+    bool rn_refused;          /* the far end ignored a renegotiation; do not ask again */
+    bool rn_deaf;             /* test hook: never hear the far end's renegotiation */
+    unsigned renegotiations;
+    int rn_from;              /* the coding a renegotiation we asked for started from */
+    long long up_since;       /* reception good enough for a higher rate since then, 0 if not */
+    long long up_next;        /* no asking for a higher rate before then */
+    double up_backoff;        /* seconds, doubled each time asking for more got nothing */
     bool trellis;
     char tag[48];
     int (*get_bit)(void *user);
@@ -378,6 +498,10 @@ struct dm_v32
     cf_t abcd[4];
     cf_t map16[16];
     cf_t map32[32];
+    cf_t map16t[16];
+    cf_t map64[64];
+    cf_t map128[128];
+    const cf_t *cmap[CODE_COUNT]; /* the trellis coded ones, by coding */
     uint8_t idx16[4][4];
     float gtx[10][TX_TAPS];
     float hr[MF_PHASES + 1][MF_TAPS];
@@ -415,6 +539,7 @@ struct dm_v32
     bool ec_request;
     uint16_t sent_rate;
     int rate;
+    coding_t coding;
     bool tcm;
     bool trained_once;
     unsigned retrains;
@@ -503,29 +628,107 @@ static bool e_word_ok(uint16_t w)
     return (w & RW_HEAD) == RW_HEAD && (w & RW_SYNC) == RW_SYNC;
 }
 
-/* B9-B14 are 0 0 1 0 0 0, "no special operational modes"; B11 is also a
- * sync bit, so RW_SYNC already has it. B4, 2400 bit/s, is for further study
- * and never offered. */
-static uint16_t make_word(bool e, bool r4800, bool r9600, bool tcm)
+static bool word_is_bis(uint16_t w)
+{
+    return (w & RW_BIS) == RW_BIS;
+}
+
+/* A rate signal offering the codings in set: in V.32's terms (Table 6), or
+ * V.32 bis's (Table 5/V.32 bis).
+ *
+ * V.32: B5 4800, B6 9600, B8 trellis coding at 9600. B9-B14 are 0 0 1 0 0 0,
+ * "no special operational modes"; B11 is also a sync bit, so RW_SYNC already
+ * has it. B4, 2400 bit/s, is for further study and never offered.
+ *
+ * V.32 bis: B4 and B8 always, then B5 4800, B9 7200, B6 9600, B10 12 000 and
+ * B12 14 400, every one but 4800 trellis coded. */
+static uint16_t make_word(bool e, unsigned set, bool bis)
 {
     uint16_t w = RW_SYNC;
 
     if (e)
         w |= RW_HEAD;
-    if (r4800)
+    if (set & CBIT(CODE_4800))
         w |= RW_B(5);
-    if (r9600)
-        w |= RW_B(6);
-    if (tcm)
-        w |= RW_B(8);
+    if (bis)
+    {
+        w |= RW_BIS;
+        if (set & CBIT(CODE_7200T))
+            w |= RW_B(9);
+        if (set & CBIT(CODE_9600T))
+            w |= RW_B(6);
+        if (set & CBIT(CODE_12000T))
+            w |= RW_B(10);
+        if (set & CBIT(CODE_14400T))
+            w |= RW_B(12);
+    }
+    else
+    {
+        if (set & (CBIT(CODE_9600U) | CBIT(CODE_9600T)))
+            w |= RW_B(6);
+        if (set & CBIT(CODE_9600T))
+            w |= RW_B(8);
+    }
     return w;
+}
+
+/* The codings a rate signal (or E) allows, read as V.32 bis if bis says this
+ * end is one and the word carries the mark, and as V.32 otherwise - which is
+ * how a V.32 modem reads a V.32 bis modem's R1: B6 9600, B8 trellis coding,
+ * the rest ignored. In V.32 terms a 9600 offer with trellis coding still
+ * allows the nonredundant code too: an end that cannot do the trellis code
+ * answers with B6 alone, and the 16-point code is what they then run (V.32
+ * 1e). */
+static unsigned set_of(uint16_t w, bool bis)
+{
+    unsigned s = 0;
+
+    if (w & RW_B(5))
+        s |= CBIT(CODE_4800);
+    if (bis && word_is_bis(w))
+    {
+        if (w & RW_B(9))
+            s |= CBIT(CODE_7200T);
+        if (w & RW_B(6))
+            s |= CBIT(CODE_9600T);
+        if (w & RW_B(10))
+            s |= CBIT(CODE_12000T);
+        if (w & RW_B(12))
+            s |= CBIT(CODE_14400T);
+    }
+    else if (w & RW_B(6))
+    {
+        s |= (w & RW_B(8)) ? CBIT(CODE_9600T) | CBIT(CODE_9600U) : CBIT(CODE_9600U);
+    }
+    return s;
+}
+
+/* The best coding in a set, or -1 for none. */
+static int best_of(unsigned set)
+{
+    for (int c = CODE_COUNT - 1; c >= 0; c--)
+        if (set & CBIT(c))
+            return c;
+    return -1;
 }
 
 static void word_text(uint16_t w, char *out, size_t len)
 {
-    snprintf(out, len, "%04x:%s%s%s%s%s", w, (w & RW_B(4)) ? " 2400" : "", (w & RW_B(5)) ? " 4800" : "",
-             (w & RW_B(6)) ? " 9600" : "", (w & RW_B(8)) ? " trellis" : "",
-             (w & (RW_B(4) | RW_B(5) | RW_B(6))) == 0 ? " cleardown" : "");
+    static const char *const short_names[CODE_COUNT] = { "4800", "7200", "9600 uncoded", "9600", "12000",
+                                                         "14400" };
+    unsigned set = set_of(w, true);
+    size_t o;
+
+    o = (size_t) snprintf(out, len, "%04x:%s", w, word_is_bis(w) ? " V.32bis" : "");
+    if (!word_is_bis(w) && (w & RW_B(6)) && (w & RW_B(8)))
+        set &= ~CBIT(CODE_9600U); /* "9600 trellis" says it better than both */
+    for (int c = 0; c < CODE_COUNT && o < len; c++)
+        if (set & CBIT(c))
+            o += (size_t) snprintf(out + o, len - o, " %s", short_names[c]);
+    if (!word_is_bis(w) && (w & RW_B(8)) && o < len)
+        o += (size_t) snprintf(out + o, len - o, " trellis");
+    if (set == 0 && o < len)
+        snprintf(out + o, len - o, " cleardown");
 }
 
 /* --------------------------------------------------------------- set-up */
@@ -545,6 +748,16 @@ static void build_tables(dm_v32_t *v)
     }
     for (int i = 0; i < 32; i++)
         v->map32[i] = pt(MAP32[i]);
+    for (int i = 0; i < 16; i++)
+        v->map16t[i] = 0.5f * pt(MAP16T[i]);
+    for (int i = 0; i < 64; i++)
+        v->map64[i] = 0.5f * pt(MAP64[i]);
+    for (int i = 0; i < 128; i++)
+        v->map128[i] = 0.5f * pt(MAP128[i]);
+    v->cmap[CODE_7200T] = v->map16t;
+    v->cmap[CODE_9600T] = v->map32;
+    v->cmap[CODE_12000T] = v->map64;
+    v->cmap[CODE_14400T] = v->map128;
     for (int i = 0; i < 40; i++)
     {
         v->cos40[i] = (float) cos(2.0 * V32_PI * i / 40.0);
@@ -616,12 +829,20 @@ static void tx_enter(dm_v32_t *v, seg_t seg, long long len)
             ec_schedule(v, boundary_time(t->nsym));
         break;
     case SEG_RATE:
+        /* 8/V.32 bis: renegotiation's rate signals start the scrambler
+         * from zero; the differential coder carries on from the preamble.
+         * In start-up and retrain both carry on from TRN (5.3). */
+        if (t->rn)
+            t->scr = 0;
+        t->wbit = 0;
+        break;
     case SEG_E:
         t->wbit = 0;
         break;
     case SEG_DATA:
         /* 5.4.1: the convolutional encoder's delay elements start at zero. */
         t->conv = 0;
+        t->rn = false;
         break;
     default:
         break;
@@ -634,6 +855,8 @@ static void tx_set(dm_v32_t *v, seg_t seg, long long len)
     v->tx.switch_at = -1;
     v->tx.nprog = v->tx.iprog = 0;
     v->tx.e_pending = false;
+    v->tx.e_min = 0;
+    v->tx.rn = false;
     tx_enter(v, seg, len);
 }
 
@@ -713,16 +936,22 @@ static cf_t tx_symbol(dm_v32_t *v)
     {
     case SEG_SILENCE:
         break;
+    /* These four keep the differential coder's state, because renegotiation
+     * starts its rate signal from the last of them (8/V.32 bis). */
     case SEG_AA:
+        t->y = Y_OF_QUAD[ST_A];
         s = v->abcd[ST_A];
         break;
     case SEG_CC:
+        t->y = Y_OF_QUAD[ST_C];
         s = v->abcd[ST_C];
         break;
     case SEG_AC:
+        t->y = Y_OF_QUAD[(t->count & 1) ? ST_C : ST_A];
         s = v->abcd[(t->count & 1) ? ST_C : ST_A];
         break;
     case SEG_CA:
+        t->y = Y_OF_QUAD[(t->count & 1) ? ST_A : ST_C];
         s = v->abcd[(t->count & 1) ? ST_A : ST_C];
         break;
     case SEG_S:
@@ -747,8 +976,9 @@ static cf_t tx_symbol(dm_v32_t *v)
         if (t->wbit >= 16)
         {
             t->wbit = 0;
-            /* 5.3.2: finish the sequence in hand, then send E. */
-            if (t->e_pending)
+            /* 5.3.2: finish the sequence in hand, then send E - and in a
+             * renegotiation, not before R4 has had 64 symbols (8.1/V.32 bis). */
+            if (t->e_pending && t->count + 1 >= t->e_min)
             {
                 t->e_pending = false;
                 t->len = t->count + 1;
@@ -763,33 +993,34 @@ static cf_t tx_symbol(dm_v32_t *v)
         break;
     case SEG_DATA:
     {
+        /* Q1 and Q2 go through the differential coder; Q3 onwards, first
+         * in time most significant, pick the point within its subset. */
+        const coding_info_t *ci = &CODING[t->coding];
+        int nr = ci->bits - 2;
         int q1 = tx_data_bit(v);
         int q2 = tx_data_bit(v);
         int q = (q1 << 1) | q2;
+        int rest = 0;
 
+        for (int i = 0; i < nr; i++)
+            rest = (rest << 1) | tx_data_bit(v);
         if (t->coding == CODE_4800)
         {
             t->y = TABLE1[q][t->y];
             s = v->abcd[QUAD_OF_Y[t->y]];
         }
+        else if (!ci->tcm)
+        {
+            t->y = TABLE1[q][t->y];
+            s = v->map16[(t->y << 2) | rest];
+        }
         else
         {
-            int q3 = tx_data_bit(v);
-            int q4 = tx_data_bit(v);
+            int y0 = t->conv & 1;
 
-            if (t->coding == CODE_9600U)
-            {
-                t->y = TABLE1[q][t->y];
-                s = v->map16[(t->y << 2) | (q3 << 1) | q4];
-            }
-            else
-            {
-                int y0 = t->conv & 1;
-
-                t->y = TABLE2[q][t->y];
-                s = v->map32[(y0 << 4) | (t->y << 2) | (q3 << 1) | q4];
-                t->conv = v->vnext[t->conv][t->y];
-            }
+            t->y = TABLE2[q][t->y];
+            s = v->cmap[t->coding][(y0 << (nr + 2)) | (t->y << nr) | rest];
+            t->conv = v->vnext[t->conv][t->y];
         }
         break;
     }
@@ -924,6 +1155,7 @@ static void ec_slow(dm_v32_t *v)
     if (ec->res_avg > 0.0f && ec->in_avg > 0.0f)
         ec->erle_db = 10.0f * log10f(ec->in_avg / ec->res_avg);
     ec->mu = EC_MU_SLOW;
+    ec->slow_from = v->n;
     DM_DEBUG("v32", "echo canceller trained: %.1f dB of cancellation (tag=%s)", ec->erle_db, v->tag);
 }
 
@@ -978,6 +1210,18 @@ static float ec_run(dm_v32_t *v, float x, long long n)
             mu = EC_MU_FAST * expf(-(float) (n - ec->fast_from) / 1000.0f);
             if (mu < EC_MU_SETTLED)
                 mu = EC_MU_SETTLED;
+        }
+        else
+        {
+            /* With the far end talking, its signal is noise to the
+             * canceller, and some of that noise stays in the taps: about
+             * mu/2 of the far end's power. At 0.002 that was 30 dB down -
+             * nothing at 9600, and the ceiling on SNR at 14 400. So
+             * refine quickly for a few seconds, then settle to 0.0002,
+             * which leaves it 40 dB down and still follows a slow drift. */
+            mu = EC_MU_SLOW * expf(-(float) (n - ec->slow_from) / 16000.0f);
+            if (mu < EC_MU_FLOOR)
+                mu = EC_MU_FLOOR;
         }
         g = mu * e / (norm + 1000.0f);
 
@@ -1165,14 +1409,18 @@ static int slice16(const dm_v32_t *v, cf_t u)
     return v->idx16[axis4(crealf(u))][axis4(cimagf(u))];
 }
 
-static int slice32(const dm_v32_t *v, cf_t u)
+/* The nearest point of a trellis coded constellation, as a tentative
+ * decision for the equaliser and the phase loop. */
+static int slice_tcm(const dm_v32_t *v, coding_t c, cf_t u)
 {
+    const cf_t *map = v->cmap[c];
+    int n = 2 << CODING[c].bits;
     int best = 0;
     float bd = 1e30f;
 
-    for (int i = 0; i < 32; i++)
+    for (int i = 0; i < n; i++)
     {
-        float d = mag2(u - v->map32[i]);
+        float d = mag2(u - map[i]);
 
         if (d < bd)
         {
@@ -1196,10 +1444,13 @@ static void vit_reset(vit_t *vt)
 }
 
 /* One received point in; once the decoder is VIT_DEPTH symbols deep, one
- * decided Y1 Y2 Q3 Q4 out from that many symbols ago, returned as 0..15. */
+ * decided Y1 Y2 Q3 ... out from that many symbols ago - Y0 left off, so 0..15
+ * at 9600 and 0..63 at 14 400. */
 static int vit_step(dm_v32_t *v, cf_t u)
 {
     vit_t *vt = &v->rx.vit;
+    const cf_t *map = v->cmap[v->rx.coding];
+    int nr = CODING[v->rx.coding].bits - 2;
     float bm[8];
     int bq[8];
     float npm[8];
@@ -1209,15 +1460,16 @@ static int vit_step(dm_v32_t *v, cf_t u)
     int best = 0;
     int s;
 
-    /* Each of the eight subsets Y0 Y1 Y2 holds four points; a branch
-     * through a subset costs the distance to its nearest one. */
+    /* Each of the eight subsets Y0 Y1 Y2 holds 2^nr points - two at 7200,
+     * sixteen at 14 400; a branch through a subset costs the distance to
+     * its nearest one. */
     for (int sub = 0; sub < 8; sub++)
     {
         bm[sub] = 1e30f;
         bq[sub] = 0;
-        for (int q = 0; q < 4; q++)
+        for (int q = 0; q < (1 << nr); q++)
         {
-            float d = mag2(u - v->map32[(sub << 2) | q]);
+            float d = mag2(u - map[(sub << nr) | q]);
 
             if (d < bm[sub])
             {
@@ -1239,7 +1491,7 @@ static int vit_step(dm_v32_t *v, cf_t u)
             {
                 npm[ns] = m;
                 np[ns] = (uint8_t) ps;
-                nb[ns] = (uint8_t) ((yy << 2) | bq[sub]);
+                nb[ns] = (uint8_t) ((yy << nr) | bq[sub]);
             }
         }
     for (int i = 0; i < 8; i++)
@@ -1270,6 +1522,7 @@ static int vit_step(dm_v32_t *v, cf_t u)
 static void ctl_rate_word(dm_v32_t *v, uint16_t w);
 static bool ctl_e_word(dm_v32_t *v, uint16_t w);
 static void ctl_rx_trained(dm_v32_t *v);
+static void stage_enter(dm_v32_t *v, stage_t st, double timeout_s);
 
 static void rx_reset(dm_v32_t *v)
 {
@@ -1493,8 +1746,14 @@ static void rx_enter_data(dm_v32_t *v, coding_t coding)
     r->prev_y = Y_OF_QUAD[r->prev_q];
     vit_reset(&r->vit);
     r->vit_mse = r->mse;
+    r->pre_run = 0;
+    r->pre_prev = 0.0f;
     set_loops(r, 0.01f, 0.03f, 0.0005f, 0.01f);
-    r->leak = 1e-5f;
+    /* A little leakage keeps the fractionally spaced taps from wandering
+     * off in the band edges over a long call. Not much: the taps settle
+     * where the leak and the error balance, and at 1e-5 that held every rate
+     * to 31 dB SNR - nothing at 9600, a third of the margin at 14 400. */
+    r->leak = 1e-6f;
 }
 
 static cf_t trn_symbol(const dm_v32_t *v, uint32_t *reg, long long j)
@@ -1549,6 +1808,88 @@ static void trn_align(dm_v32_t *v)
     if (bo != 0)
         DM_DEBUG("v32", "TRN found %d symbol%s from where S-bar put it (tag=%s)", bo,
                  (bo == 1 || bo == -1) ? "" : "s", v->tag);
+}
+
+/* 8/V.32 bis: the far end asking to change rate. Its preamble is 56 symbols
+ * of AA from a caller or AC from an answerer, then 8 of CC or CA, then its
+ * rate signal - sent in the middle of data, with nothing else to announce
+ * it. So in data, every symbol is looked at for being the far end's preamble
+ * symbol: a point of the 4800 bit/s set, the same as the one before (AA) or
+ * opposite it (AC). Twenty-four in a row of those does not happen in
+ * scrambled data at any rate, and leaves thirty-odd symbols of the preamble
+ * still to come. Rotations by quarter turns change none of this, which
+ * matters because a trellis coded receiver's phase may have slipped by one
+ * without anything noticing. */
+#define RN_PRE_RUN 24
+
+static bool rn_pre_watch(dm_v32_t *v, cf_t u)
+{
+    rx_t *r = &v->rx;
+    cf_t want = v->calling ? -r->pre_prev : r->pre_prev;
+    float p = mag2(u);
+    bool like = p > 5.0f && p < 16.0f && mag2(u - want) < 2.0f;
+
+    r->pre_prev = u;
+    if (!v->far_bis || v->rn_deaf || (v->stage != STG_DATA && v->stage != STG_RN_SEND))
+        return false;
+    r->pre_run = like ? r->pre_run + 1 : 0;
+    if (r->pre_run < RN_PRE_RUN)
+        return false;
+
+    /* 8.1 and 8.2/V.32 bis: clamp circuit 104, and listen for the rate
+     * signal. */
+    r->mode = RX_RN_PRE;
+    r->data_on = false;
+    r->pre_count = 0;
+    r->pre_tail = 0;
+    r->last_q = slice4(v, u);
+    if (v->stage == STG_DATA)
+    {
+        stage_enter(v, STG_RN_RESP, 3.0 + ((v->rtd >= 0.0) ? v->rtd / 8000.0 : 0.5));
+        DM_INFO("v32", "the far end is asking to change rate (tag=%s)", v->tag);
+    }
+    else
+    {
+        DM_DEBUG("v32", "the far end's preamble heard; waiting for its rate signal (tag=%s)", v->tag);
+    }
+    return true;
+}
+
+/* Through the preamble to the instant its rate signal starts. The 56 symbols
+ * end where the pattern changes - AA turning into C, or AC repeating a
+ * symbol as it turns into CA - and the rate signal comes eight symbols after
+ * that. Knowing where it starts lets the descrambler start where the far
+ * end's scrambler does, from zero, rather than lose the first sequence to
+ * resynchronising: the responder sends only four of them. */
+static void rn_pre_symbol(dm_v32_t *v, const cf_t *w, float norm, cf_t vout, cf_t u)
+{
+    rx_t *r = &v->rx;
+    int q = slice4(v, u);
+
+    track(v, w, norm, vout, u, v->abcd[q]);
+    r->pre_count++;
+    if (r->pre_tail == 0)
+    {
+        bool same = (v->calling ? (q ^ 2) : q) == r->last_q;
+
+        if (!same)
+            r->pre_tail = 1;
+    }
+    else
+    {
+        r->pre_tail++;
+    }
+    r->last_q = q;
+    r->prev_q = q;
+    if (r->pre_tail >= 8 || r->pre_count > 200)
+    {
+        if (r->pre_tail < 8)
+            DM_DEBUG("v32", "the end of the far end's preamble was not seen (tag=%s)", v->tag);
+        r->mode = RX_RATE;
+        r->dscr = 0;
+        r->rw_locked = false;
+        r->rw_bits = 0;
+    }
 }
 
 static void symbol_out(dm_v32_t *v)
@@ -1643,6 +1984,11 @@ static void symbol_out(dm_v32_t *v)
     }
 
     case RX_DATA:
+        if (rn_pre_watch(v, u))
+        {
+            track(v, w, norm, vout, u, v->abcd[slice4(v, u)]);
+            break;
+        }
         r->data_rcvd++;
         if (r->coding == CODE_4800)
         {
@@ -1669,24 +2015,26 @@ static void symbol_out(dm_v32_t *v)
         }
         else
         {
+            const cf_t *map = v->cmap[r->coding];
+            int nr = CODING[r->coding].bits - 2;
             int out;
 
-            track(v, w, norm, vout, u, v->map32[slice32(v, u)]);
+            track(v, w, norm, vout, u, map[slice_tcm(v, r->coding, u)]);
             r->vit_u[r->vit.pos] = u;
             out = vit_step(v, u);
             if (out >= 0)
             {
-                int yy = out >> 2;
+                int yy = out >> nr;
                 int qq = v->inv2[r->prev_y][yy];
                 cf_t held = r->vit_u[r->vit.pos];
-                float e0 = mag2(held - v->map32[out]);
-                float e1 = mag2(held - v->map32[16 | out]);
+                float e0 = mag2(held - map[out]);
+                float e1 = mag2(held - map[(1 << (nr + 2)) | out]);
 
                 /* The slicer's tentative decisions flatter the error at
-                 * low SNR, where the nearest of 32 points is often the
-                 * wrong one; measure against what the decoder chose. It
-                 * decides Y1 Y2 Q3 Q4, which leaves two points, one per
-                 * value of Y0, and the received one is near the right one.
+                 * low SNR, where the nearest point is often the wrong one;
+                 * measure against what the decoder chose. It decides Y1
+                 * Y2 Q3 ..., which leaves two points, one per value of
+                 * Y0, and the received one is near the right one.
                  *
                  * Not by re-running the encoder over the decoder's output
                  * to recover Y0, which is what this did: the decoder may
@@ -1700,10 +2048,14 @@ static void symbol_out(dm_v32_t *v)
                 r->prev_y = yy;
                 deliver(v, qq >> 1);
                 deliver(v, qq & 1);
-                deliver(v, (out >> 1) & 1);
-                deliver(v, out & 1);
+                for (int i = nr - 1; i >= 0; i--)
+                    deliver(v, (out >> i) & 1);
             }
         }
+        break;
+
+    case RX_RN_PRE:
+        rn_pre_symbol(v, w, norm, vout, u);
         break;
 
     default:
@@ -1796,34 +2148,40 @@ static long long trn_length(const dm_v32_t *v)
     return k;
 }
 
-static coding_t coding_of(uint16_t w)
-{
-    if (w & RW_B(6))
-        return (w & RW_B(8)) ? CODE_9600T : CODE_9600U;
-    return CODE_4800;
-}
-
 static const char *coding_name(coding_t c)
 {
-    switch (c)
-    {
-    case CODE_4800:
-        return "4800";
-    case CODE_9600U:
-        return "9600 (16 points, uncoded)";
-    case CODE_9600T:
-        return "9600 (trellis coded)";
-    }
-    return "?";
+    return CODING[c].name;
 }
 
-/* What our receiver could cope with, judged from how well it trained. The
- * thresholds are where each mode, measured back to back through G.711 with
- * a -10 dB echo, is still error-free with a dB or so to spare; the trellis
- * code is worth about 3.5 dB. 4800 works down to about 14 dB. */
-static bool rx_can_9600(const dm_v32_t *v, bool tcm)
+/* What our receiver could cope with at a given SNR: as it trained, when
+ * choosing what to offer, or as it is now, in data, when renegotiating. */
+static bool rx_can(coding_t c, float snr)
 {
-    return v->rx.snr_trained >= (tcm ? 17.5f : 21.0f);
+    return snr >= CODING[c].offer_db;
+}
+
+/* What we can offer in reply to the far end's rate signal: the codings we
+ * are enabled for, restricted to the ones it allowed (5.4.1 and 6.1/V.32
+ * bis), less any our receiver would not bear. */
+static unsigned offer_set(const dm_v32_t *v, unsigned far, const char *verb)
+{
+    unsigned s = v->enabled & far & (v->far_bis ? SET_BIS : SET_V32);
+    int lost = -1;
+    int kept;
+
+    for (int c = 0; c < CODE_COUNT; c++)
+        if ((s & CBIT(c)) && !rx_can((coding_t) c, v->rx.snr_trained))
+        {
+            s &= ~CBIT(c);
+            lost = c;
+        }
+    /* Worth saying only if it cost speed: dropping the uncoded 9600 while
+     * the trellis coded one stays costs nothing. */
+    kept = best_of(s);
+    if (lost >= 0 && (kept < 0 || CODING[lost].rate > CODING[kept].rate))
+        DM_INFO("v32", "the line trained at only %.1f dB SNR; not %s %d (tag=%s)", v->rx.snr_trained, verb,
+                CODING[lost].rate, v->tag);
+    return s;
 }
 
 /* Back to the start of 5.4.1 or 5.4.2 at the third paragraph - which is
@@ -1863,7 +2221,7 @@ static void restart(dm_v32_t *v, const char *why, bool failed)
  * when there is a decoder. */
 static float rx_snr(const dm_v32_t *v)
 {
-    float mse = (v->rx.mode == RX_DATA && v->rx.coding == CODE_9600T && v->rx.vit_mse > 0.0f)
+    float mse = (v->rx.mode == RX_DATA && CODING[v->rx.coding].tcm && v->rx.vit_mse > 0.0f)
                     ? v->rx.vit_mse
                     : v->rx.mse;
 
@@ -1876,8 +2234,11 @@ static void go_data(dm_v32_t *v)
     v->tx.data_on = true;
     v->rx.data_on = true;
     v->low_since = v->poor_since = 0;
-    DM_INFO("v32", "trained at %s: SNR %.1f dB, round trip %.0f ms, echo canceller %s (tag=%s)",
-            coding_name(v->rx.coding), rx_snr(v),
+    v->up_since = 0;
+    v->up_next = v->n + SECONDS(10.0);
+    v->rn_from = -1;
+    DM_INFO("v32", "trained at %s%s: SNR %.1f dB, round trip %.0f ms, echo canceller %s (tag=%s)",
+            coding_name(v->rx.coding), (v->bis && !v->far_bis) ? ", as V.32" : "", rx_snr(v),
             v->rtd >= 0.0 ? v->rtd / 8.0 : -1.0,
             v->ec.enabled ? "on" : "off - no echo", v->tag);
     if (v->trained_once)
@@ -1895,12 +2256,148 @@ static void cleardown(dm_v32_t *v, const char *why)
     emit(v, DM_V32_CLEARDOWN);
 }
 
+static void set_coding(dm_v32_t *v, coding_t c)
+{
+    v->coding = c;
+    v->rate = CODING[c].rate;
+    v->tcm = CODING[c].tcm;
+}
+
+/* --------------------------------------------- rate renegotiation (V.32 bis)
+ *
+ * Section 8/V.32 bis: either end may ask to change rate in the middle of data,
+ * with no retrain - a preamble, a rate signal (R4 from the end that asks, R5
+ * from the one that answers), E naming the best rate the two have in common,
+ * and 24 symbols of scrambled ones at it. The equaliser, the phase and timing
+ * loops and the echo canceller all carry on as they were, which is what makes
+ * it take a fraction of a second where a retrain takes several on a long
+ * path. */
+
+static double rn_timeout(const dm_v32_t *v)
+{
+    return 3.0 + ((v->rtd >= 0.0) ? v->rtd / 8000.0 : 0.5);
+}
+
+/* The rate signals of a renegotiation offer "the desired rate ... and all
+ * lower data signalling rates at which the modem is enabled to operate". */
+static unsigned rn_set_upto(const dm_v32_t *v, int want)
+{
+    unsigned s = 0;
+
+    for (int c = 0; c <= want; c++)
+        if (v->enabled & SET_BIS & CBIT(c))
+            s |= CBIT(c);
+    return s;
+}
+
+/* The best coding our receiver would bear now, by the SNR it has in data. */
+static int rn_desired(const dm_v32_t *v)
+{
+    float snr = rx_snr(v);
+    int best = CODE_4800;
+
+    for (int c = 0; c < CODE_COUNT; c++)
+        if ((v->enabled & SET_BIS & CBIT(c)) && rx_can((coding_t) c, snr))
+            best = c;
+    return best;
+}
+
+/* The preamble: AA for 56 symbols then CC for 8 from the caller, AC then CA
+ * from the answerer. The rate signal that follows starts its differential
+ * coder from the last of them, which tx_symbol() keeps. */
+static void rn_tx_preamble(dm_v32_t *v)
+{
+    if (v->calling)
+    {
+        tx_set(v, SEG_AA, 56);
+        tx_then(v, SEG_CC, 8);
+    }
+    else
+    {
+        tx_set(v, SEG_AC, 56);
+        tx_then(v, SEG_CA, 8);
+    }
+}
+
+/* 8.1/V.32 bis: ask for a change to want, or the best below it the far end
+ * will take. */
+static bool rn_start(dm_v32_t *v, int want, const char *why)
+{
+    unsigned offer;
+
+    if (!v->bis || !v->far_bis || v->stage != STG_DATA)
+        return false;
+    offer = rn_set_upto(v, want);
+    if (offer == 0)
+        return false;
+    v->rn_offer = offer;
+    v->rn_from = (int) v->coding;
+    rn_tx_preamble(v);
+    tx_then(v, SEG_RATE, -1);
+    v->tx.word = make_word(false, offer, true);
+    v->tx.e_min = 64;
+    v->tx.rn = true;
+    v->tx.data_on = false;
+    stage_enter(v, STG_RN_SEND, rn_timeout(v));
+    DM_INFO("v32", "%s; asking the far end to change to %d (tag=%s)", why, CODING[best_of(offer)].rate,
+            v->tag);
+    return true;
+}
+
+/* The far end's R4 (when it asked) or R5 (when we did) is in. */
+static void rn_rate_word(dm_v32_t *v, uint16_t w, const char *wt)
+{
+    char ot[64];
+    int c;
+
+    if (v->stage == STG_RN_RESP)
+    {
+        /* 8.2/V.32 bis: turn 106 off, our preamble, R5 for 64 symbols, E,
+         * and 24 symbols of scrambled ones at the new rate. R5 says what we
+         * want irrespective of R4, and E the best the two have in common. */
+        v->rn_offer = rn_set_upto(v, rn_desired(v));
+        c = best_of(set_of(w, true) & v->rn_offer);
+        word_text(make_word(false, v->rn_offer, true), ot, sizeof(ot));
+        DM_DEBUG("v32", "R4 heard (%s); sending R5 (%s) (tag=%s)", wt, ot, v->tag);
+        if (c < 0)
+        {
+            cleardown(v, "a rate renegotiation found no rate in common");
+            return;
+        }
+        rn_tx_preamble(v);
+        tx_then(v, SEG_RATE, 64);
+        tx_then(v, SEG_E, 8);
+        tx_then(v, SEG_DATA, -1);
+        v->tx.word = make_word(false, v->rn_offer, true);
+        v->tx.eword = make_word(true, CBIT(c), true);
+        v->tx.coding = (coding_t) c;
+        v->tx.rn = true;
+        v->tx.data_on = false;
+    }
+    else
+    {
+        /* 8.1/V.32 bis: once R4 has run 64 symbols, finish the sequence in
+         * hand and send E. */
+        c = best_of(set_of(w, true) & v->rn_offer);
+        DM_DEBUG("v32", "R5 heard (%s) (tag=%s)", wt, v->tag);
+        if (c < 0)
+        {
+            cleardown(v, "a rate renegotiation found no rate in common");
+            return;
+        }
+        v->tx.eword = make_word(true, CBIT(c), true);
+        v->tx.coding = (coding_t) c;
+        v->tx.e_pending = true;
+    }
+    stage_enter(v, STG_RN_WAIT_E, rn_timeout(v));
+}
+
 /* The receiver has a rate signal: R1, R2 or R3 depending on who we are and
- * how far along. */
+ * how far along - or R4 or R5 in a renegotiation. */
 static void ctl_rate_word(dm_v32_t *v, uint16_t w)
 {
-    char wt[48];
-    char ot[48];
+    char wt[64];
+    char ot[64];
 
     word_text(w, wt, sizeof(wt));
     switch (v->stage)
@@ -1908,22 +2405,17 @@ static void ctl_rate_word(dm_v32_t *v, uint16_t w)
     case STG_C_TRAIN1:
     {
         /* R1. Answer with S for NT, the conditioning signal, and R2: what
-         * we can do, restricted to what it offered (5.4.1). */
-        bool b6 = (w & RW_B(6)) && v->max_rate >= 9600;
-        bool b8 = b6 && (w & RW_B(8)) && v->trellis;
-        bool b5 = (w & RW_B(5)) != 0;
+         * we can do, restricted to what it offered (5.4.1). If either rate
+         * signal lacks V.32 bis's mark, the call is V.32. */
+        unsigned offer;
         long long nt_syms;
 
-        if (b6 && !rx_can_9600(v, b8))
-        {
-            DM_INFO("v32", "the line trained at only %.1f dB SNR; not offering 9600 (tag=%s)",
-                    v->rx.snr_trained, v->tag);
-            b6 = b8 = false;
-        }
-        v->sent_rate = make_word(false, b5, b6, b8);
+        v->far_bis = v->bis && word_is_bis(w);
+        offer = offer_set(v, set_of(w, v->bis), "offering");
+        v->sent_rate = make_word(false, offer, v->far_bis);
         word_text(v->sent_rate, ot, sizeof(ot));
         DM_DEBUG("v32", "R1 heard (%s); sending R2 (%s) (tag=%s)", wt, ot, v->tag);
-        if (!b5 && !b6)
+        if (offer == 0)
         {
             cleardown(v, "the answering modem offers no rate we can use");
             return;
@@ -1948,17 +2440,17 @@ static void ctl_rate_word(dm_v32_t *v, uint16_t w)
     case STG_C_TRAIN2:
     {
         /* R3: the rate to use. Finish the R2 sequence in hand, send E. */
-        coding_t c = coding_of(w);
+        int c = best_of(set_of(w, v->far_bis) & (v->far_bis ? SET_BIS : SET_V32));
 
-        if ((w & (RW_B(5) | RW_B(6))) == 0)
+        if (c < 0)
         {
             cleardown(v, "the answering modem called for a cleardown in R3");
             return;
         }
         DM_DEBUG("v32", "R3 heard (%s); sending E (tag=%s)", wt, v->tag);
-        v->tx.eword = make_word(true, c == CODE_4800, c != CODE_4800, c == CODE_9600T);
+        v->tx.eword = make_word(true, CBIT(c), v->far_bis);
         v->tx.e_pending = true;
-        v->tx.coding = c;
+        v->tx.coding = (coding_t) c;
         stage_enter(v, STG_C_WAIT_E, 6.0);
         break;
     }
@@ -1966,26 +2458,20 @@ static void ctl_rate_word(dm_v32_t *v, uint16_t w)
     case STG_A_TRAIN:
     {
         /* R2. Second conditioning signal, then R3 naming one rate from it. */
-        bool b6 = (w & RW_B(6)) && v->max_rate >= 9600;
-        bool b8 = b6 && (w & RW_B(8)) && v->trellis;
-        bool b5;
+        int c;
 
-        if (b6 && !rx_can_9600(v, b8))
+        v->far_bis = v->bis && word_is_bis(w);
+        c = best_of(offer_set(v, set_of(w, v->bis), "taking"));
+        if (c < 0)
         {
-            DM_INFO("v32", "the line trained at only %.1f dB SNR; not taking 9600 (tag=%s)",
-                    v->rx.snr_trained, v->tag);
-            b6 = b8 = false;
-        }
-        b5 = !b6 && (w & RW_B(5));
-        v->sent_rate = make_word(false, b5, b6, b8);
-        word_text(v->sent_rate, ot, sizeof(ot));
-        DM_DEBUG("v32", "R2 heard (%s); sending R3 (%s) (tag=%s)", wt, ot, v->tag);
-        if (!b5 && !b6)
-        {
+            DM_DEBUG("v32", "R2 heard (%s) (tag=%s)", wt, v->tag);
             cleardown(v, "the calling modem offers no rate we can use");
             return;
         }
-        v->tx.coding = coding_of(v->sent_rate);
+        v->sent_rate = make_word(false, CBIT(c), v->far_bis);
+        word_text(v->sent_rate, ot, sizeof(ot));
+        DM_DEBUG("v32", "R2 heard (%s); sending R3 (%s) (tag=%s)", wt, ot, v->tag);
+        v->tx.coding = (coding_t) c;
         v->tx.word = v->sent_rate;
         tx_set(v, SEG_S, 256);
         tx_then(v, SEG_SBAR, 16);
@@ -1994,6 +2480,11 @@ static void ctl_rate_word(dm_v32_t *v, uint16_t w)
         stage_enter(v, STG_A_WAIT_E, 10.0);
         break;
     }
+
+    case STG_RN_RESP:
+    case STG_RN_SEND:
+        rn_rate_word(v, w, wt);
+        break;
 
     default:
         DM_TRACE("v32", "rate signal %s ignored in stage '%s' (tag=%s)", wt, STAGE_NAMES[v->stage],
@@ -2005,28 +2496,33 @@ static void ctl_rate_word(dm_v32_t *v, uint16_t w)
 /* E: the far end's last word before scrambled ones at the agreed rate. */
 static bool ctl_e_word(dm_v32_t *v, uint16_t w)
 {
-    coding_t c = coding_of(w);
-    char wt[48];
+    int c = best_of(set_of(w, v->far_bis) & (v->far_bis ? SET_BIS : SET_V32));
+    char wt[64];
 
     word_text(w, wt, sizeof(wt));
-    if (v->stage != STG_C_WAIT_E && v->stage != STG_A_WAIT_E)
+    if (v->stage != STG_C_WAIT_E && v->stage != STG_A_WAIT_E && v->stage != STG_RN_WAIT_E)
     {
         DM_TRACE("v32", "E (%s) ignored in stage '%s' (tag=%s)", wt, STAGE_NAMES[v->stage], v->tag);
         return false;
     }
-    if (c != v->tx.coding)
+    if (c < 0)
+        c = CODE_4800;
+    if (c != (int) v->tx.coding)
         DM_WARN("v32", "the far end's E (%s) names a different rate from the one agreed; "
                        "receiving at its rate (tag=%s)",
                 wt, v->tag);
-    DM_DEBUG("v32", "E heard (%s); receiving at %s (tag=%s)", wt, coding_name(c), v->tag);
-    rx_enter_data(v, c);
-    v->rate = (c == CODE_4800) ? 4800 : 9600;
-    v->tcm = (c == CODE_9600T);
-    if (v->stage == STG_A_WAIT_E)
+    DM_DEBUG("v32", "E heard (%s); receiving at %s (tag=%s)", wt, coding_name((coding_t) c), v->tag);
+    rx_enter_data(v, (coding_t) c);
+    set_coding(v, (coding_t) c);
+    if (v->stage == STG_RN_WAIT_E)
+    {
+        /* 8.1 and 8.2/V.32 bis: 104 stays clamped for 24 symbols more. */
+        stage_enter(v, STG_RN_B1, rn_timeout(v));
+    }
+    else if (v->stage == STG_A_WAIT_E)
     {
         /* 5.4.2: finish R3's sequence, E, 128 symbols of scrambled ones. */
-        v->tx.eword = make_word(true, v->tx.coding == CODE_4800, v->tx.coding != CODE_4800,
-                                v->tx.coding == CODE_9600T);
+        v->tx.eword = make_word(true, CBIT(v->tx.coding), v->far_bis);
         v->tx.e_pending = true;
         stage_enter(v, STG_A_B1, 4.0);
     }
@@ -2060,6 +2556,28 @@ static void stage_timeout(dm_v32_t *v)
         }
         v->deadline = 0;
         break;
+    case STG_RN_SEND:
+        /* Note 3 to 8/V.32 bis: a far end that never answers may be a V.32
+         * modem that uses B4 for something else. Retrain, and do not ask
+         * again. */
+        v->rn_refused = true;
+        emit(v, DM_V32_RETRAINING);
+        restart(v, "the far end did not answer a request to change rate", false);
+        break;
+    case STG_RN_RESP:
+    case STG_RN_WAIT_E:
+    case STG_RN_B1:
+    {
+        char why[96];
+
+        /* A far end that starts the procedure and does not finish it is no
+         * more to be relied on than one that never starts it. */
+        v->rn_refused = true;
+        snprintf(why, sizeof(why), "a rate renegotiation stalled at '%s'", STAGE_NAMES[v->stage]);
+        emit(v, DM_V32_RETRAINING);
+        restart(v, why, false);
+        break;
+    }
     default:
     {
         char why[96];
@@ -2099,24 +2617,29 @@ static void control(dm_v32_t *v, long long n)
     if (v->stage == STG_DEAD)
         return;
 
-    /* 5.5: the far end starting a retrain, or starting over. */
-    if (v->calling && v->ac_strict >= RUN_128T &&
-        (v->stage == STG_C_TRAIN2 || v->stage == STG_C_WAIT_E || v->stage == STG_C_B1 ||
-         v->stage == STG_DATA))
+    /* 5.5: the far end starting a retrain, or starting over. A renegotiation
+     * preamble's 56 symbols of AC or AA are too short to be taken for one. */
     {
-        if (v->stage == STG_DATA)
-            emit(v, DM_V32_RETRAINING);
-        restart(v, "the answering modem is sending AC", false);
-        return;
-    }
-    if (!v->calling && v->aa_strict >= RUN_128T &&
-        (v->stage == STG_A_R1 || v->stage == STG_A_TRAIN || v->stage == STG_A_WAIT_E ||
-         v->stage == STG_A_B1 || v->stage == STG_DATA))
-    {
-        if (v->stage == STG_DATA)
-            emit(v, DM_V32_RETRAINING);
-        restart(v, "the calling modem is sending AA", false);
-        return;
+        bool in_data = v->stage == STG_DATA || v->stage == STG_RN_SEND || v->stage == STG_RN_RESP ||
+                       v->stage == STG_RN_WAIT_E || v->stage == STG_RN_B1;
+
+        if (v->calling && v->ac_strict >= RUN_128T &&
+            (v->stage == STG_C_TRAIN2 || v->stage == STG_C_WAIT_E || v->stage == STG_C_B1 || in_data))
+        {
+            if (in_data)
+                emit(v, DM_V32_RETRAINING);
+            restart(v, "the answering modem is sending AC", false);
+            return;
+        }
+        if (!v->calling && v->aa_strict >= RUN_128T &&
+            (v->stage == STG_A_R1 || v->stage == STG_A_TRAIN || v->stage == STG_A_WAIT_E ||
+             v->stage == STG_A_B1 || in_data))
+        {
+            if (in_data)
+                emit(v, DM_V32_RETRAINING);
+            restart(v, "the calling modem is sending AA", false);
+            return;
+        }
     }
 
     switch (v->stage)
@@ -2245,7 +2768,7 @@ static void control(dm_v32_t *v, long long n)
             /* 5.4.2: 16 symbols of silence, then S, S-bar, TRN and R1. */
             long long trn = trn_length(v);
 
-            v->sent_rate = make_word(false, true, v->max_rate >= 9600, v->max_rate >= 9600 && v->trellis);
+            v->sent_rate = make_word(false, v->enabled, v->bis);
             v->tx.word = v->sent_rate;
             tx_set(v, SEG_SILENCE, 16);
             tx_then(v, SEG_S, 256);
@@ -2282,15 +2805,43 @@ static void control(dm_v32_t *v, long long n)
             go_data(v);
         break;
 
+    case STG_RN_B1:
+        /* 8.1 and 8.2/V.32 bis: 24 symbols of scrambled ones, then data -
+         * each direction on its own clock. A step up that got nowhere -
+         * the far end's receiver would not have it - waits twice as long
+         * before the next. */
+        if (!v->tx.data_on && v->tx.seg == SEG_DATA && v->tx.count >= 24)
+            v->tx.data_on = true;
+        if (!v->rx.data_on && v->rx.mode == RX_DATA && v->rx.data_rcvd >= 24)
+            v->rx.data_on = true;
+        if (v->tx.data_on && v->rx.data_on)
+        {
+            stage_enter(v, STG_DATA, 0.0);
+            v->low_since = v->poor_since = 0;
+            v->renegotiations++;
+            v->up_since = 0;
+            if (v->rn_from >= 0 && (int) v->coding <= v->rn_from && v->up_backoff > 0.0)
+                v->up_backoff = (v->up_backoff * 2.0 > 600.0) ? 600.0 : v->up_backoff * 2.0;
+            else
+                v->up_backoff = 30.0;
+            v->up_next = n + SECONDS(v->up_backoff);
+            v->rn_from = -1;
+            DM_INFO("v32", "changed rate to %s without retraining: SNR %.1f dB (tag=%s)",
+                    coding_name(v->rx.coding), rx_snr(v), v->tag);
+            emit(v, DM_V32_RATE_CHANGED);
+        }
+        break;
+
     case STG_DATA:
     {
         float snr = rx_snr(v);
-        /* Where each coding stops being worth having: measured back to back
-         * over G.711, the trellis code is at about 1e-2 bit errors by 15 dB
-         * and useless by 13; the 16-point code needs 3 dB more; 4800 is
-         * still clean at 14. A retrain picks the rate again, from what the
-         * line will bear now. */
-        float poor = (v->rate == 4800) ? 11.0f : (v->tcm ? 14.0f : 17.0f);
+        /* Where each coding stops being worth having (CODING): measured
+         * back to back over G.711, the 9600 trellis code is at about 1e-2
+         * bit errors by 15 dB and useless by 13; the 16-point code needs 3
+         * dB more; 4800 is still clean at 14. Between two V.32 bis modems
+         * the cure is to step down to a rate the line will bear (8/V.32
+         * bis); otherwise a retrain picks the rate again. */
+        float poor = CODING[v->coding].poor_db;
 
         if (v->pwr < v->ploss)
         {
@@ -2314,8 +2865,15 @@ static void control(dm_v32_t *v, long long n)
             else if (n - v->poor_since > SECONDS(2.0))
             {
                 char why[80];
+                int want = rn_desired(v);
 
                 snprintf(why, sizeof(why), "reception has been poor (%.1f dB SNR) for 2 seconds", snr);
+                /* Stepping down only helps where the line is the trouble -
+                 * not where the signal has all but gone, or the far end
+                 * ignored the last request. */
+                if (!v->rn_refused && want < (int) v->coding && snr >= CODING[CODE_4800].poor_db + 2.0f &&
+                    rn_start(v, want, why))
+                    break;
                 emit(v, DM_V32_RETRAINING);
                 restart(v, why, false);
                 return;
@@ -2324,6 +2882,35 @@ static void control(dm_v32_t *v, long long n)
         else
         {
             v->poor_since = 0;
+        }
+
+        /* And the other way: reception good enough for a higher rate, with
+         * a dB to spare, for ten seconds - after a step down that turned out
+         * more cautious than it needed to be, or a bad patch that passed. */
+        if (v->bis && v->far_bis && !v->rn_refused)
+        {
+            int up = rn_desired(v);
+
+            if (up > (int) v->coding && snr >= CODING[up].offer_db + 1.0f)
+            {
+                if (v->up_since == 0)
+                    v->up_since = n;
+                else if (n - v->up_since > SECONDS(10.0) && n >= v->up_next)
+                {
+                    char why[80];
+
+                    snprintf(why, sizeof(why), "reception is good enough for %d (%.1f dB SNR)", CODING[up].rate,
+                             snr);
+                    if (v->up_backoff <= 0.0)
+                        v->up_backoff = 30.0;
+                    if (rn_start(v, up, why))
+                        break;
+                }
+            }
+            else
+            {
+                v->up_since = 0;
+            }
         }
         break;
     }
@@ -2390,8 +2977,29 @@ dm_v32_t *dm_v32_create(const dm_v32_params_t *p)
         return NULL;
     }
     v->calling = p->calling;
-    v->max_rate = (p->max_rate >= 9600) ? 9600 : 4800;
-    v->trellis = p->trellis;
+    v->bis = p->v32bis;
+    v->rn_deaf = p->deaf_to_renegotiation;
+    v->trellis = p->trellis || p->v32bis;
+    /* 4800 always. V.32 bis keeps the nonredundant 9600 for a V.32 far end
+     * that has no trellis coder (1e/V.32 bis: "compatibility with V.32"). */
+    v->enabled = CBIT(CODE_4800);
+    if (p->max_rate >= 9600 || p->max_rate == 0)
+    {
+        v->enabled |= CBIT(CODE_9600U);
+        if (v->trellis)
+            v->enabled |= CBIT(CODE_9600T);
+    }
+    if (v->bis)
+    {
+        int max = (p->max_rate == 0) ? 14400 : p->max_rate;
+
+        if (max >= 7200)
+            v->enabled |= CBIT(CODE_7200T);
+        if (max >= 12000)
+            v->enabled |= CBIT(CODE_12000T);
+        if (max >= 14400)
+            v->enabled |= CBIT(CODE_14400T);
+    }
     snprintf(v->tag, sizeof(v->tag), "%s", p->tag ? p->tag : (p->calling ? "out" : "in"));
     v->get_bit = p->get_bit;
     v->put_bit = p->put_bit;
@@ -2465,6 +3073,18 @@ int dm_v32_bit_rate(const dm_v32_t *v)
     return v->rate;
 }
 
+bool dm_v32_renegotiate(dm_v32_t *v, int rate)
+{
+    int want = -1;
+
+    for (int c = 0; c < CODE_COUNT; c++)
+        if ((SET_BIS & CBIT(c)) && CODING[c].rate <= rate)
+            want = c;
+    if (want < 0)
+        return false;
+    return rn_start(v, want, "asked to change rate");
+}
+
 float dm_v32_rx_power(const dm_v32_t *v)
 {
     return 10.0f * log10f(v->pwr / v->p0 + 1e-12f);
@@ -2484,4 +3104,6 @@ void dm_v32_stats(const dm_v32_t *v, dm_v32_stats_t *out)
     out->echo_return_loss_db = v->ec.erl_db;
     out->echo_cancelled_db = v->ec.erle_db;
     out->retrains = v->retrains;
+    out->v32bis = v->bis && v->far_bis;
+    out->renegotiations = v->renegotiations;
 }

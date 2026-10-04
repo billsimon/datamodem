@@ -18,7 +18,7 @@ Login:
 ```
 
 There is no modem hardware and no sound card anywhere in this. The data pumps
-- spandsp's, and a V.32 of our own - are wired straight into a pjsip media
+- spandsp's, and a V.32 and V.32bis of our own - are wired straight into a pjsip media
 port, so the modulated audio is the RTP stream.
 
 Sibling project: [`faxmodem`](../faxmodem) does the same thing for T.30 fax.
@@ -59,7 +59,11 @@ environment, then the file. `datamodem help` lists all of them;
 export DATAMODEM_PASSWORD=...
 datamodem +15551234567 --server sip.example.com --username 1001
 
-# 9600 bps, where the far end is a V.32 (or V.32bis, V.34...) modem
+# 14400 bps, where the far end is a V.32bis (or V.34, V.90...) modem; a far
+# end that only does V.32 gets 9600
+datamodem 5551234 --server sip.example.com --username 1001 --modulation v32bis
+
+# 9600 bps, plain V.32
 datamodem 5551234 --server sip.example.com --username 1001 --modulation v32
 
 # a host that wants 7E1 and speaks Bell 103
@@ -123,6 +127,7 @@ off by default, because a real modem has no such thing.
 
 | `--modulation` | Standard | Rate | Calling end transmits | Answering end transmits |
 |---|---|---|---|---|
+| `v32bis` | ITU-T V.32bis | 14400, 12000, 9600, 7200 or 4800 | 1800 Hz carrier | 1800 Hz carrier, the same band |
 | `v32` | ITU-T V.32 | 9600 or 4800 | 1800 Hz carrier | 1800 Hz carrier, the same band |
 | `v22bis` | ITU-T V.22bis | 2400 or 1200 | 1200 Hz carrier | 2400 Hz carrier |
 | `v22` | ITU-T V.22 | 1200 | 1200 Hz carrier | 2400 Hz carrier |
@@ -130,7 +135,7 @@ off by default, because a real modem has no such thing.
 | `v21` (default) | ITU-T V.21 | 300 full duplex | 980/1180 Hz | 1650/1850 Hz |
 | `bell103` | Bell 103 | 300 full duplex | 1270/1070 Hz | 2225/2025 Hz |
 
-All six carry data, verified byte-for-byte in both directions by `selftest`
+All seven carry data, verified byte-for-byte in both directions by `selftest`
 and over a real call by `loopback-test.sh`. **V.22bis needs the sources in
 `third_party/spandsp-v22bis` built in** — the V.22bis in most packaged
 libspandsp builds does not work; see below.
@@ -144,7 +149,8 @@ test are this same program and invert together; the table above is checked
 against the standards rather than against a passing test.
 
 2400 bps is thirty times faster than 300 and makes an interactive session
-genuinely comfortable; 9600 makes a file transfer reasonable. Against that,
+genuinely comfortable; 9600 makes a file transfer reasonable, and 14400 half
+as long again. Against that,
 V.22bis takes about 6 seconds to train where V.21 takes about 4 - V.32 six
 to ten, depending on the round trip - and QAM is far less tolerant of a poor
 audio path than FSK is. If a trunk is doing anything at all to the audio,
@@ -153,9 +159,10 @@ the 300 bps modes will survive it and the QAM ones will not.
 The default is still `v21`, because 300 bps will get through an audio path
 that nothing else will, and thirty characters a second is a perfectly usable
 interactive terminal — it is how everyone did this in 1982. Reach for
-`--modulation v32` or `v22bis` when you want the speed and the line is good;
-V.32 needs the far end to be a V.32 modem (or anything later, all of which
-fall back to it), V.22bis is what nearly everything speaks.
+`--modulation v32bis`, `v32` or `v22bis` when you want the speed and the line
+is good; V.32bis and V.32 need the far end to be a V.32 modem or anything
+later (all of which fall back to it - V.32bis itself drops to V.32 for a far
+end that is only V.32), V.22bis is what nearly everything speaks.
 
 ### The V.22bis situation, and why `third_party` exists
 
@@ -235,7 +242,11 @@ An echo only 10 dB down makes 9600 impossible, and they are often worse. So:
   echo of its start has time to come back and be learned before the far end
   starts talking.
 - Once the far end is talking the canceller keeps adapting, slowly, so it
-  follows the small drift of a real path.
+  follows the small drift of a real path - quickly for the first few
+  seconds, then at a step small enough that the far end's own signal, which
+  is noise as far as the canceller is concerned, does not leak into it. At
+  the old fixed step that leak was 30 dB down: no matter at 9600, a third of
+  the margin at 14400.
 
 Two datamodems talking pure VoIP have no hybrid anywhere and no echo; the
 log says `echo canceller off - no echo`, which is correct, not a fault.
@@ -251,15 +262,20 @@ coming back 10 dB down:
 
 | noise | rate agreed | receiver SNR | result |
 |---|---|---|---|
-| none | 9600 trellis | 31-32 dB | byte-for-byte |
-| -40 dBm0 | 9600 trellis | 26-27 dB | byte-for-byte |
-| -31 dBm0 | 9600 trellis | 19-20 dB | byte-for-byte |
-| -27 dBm0 | 4800 | 16 dB | byte-for-byte |
+| none | 9600 trellis | 32-35 dB | byte-for-byte |
+| -40 dBm0 | 9600 trellis | 27-28 dB | byte-for-byte |
+| -31 dBm0 | 9600 trellis | 19.5-20 dB | byte-for-byte |
+| -29 dBm0 | 4800 | 18 dB | byte-for-byte |
 | -24 dBm0 | 4800 | 13 dB | byte-for-byte |
 
-The trellis code is worth about 3.5 dB over the uncoded 16-point
-constellation, which is the difference between those last rows being 9600 or
-not. Longer runs in a separate harness ran two minutes without a bit error
+The trellis code is worth about 3 dB over the uncoded 16-point
+constellation. The thresholds come from a minute of pseudo-random data each
+way at every rate and noise level, measured bit by bit: each coding is
+offered a dB above the SNR where it stopped making errors at all (19 dB for
+9600 trellis coded), and a running link counts as poor where it reaches
+about one error in ten thousand (17 dB). The receiver's SNR estimate tracks
+what training predicted to within 0.3 dB, which is what makes choosing a
+rate from training work. Longer runs in a separate harness ran two minutes without a bit error
 with the echo 3 dB down and a 250 ms path, with the far modem's clock 1000
 ppm off ours (ten times what V.32 permits), and through a dispersive
 channel; 20-60 ms of lost audio costs the bits in it and no retrain.
@@ -287,12 +303,95 @@ answer tone and goes straight to AC, which V.32 allows on national
 connections, the caller hears that and starts at once instead of waiting out
 `--answer-wait`.
 
+### V.32bis: 14400 bps
+
+`--modulation v32bis` is ITU-T V.32bis (02/91), in the same `src/v32.c`: V.32
+with three more trellis coded constellations - 14400 (128 points), 12000
+(64) and 7200 (16) - alongside V.32's 9600 and 4800, and a way of changing
+rate in the middle of a call without retraining.
+
+```
+datamodem 5551234 --server sip.example.com --username 1001 --modulation v32bis
+...
+info  [v32] trained at 14400 (trellis coded): SNR 33.5 dB, round trip 300 ms,
+      echo canceller on (tag=out)
+CONNECT 14400
+```
+
+Everything V.32 does above, V.32bis does the same way: the same start-up,
+the same echo canceller, the same trellis code and the same 9600
+constellation, point for point. What changes is the meaning of the rate
+signals. A V.32bis modem marks its own with two bits V.32 left alone, and if
+the far end's lack them the call runs as V.32 - so `--modulation v32bis`
+dialling a V.32 modem connects at 9600, says `trained at 9600 ..., as V.32`,
+and is exactly the V.32 above. Both BBSes this was tried against announce
+themselves as V.32bis in their very first rate signal (`0ff9: V.32bis 4800
+7200 9600 12000 14400`) and were answering `--modulation v32` as V.32.
+
+`--bit-rate` caps what is offered: 14400, 12000, 9600, 7200 or 4800.
+
+**Choosing the rate.** As with V.32, each end offers only what its receiver
+trained well enough for, a dB above where each coding stopped making errors.
+The same conditions as the V.32 table:
+
+| noise | rate agreed | receiver SNR | result |
+|---|---|---|---|
+| none | 14400 | 33 dB | byte-for-byte |
+| -40 dBm0 | 14400 | 27.5 dB | byte-for-byte |
+| -36 dBm0 | 12000 | 24.5 dB | byte-for-byte |
+| -33 dBm0 | 9600 | 22 dB | byte-for-byte |
+| -29 dBm0 | 7200 | 18 dB | byte-for-byte |
+| -24 dBm0 | 4800 | 13 dB | byte-for-byte |
+
+Each further bit per symbol costs 3 dB: 14400 wants about 25 dB, which a
+clean G.711 path gives with room to spare. 7200 needs no more than 4800
+does, to within a dB, and is half as fast again.
+
+**Changing rate without retraining** (section 8). Between two V.32bis modems
+either end can ask for a different rate in the middle of data: a preamble,
+an exchange of rate signals, and 24 symbols at the new rate, a fraction of a
+second in all where a retrain is several. The equaliser, the loops and the
+echo canceller carry on as they were. datamodem answers the far end's
+requests, and makes its own:
+
+- **down**, when reception has been poor for two seconds, to the best rate
+  the receiver would bear now - which is what V.32 can only retrain for;
+- **up**, when reception has been good enough for a higher rate, with a dB
+  to spare, for ten seconds: after a step down that was more cautious than it
+  needed to be, or a bad patch that passed. An attempt that gets nothing -
+  the far end's receiver would not have it - waits twice as long before the
+  next.
+
+```
+info  [v32] reception has been poor (18.3 dB SNR) for 2 seconds; asking the far end to change to 7200 (tag=out)
+info  [v32] changed rate to 7200 (trellis coded) without retraining: SNR 17.8 dB (tag=out)
+...
+info  [v32] reception is good enough for 14400 (31.5 dB SNR); asking the far end to change to 14400 (tag=out)
+info  [v32] changed rate to 14400 (trellis coded) without retraining: SNR 29.9 dB (tag=out)
+```
+
+The Recommendation sends the rate change in the middle of whatever was
+crossing, so the bits in flight at that moment are lost: V.42 retransmits
+them, and without V.42 a character or two goes astray, exactly as with a
+retrain. A far end that does not answer a request - the Recommendation
+warns that some V.32 modems use the marking bit for something else - or
+starts the exchange and does not finish it, is retrained with instead, and
+not asked again; its own requests are still answered.
+
+Datamodem against datamodem it has run fifteen minutes at 14400 without a
+bit error, with the far end's echo 10 dB down, a 150 ms path, G.711 and the
+far modem's clock 50 ppm off ours; it holds 14400 from -100 to +200 ppm.
+**What it has not met yet is a real V.32bis modem at 14400**: the
+constellations are checked point by point against the Recommendation's
+figures (and agree with spandsp's V.17, which shares them), and the rate
+signals against its tables, but the same caution as for V.32 applies until
+it has.
+
 ### Faster still
 
-V.32bis (14400) is V.32 with bigger constellations and would be a modest
-step from here. V.34 and V.90 are different machines altogether - V.34's
-line probing, shell mapping and precoding are each a project of their own -
-and nothing here implements them.
+V.34 and V.90 are different machines altogether - V.34's line probing,
+shell mapping and precoding are each a project of their own - and nothing
+here implements them.
 
 ## Error correction and compression
 
@@ -747,12 +846,30 @@ away, answered our XID a little after 1 s, and - having answered - went on
 to compress, at an end that had given up waiting and was not decompressing.
 The banner arrived clean for its first line, while V.42bis was still in its
 transparent start-up, and then turned to garbage. T401 is now the round trip
-(V.32 measures it; otherwise the two jitter buffers) plus half a second,
-never less than V.42's 1 s - which on the default jitter buffers is exactly
-1 s, so the timer table above still holds unless a longer path is measured - and an XID answer
-that does arrive late, before the link is up, is taken rather than
+(V.32 measures it; otherwise the two jitter buffers) plus half a second, plus
+the time to send two of the longest frames at the line rate - ours, and one
+of the far end's that its acknowledgement may be queued behind - never less
+than V.42's 1 s. On the default jitter buffers at 9600 and up that is still
+about 1 s; at 300 bps, where one frame takes three and a half seconds to
+send, it is eight. It is worked out again whenever the rate changes. An XID
+answer that does arrive late, before the link is up, is taken rather than
 discarded. The V.42 detection window is sized from the same round trip. All
-of it only makes this end more patient; nothing the far end does changes. `--log-level debug` prints both ends' XID values and every LAPM frame.
+of it only makes this end more patient; nothing the far end does changes.
+`--log-level debug` prints both ends' XID values and every LAPM frame.
+
+**A one-way transfer was not being acknowledged.** spandsp's LAPM answered
+every I-frame with an RR carrying the final bit, whether or not it had been
+polled, and threw away any final response it had not asked for - its own
+acknowledgements included. And it started T401 only when no timer at all
+was running, which after the link came up was never, because the idle timer
+T403 always was. With data going both ways nobody noticed, the
+acknowledgements riding on I-frames instead; with data going one way - a
+download - every acknowledgement was discarded, the window filled, and
+nothing moved until T403 fired ten seconds later. A 100 KB transfer at 14400
+had moved 59 KB after five minutes; it now takes one. Now F follows P, an unsolicited final response still
+acknowledges, and T401 runs from the first unacknowledged frame, which
+together put the same transfer at line speed. This was there all along, at
+every rate.
 
 **Detection traffic is real junk to a far end that is not listening for it.**
 The ODP pattern will show up as perhaps a hundred garbage characters before
@@ -890,7 +1007,7 @@ needs no network and no credentials, and it is the fastest way to tell a
 modulation problem from a SIP problem. Try it on each modulation:
 
 ```
-for m in v32 v22bis v22 v23 v21 bell103; do ./build/datamodem selftest --modulation $m; done
+for m in v32bis v32 v22bis v22 v23 v21 bell103; do ./build/datamodem selftest --modulation $m; done
 for v in "" "--v42 detect" "--v42 detect --v42bis"; do
     ./build/datamodem selftest $v
 done
@@ -907,6 +1024,31 @@ DATAMODEM_SELFTEST_LINE="delay=150,echo=-10,noise=-40,ulaw" \
 
 # the 16-point fallback every 9600 bps V.32 modem has to support
 DATAMODEM_V32_NO_TRELLIS=1 ./build/datamodem selftest --modulation v32
+
+# 20 ms of loud noise every 3 seconds: damaged frames for V.42 to recover
+DATAMODEM_SELFTEST_LINE="delay=150,echo=-10,ulaw,burst=20/3" \
+    ./build/datamodem selftest --modulation v32bis --v42 require
+```
+
+A few more test hooks, none of them options:
+
+```
+# more data than 512 bytes, to see error rates 512 bytes cannot
+DATAMODEM_SELFTEST_BYTES=200000 ./build/datamodem selftest --modulation v32bis
+
+# data from the caller only, the way a download goes: acknowledgements
+# cannot ride on I-frames, so LAPM has to get its RRs right
+DATAMODEM_SELFTEST_ONEWAY=1 ./build/datamodem selftest --modulation v32bis --v42 require
+
+# V.32bis rate renegotiation, which a clean line never needs: the calling
+# end asks for 9600 five seconds in ("5:9600:answer" for the answering end)
+DATAMODEM_V32_RENEGOTIATE=5:9600 DATAMODEM_SELFTEST_BYTES=50000 \
+    ./build/datamodem selftest --modulation v32bis --v42 require
+
+# and the same against an answering end that ignores it: the request times
+# out, both ends retrain, and neither asks again
+DATAMODEM_V32_IGNORE_RENEGOTIATION=answer DATAMODEM_V32_RENEGOTIATE=5:9600 \
+    DATAMODEM_SELFTEST_BYTES=50000 ./build/datamodem selftest --modulation v32bis --v42 require
 ```
 
 `loopback-test.sh` starts an answering datamodem and dials it over real SIP
@@ -954,7 +1096,7 @@ are actually off while connected and actually back on afterwards, and drives
                                   +-------------+
 ```
 
-- `modem.c` — the data pump. spandsp's FSK and V.22bis engines, our V.32,
+- `modem.c` — the data pump. spandsp's FSK and V.22bis engines, our V.32 and V.32bis,
   the answer tone, the asynchronous character framing, and the V.42/V.42bis
   stack. The
   transmit framer is written out by hand rather than using spandsp's
@@ -972,9 +1114,10 @@ are actually off while connected and actually back on afterwards, and drives
   every burst is flushed: without the flush the compressor sits on a typed
   command indefinitely, waiting for input that will not arrive until the far
   end replies to the thing stuck in the buffer.
-- `v32.c` — V.32, complete: transmitter, receiver (matched filter, Gardner
-  timing, fractionally spaced equaliser, Viterbi decoder for the trellis
-  code), echo canceller, and the start-up and retrain procedures. It knows
+- `v32.c` — V.32 and V.32bis, complete: transmitter, receiver (matched
+  filter, Gardner timing, fractionally spaced equaliser, Viterbi decoder for
+  the trellis code), echo canceller, the start-up and retrain procedures, and
+  V.32bis's rate renegotiation. It knows
   nothing of spandsp or pjmedia - samples in, samples out, bits through
   callbacks.
 - `sip.c` — pjsua: registration, call setup, and the `pjmedia_port` that pulls
