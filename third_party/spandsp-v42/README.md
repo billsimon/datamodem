@@ -214,7 +214,8 @@ Now:
   arrives late, before the UA, in which case it is taken: the far end has
   agreed and will compress whatever we decided in the meantime;
 - T401 is per context, set by `dm_v42_set_t401()` from the round trip
-  `src/modem.c` knows about, never below V.42's 1 s. A fixed 1 s is shorter
+  `src/modem.c` knows about (and, since patch 9, the line rate), never below
+  V.42's 1 s. A fixed 1 s is shorter
   than some RTP round trips, and an XID answered at 1.1 s over a 772 ms path
   was given up on and then discarded;
 - `receive_xid()` narrows `s->config` to the agreement — the directions both
@@ -230,6 +231,40 @@ Now:
 `dm_v42_no_xid` (from `DATAMODEM_V42_NO_XID`) makes an end behave like the
 far ends that know nothing of XID — never sending one, ignoring any received
 — so the other end's fallback can be tested.
+
+### 9. A one-way transfer was never acknowledged
+
+Three faults in the data phase, which traffic in both directions hides
+completely - acknowledgements ride on I-frames then - and which a download
+exposes at once:
+
+- `tx_information_rr_rnr_response()` answered every I-frame with an RR (or
+  RNR) carrying F=1, polled or not. F now mirrors the command's P bit.
+- `rx_supervisory_rsp_frame()` discarded, whole, any response with F=1 that
+  arrived outside timer recovery - and since upstream's receiver sent nothing
+  else, that was every acknowledgement it ever got from another spandsp, and
+  possibly from far ends built on it. The F bit is now ignored there, as it
+  means nothing, and the N(R) acknowledgement is taken.
+- `lapm_hdlc_underflow()` started T401 for an I-frame only if `bit_timer`
+  was zero. But T401 and T403 share that one timer, and T403 is running from
+  the moment the link is up whenever T401 is not, so T401 never ran in the
+  data phase at all. It now starts if what is running is anything other than
+  T401 (8.4.8: T401 runs while an I-frame is unacknowledged).
+
+Together they left the sender's window full of frames it would never hear
+acknowledged, until T403 fired ten seconds later, polled, and sent everything
+again - which the receiver, having had it all, rejected. A 100 KB one-way
+transfer at 14400 had moved 59 KB in five minutes.
+
+T401 actually running has a consequence for `src/modem.c`: a 128-octet
+frame takes 3.5 s to send at 300 bps, so a T401 of 1 s expired before the
+frame it was timing had left. It is now sized there to cover the round
+trip, two frames at the line rate and some thinking time, and resized when
+the rate changes.
+
+The frame log also showed P/F from the wrong bit for I and S frames - bit 4
+of the control octet, which is the U frame's P/F but part of N(S) or the
+frame type in the others. It now reads the second control octet for those.
 
 ### The test hook
 

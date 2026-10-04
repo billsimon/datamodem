@@ -1,4 +1,5 @@
-/* ITU-T V.32: 9600 and 4800 bit/s, full duplex, on one pair of wires.
+/* ITU-T V.32: 9600 and 4800 bit/s, full duplex, on one pair of wires - and
+ * V.32 bis, which takes the same modem to 14 400.
  *
  * Both directions occupy the same band - a 2400 baud QAM carrier at 1800 Hz -
  * so each modem has to subtract its own echo from what it hears before it
@@ -14,9 +15,13 @@
  * same way.
  *
  * Implemented: 9600 bit/s trellis coded (32 points) and nonredundant (16
- * points), 4800 bit/s (4 points), and the full rate negotiation between them.
- * Not implemented: 2400 bit/s, which the Recommendation leaves for further
- * study, and the Annex A automode fallback to V.22bis. */
+ * points), 4800 bit/s (4 points), and the full rate negotiation between them;
+ * and with v32bis set, V.32 bis's 14 400, 12 000 and 7200 bit/s (128, 64 and
+ * 16 points, all trellis coded) and its rate renegotiation, answering the far
+ * end's requests and making its own when reception degrades. A V.32 bis
+ * modem works to V.32's rules with a far end that is only V.32, as the
+ * Recommendation requires. Not implemented: 2400 bit/s, which V.32 leaves for
+ * further study, and the Annex A automode fallback to V.22bis. */
 #ifndef DATAMODEM_V32_H
 #define DATAMODEM_V32_H
 
@@ -31,16 +36,19 @@ typedef enum
     DM_V32_RETRAINING,       /* a retrain has begun, from either end; data is paused */
     DM_V32_CARRIER_DOWN,     /* the far end's signal has gone; a retrain is being tried */
     DM_V32_TRAINING_FAILED,  /* a stage of the handshake timed out; starting it over */
-    DM_V32_CLEARDOWN         /* the rate exchange agreed on no rate at all */
+    DM_V32_CLEARDOWN,        /* the rate exchange agreed on no rate at all */
+    DM_V32_RATE_CHANGED      /* V.32 bis renegotiated the rate; data is crossing again */
 } dm_v32_event_t;
 
 typedef struct
 {
     bool calling;
-    int max_rate;             /* 9600 or 4800 */
-    bool trellis;             /* offer the trellis-coded 9600; the 16-point one is always there */
+    bool v32bis;              /* a V.32 bis modem; otherwise V.32 */
+    int max_rate;             /* 14400, 12000, 9600, 7200 or 4800; V.32 stops at 9600 and skips 7200 */
+    bool trellis;             /* V.32: offer the trellis-coded 9600; the 16-point one is always there */
     bool listen_first;        /* calling: stay silent until dm_v32_start(), or until AC is heard */
     float tx_power;           /* dBm0 */
+    bool deaf_to_renegotiation; /* test hook: act like a far end that ignores 8/V.32 bis */
     const char *tag;          /* for logs */
 
     /* Called on whichever thread drives dm_v32_tx / dm_v32_rx. get_bit is
@@ -65,6 +73,8 @@ typedef struct
     float echo_return_loss_db; /* how far below our own signal the echo came back */
     float echo_cancelled_db;  /* and how much further the canceller took it down */
     unsigned retrains;
+    bool v32bis;              /* both ends are V.32 bis; false when either is only V.32 */
+    unsigned renegotiations;  /* rate changes without a retrain (V.32 bis) */
 } dm_v32_stats_t;
 
 dm_v32_t *dm_v32_create(const dm_v32_params_t *params);
@@ -89,6 +99,11 @@ void dm_v32_start(dm_v32_t *v);
 bool dm_v32_started(const dm_v32_t *v);
 
 int dm_v32_bit_rate(const dm_v32_t *v);
+
+/* V.32 bis, in data: ask the far end to change to rate, or the best below it
+ * that both ends will take (8/V.32 bis). False if this is not a V.32 bis
+ * call, or not in data. DM_V32_RATE_CHANGED says when it has happened. */
+bool dm_v32_renegotiate(dm_v32_t *v, int rate);
 float dm_v32_rx_power(const dm_v32_t *v);
 void dm_v32_stats(const dm_v32_t *v, dm_v32_stats_t *out);
 

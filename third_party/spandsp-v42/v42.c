@@ -696,7 +696,11 @@ static void dm_frame_log(v42_state_t *ss, const char *dir, const uint8_t *frame,
              dir, dm_lapm_frame_name(frame, len),
              ok ? "      " : "BAD FCS",
              (len > 0) ? frame[0] : 0, (len > 1) ? frame[1] : 0,
-             (len > 1) ? ((frame[1] >> 4) & 1) : 0,
+             /* datamodem: where P/F is depends on the frame: bit 4 of
+                the control octet in a U frame, bit 0 of the second in I and
+                S frames, whose bit 4 is part of N(S) or the S frame type. */
+             (len > 1) ? (((frame[1] & 0x03) == 0x03) ? ((frame[1] >> 4) & 1)
+                                                      : ((len > 2) ? (frame[2] & 1) : 0)) : 0,
              len, hex, (len > shown) ? "..." : "");
 
     /* datamodem: and then all of it, 32 octets a line with the printable
@@ -993,8 +997,16 @@ static void tx_information_rr_rnr_response(v42_state_t *ss, const uint8_t *frame
     s = &ss->lapm;
     /* Respond with information frame, RR, or RNR, as appropriate */
     /* p = 1 may be used for status checking */
+    /* datamodem: with F equal to the command's P, as HDLC's poll/final rule has it.
+       Upstream set F=1 on every one, and the far end's
+       rx_supervisory_rsp_frame() - ours included - throws away a final
+       response it did not poll for, acknowledgement and all. Both ends
+       sending data hides it, the acknowledgements riding on I-frames
+       instead; a one-way transfer, a download, got no acknowledgements at
+       all, filled its window and sat there until a timer let it go round
+       again. */
     if ((frame[2] & 0x1)  ||  !tx_information_frame(ss))
-        tx_supervisory_frame(s, frame[0], (s->local_busy)  ?  LAPM_S_RNR  :  LAPM_S_RR, 1);
+        tx_supervisory_frame(s, frame[0], (s->local_busy)  ?  LAPM_S_RNR  :  LAPM_S_RR, frame[2] & 0x1);
 }
 /*- End of function --------------------------------------------------------*/
 
@@ -1160,15 +1172,22 @@ static void rx_supervisory_rsp_frame(v42_state_t *ss, const uint8_t *frame, int 
     lapm_state_t *s;
 
     s = &ss->lapm;
-    if (s->retry_count == 0  &&  (frame[2] & 0x1))
-        return;
+    /* datamodem: a final response nobody polled for. Upstream dropped the
+       frame whole, acknowledgement included - and upstream's own receiver
+       sent nothing else (see tx_information_rr_rnr_response()), as may any
+       far end built on it. The F bit means nothing here, but N(R) still
+       does, so take it as a plain response. */
+    int f = frame[2] & 0x1;
+
+    if (s->retry_count == 0  &&  f)
+        f = 0;
     /* Ack I frames <= NR - 1 */
     switch (frame[1] & 0x0C)
     {
     case LAPM_S_RR:
         s->far_busy = FALSE;
         ack_info(ss, frame[2] >> 1);
-        if (s->retry_count  &&  (frame[2] & 0x1))
+        if (s->retry_count  &&  f)
         {
             reject_info(s);
             t401_stop_t403_start(ss);
@@ -1177,7 +1196,7 @@ static void rx_supervisory_rsp_frame(v42_state_t *ss, const uint8_t *frame, int 
     case LAPM_S_RNR:
         s->far_busy = TRUE;
         ack_info(ss, frame[2] >> 1);
-        if (s->retry_count  &&  (frame[2] & 0x1))
+        if (s->retry_count  &&  f)
         {
             reject_info(s);
             t401_stop_t403_start(ss);
@@ -1188,7 +1207,7 @@ static void rx_supervisory_rsp_frame(v42_state_t *ss, const uint8_t *frame, int 
     case LAPM_S_REJ:
         s->far_busy = FALSE;
         ack_info(ss, frame[2] >> 1);
-        if (s->retry_count == 0  ||  (frame[2] & 0x1))
+        if (s->retry_count == 0  ||  f)
         {
             reject_info(s);
             t401_stop_t403_start(ss);
@@ -1422,7 +1441,14 @@ static void lapm_hdlc_underflow(void *user_data)
         f->buf[1] = s->vs << 1;
         f->buf[2] = s->vr << 1;
         s->vs = (s->vs + 1) & 0x7F;
-        if (ss->bit_timer == 0)
+        /* datamodem: T401 runs from the first I-frame that has not been
+           acknowledged (8.4.8) - whatever else the one timer was doing.
+           Upstream started it only if no timer was running, but T403, the
+           idle poll, is running whenever T401 is not, from the moment the
+           link comes up. So T401 never ran at all, and a frame lost or an
+           acknowledgement missed was recovered only when T403 expired, ten
+           seconds later. */
+        if (ss->bit_timer == 0  ||  ss->bit_timer_func != t401_expired)
             t401_start(ss);
     }
     dm_frame_log(ss, "tx", f->buf, f->len, TRUE);
