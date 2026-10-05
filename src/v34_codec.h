@@ -154,9 +154,9 @@ void v34_data_energy(const v34_data_params_t *p, double *ex, double *exn);
 
 /* -------------------------------------------------------------- decoder */
 
-/* Viterbi decoder for the 16-state code, the one our receiver asks for. It
- * assumes what our MP asks for: no precoding and no non-linear encoding. */
-#define V34_VIT_DEPTH 24
+/* Viterbi decoder for any of the three codes. It assumes what our MP asks
+ * for besides: no precoding and no non-linear encoding. */
+#define V34_VIT_DEPTH 48
 
 typedef void (*v34_put_bit_t)(void *user, int bit);
 
@@ -169,9 +169,10 @@ typedef struct
     uint32_t dscr;
 
     /* Viterbi */
-    float pm[16];
-    uint8_t prev[V34_VIT_DEPTH][16];
-    uint8_t pair[V34_VIT_DEPTH][16];  /* s(2m) << 3 | s(2m+1) */
+    int states;
+    float pm[64];
+    uint8_t prev[V34_VIT_DEPTH][64];
+    uint8_t pair[V34_VIT_DEPTH][64];  /* s(2m) << 3 | s(2m+1) */
     v34_cf_t rx[V34_VIT_DEPTH][2];
     int vpos;
     long long m_in;           /* 4D symbols into the decoder */

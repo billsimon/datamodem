@@ -228,6 +228,8 @@ static void sink_bit(void *user, int bit)
 }
 
 /* Returns the number of bit errors, or -1 if the decoder lost the stream. */
+static bool count_events;
+
 static long round_trip(const v34_data_params_t *p, int frames, double snr_db, size_t *nbits_out)
 {
     static v34_enc_t enc;
@@ -270,8 +272,18 @@ static long round_trip(const v34_data_params_t *p, int frames, double snr_db, si
         if (n + (size_t) f.b * 2 < src.pos)
             errors = -1;
         else
+        {
+            size_t last = 0;
+
+            /* Error events: errors within 200 bits of each other are one. */
             for (size_t i = 0; i < n; i++)
-                errors += src.bits[i] != dst.bits[i];
+                if (src.bits[i] != dst.bits[i])
+                {
+                    if (!count_events || errors == 0 || i - last > 200)
+                        errors++;
+                    last = i;
+                }
+        }
         if (nbits_out)
             *nbits_out = n;
     }
@@ -289,7 +301,8 @@ static void test_round_trip(void)
             for (int ex = 0; ex < 2; ex++)
                 for (int aux = 0; aux < 2; aux++)
                 {
-                    v34_data_params_t p = { .sr = sr, .rate = rate, .trellis = 16, .expanded = ex, .aux = aux };
+                    v34_data_params_t p = { .sr = sr, .rate = rate, .trellis = 16 << ((rate / 2400 + aux) % 3),
+                                            .expanded = ex, .aux = aux };
                     v34_frame_t f;
                     size_t n = 0;
                     long e;
@@ -315,6 +328,26 @@ static void test_coding_gain(void)
     e = round_trip(&p, 600, 38.5, &n);
     printf("  33600 at 3429, 38.5 dB: %ld bit errors in %zu\n", e, n);
     CHECK(e >= 0 && e < 50, "33600 at 38.5 dB SNR: %ld bit errors in %zu bits", e, n);
+    /* The bigger codes do better again. */
+    for (int t = 16; t <= 64; t *= 2)
+    {
+        long tot = 0;
+        size_t nn = 0;
+
+        p.trellis = t;
+        p.rate = 33600;
+        count_events = true;
+        for (int rep = 0; rep < 12; rep++)
+        {
+            e = round_trip(&p, 1000, 32.0, &n);
+            CHECK(e >= 0, "33600 with the %d-state code lost the stream", t);
+            tot += e;
+            nn += n;
+        }
+        count_events = false;
+        printf("  33600 at 3429, 32 dB, %d states: %ld error events in %zu bits\n", t, tot, nn);
+    }
+    p.trellis = 16;
     p.rate = 24000;
     e = round_trip(&p, 600, 30.0, &n);
     printf("  24000 at 3429, 30 dB: %ld bit errors in %zu\n", e, n);

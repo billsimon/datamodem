@@ -61,6 +61,8 @@ typedef struct
     unsigned symbol_rates;    /* test hook: which of the six to allow, bit 0 = 2400; 0 = all */
     int carrier;              /* test hook: what to ask the far end for, 0 = whatever probing says, 1 low, 2 high */
     int pre_emphasis;         /* test hook: likewise, -1 = whatever probing says, else 0 to 10 */
+    int trellis;              /* the code our receiver asks for: 16 (0 means 16), 32 or 64 */
+    bool shaping;             /* ask for expanded shaping */
     const char *tag;          /* for logs */
 
     /* Called on whichever thread drives dm_v34_tx / dm_v34_rx. get_bit is

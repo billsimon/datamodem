@@ -278,6 +278,24 @@ discarded meanwhile (remembered per context, alongside the XID result), so
 that it is sent again at once. `src/modem.c` sets the condition when its
 receive queue is nearly full and clears it once it has drained.
 
+### 11. Going back for a REJ forgot what had been sent
+
+To answer a REJ, `reject_info()` winds V(S) back to V(A) and sends again from
+there. But the far end can still acknowledge frames from beyond that point -
+ones it did receive, the REJ having been for an earlier frame, or ones it
+acknowledged before our going back reached it - and `ack_info()` checked
+N(R) against the wound-back V(S), called that a protocol error, and sent
+DISC. It takes a lot of frames in flight for the window to matter, which is
+why V.32 never showed it: a V.34 retrain at 33 600 bit/s, with a round trip
+of a couple of hundred milliseconds, did it every time - the data link came
+back up after the modems had retrained and then threw itself away.
+
+So the highest N(S) actually sent before going back is remembered (per
+context, alongside the XID result), N(R) up to it is valid, and frames the
+far end turns out to have had are released rather than sent a second time.
+The remembered value is dropped once V(A) has passed it, or once sequence
+numbers could have wrapped round to it.
+
 ### The test hook
 
 `dm_v42_refuse_sabme` makes the answering end refuse that many SABMEs with

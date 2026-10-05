@@ -2117,6 +2117,19 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
             DM_WARN("modem", "DATAMODEM_V34_CARRIER: asking for the %s carrier. This is a test hook.",
                     vp.carrier == 2 ? "high" : "low");
         }
+        /* Test hooks: the trellis code and shaping our receiver asks the far
+         * end's transmitter for. */
+        if (getenv("DATAMODEM_V34_TRELLIS") != NULL)
+        {
+            vp.trellis = atoi(getenv("DATAMODEM_V34_TRELLIS"));
+            DM_WARN("modem", "DATAMODEM_V34_TRELLIS: asking for the %d-state code. This is a test hook.",
+                    vp.trellis);
+        }
+        if (getenv("DATAMODEM_V34_SHAPING") != NULL)
+        {
+            vp.shaping = true;
+            DM_WARN("modem", "DATAMODEM_V34_SHAPING: asking for expanded shaping. This is a test hook.");
+        }
         if (getenv("DATAMODEM_V34_PRE_EMPHASIS") != NULL)
         {
             vp.pre_emphasis = atoi(getenv("DATAMODEM_V34_PRE_EMPHASIS"));
@@ -2849,7 +2862,8 @@ int64_t dm_modem_since_rx_ms(dm_modem_t *m)
  * telephone network; noise is white noise in dBm0; ulaw passes everything
  * through G.711; burst=20/3 adds 20 ms of loud noise every 3 seconds, which
  * damages a frame or two without making the line look bad on average - how
- * V.42's recovery gets exercised. A test hook, not an option - it is how V.32's echo
+ * V.42's recovery gets exercised; cut=20/600 silences the line both ways for
+ * 600 ms, 20 seconds in, which a modem can only recover from by retraining. A test hook, not an option - it is how V.32's echo
  * canceller and round-trip measurement get tested without a phone line. */
 #define SELFTEST_LINE_MAX (SELFTEST_CHUNK * 128) /* 2.5 s of each direction */
 
@@ -2863,6 +2877,8 @@ typedef struct
     awgn_state_t *burst;
     int burst_len;            /* samples */
     int burst_every;          /* samples */
+    long cut_at;              /* line silent from here, both ways, 0 = never */
+    int cut_len;
     int16_t hist[2][SELFTEST_LINE_MAX];
     long pos;
 } selftest_line_t;
@@ -2897,6 +2913,18 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
             noise_db = atof(tok + 6);
         else if (strcmp(tok, "ulaw") == 0)
             ln->ulaw = true;
+        else if (strncmp(tok, "cut=", 4) == 0)
+        {
+            double at = 0.0, ms = 0.0;
+
+            if (sscanf(tok + 4, "%lf/%lf", &at, &ms) != 2 || at <= 0.0 || ms <= 0.0)
+            {
+                DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: cut= wants seconds/ms, as in cut=20/600");
+                return false;
+            }
+            ln->cut_at = (long) (at * DM_SAMPLE_RATE);
+            ln->cut_len = (int) (ms * DM_SAMPLE_RATE / 1000.0);
+        }
         else if (strncmp(tok, "burst=", 6) == 0)
         {
             double ms = 0.0;
@@ -2913,7 +2941,7 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
         }
         else
         {
-            DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise=, burst= or ulaw",
+            DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise=, burst=, cut= or ulaw",
                      tok);
             return false;
         }
@@ -2988,6 +3016,9 @@ static void selftest_line_run(selftest_line_t *ln, dm_modem_t *caller, dm_modem_
             in[e][i] = (int16_t) lrintf(x);
             if (ln->ulaw)
                 in[e][i] = ulaw_to_linear(linear_to_ulaw(in[e][i]));
+            /* The line going dead for a moment, which only a retrain cures. */
+            if (ln->cut_at > 0 && t >= ln->cut_at && t < ln->cut_at + ln->cut_len)
+                in[e][i] = 0;
         }
     }
     ln->pos += SELFTEST_CHUNK;

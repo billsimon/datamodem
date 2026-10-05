@@ -33,6 +33,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <inttypes.h>
 #include <string.h>
 #include <errno.h>
@@ -279,6 +280,7 @@ static struct
     int done;
     int t401_ms;
     int busy_discarded;     /* I-frames thrown away while we were busy (patch 10) */
+    int vs_high;            /* the highest N(S) sent before a REJ went back (patch 11), -1 none */
 } dm_xid[DM_XID_SLOTS];
 
 /* datamodem: test hook. When set, this end behaves like the far ends that
@@ -304,6 +306,7 @@ static int dm_xid_slot(const v42_state_t *s)
     dm_xid[free_slot].done = 0;
     dm_xid[free_slot].t401_ms = 0;
     dm_xid[free_slot].busy_discarded = 0;
+    dm_xid[free_slot].vs_high = -1;
     return free_slot;
 }
 
@@ -1012,14 +1015,31 @@ static void tx_information_rr_rnr_response(v42_state_t *ss, const uint8_t *frame
 }
 /*- End of function --------------------------------------------------------*/
 
+/* datamodem (patch 11): going back for a REJ forgets how far we had got,
+   and the far end may yet acknowledge frames from beyond the point we went
+   back to - ones it had in fact received, the REJ having been for an earlier
+   one, or sent before ours arrived. ack_info() took such an N(R) for a
+   protocol error and disconnected. It only takes enough frames in flight to
+   happen: a V.34 retrain at 33 600 bit/s did it every time. So remember the
+   highest N(S) that went out, and count N(R) up to it as valid. */
+static int *dm_vs_high(lapm_state_t *s)
+{
+    v42_state_t *ss = (v42_state_t *) ((char *) s - offsetof(v42_state_t, lapm));
+
+    return &dm_xid[dm_xid_slot(ss)].vs_high;
+}
+
 static int reject_info(lapm_state_t *s)
 {
     uint8_t n;
+    int *high = dm_vs_high(s);
 
     /* Reject all non-acked frames */
     if (s->state != LAPM_DATA)
         return 0;
     n = (s->vs - s->va) & 0x7F;
+    if (*high < 0 || ((s->vs - s->va) & 0x7F) > ((*high - s->va) & 0x7F))
+        *high = s->vs;
     s->vs = s->va;
     s->info_get = s->info_acked;
     return n;
@@ -1032,17 +1052,40 @@ static int ack_info(v42_state_t *ss, uint8_t nr)
     int n;
 
     s = &ss->lapm;
-    /* Check that NR is valid - i.e.  VA <= NR <= VS  &&  VS-VA <= k */
-    if (!((((nr - s->va) & 0x7F) + ((s->vs - nr) & 0x7F)) <= s->tx_window_size_k
-         &&
-         ((s->vs - s->va) & 0x7F) <= s->tx_window_size_k))
     {
-        lapm_disconnect(ss);
-        return -1;
+        int *high = dm_vs_high(s);
+        uint8_t top = s->vs;
+
+        /* patch 11: what was sent before a REJ took us back counts too -
+           while it is still ahead of V(A) within the window, and so not
+           something sequence numbers have since wrapped past. */
+        if (*high >= 0 && ((*high - s->va) & 0x7F) > s->tx_window_size_k)
+            *high = -1;
+        if (*high >= 0 && ((*high - s->va) & 0x7F) > ((s->vs - s->va) & 0x7F))
+            top = (uint8_t) *high;
+        /* Check that NR is valid - i.e.  VA <= NR <= VS  &&  VS-VA <= k */
+        if (!((((nr - s->va) & 0x7F) + ((top - nr) & 0x7F)) <= s->tx_window_size_k
+             &&
+             ((top - s->va) & 0x7F) <= s->tx_window_size_k))
+        {
+            span_log(&ss->logging, SPAN_LOG_FLOW, "N(R) %d invalid: V(A) %d V(S) %d\n", nr, s->va, s->vs);
+            dm_cause("the far end acknowledged a frame we never sent");
+            lapm_disconnect(ss);
+            return -1;
+        }
+        if (((top - nr) & 0x7F) == 0 || ((nr - s->va) & 0x7F) >= ((top - s->va) & 0x7F))
+            *high = -1;
     }
     n = 0;
-    while (s->va != nr  &&  s->info_acked != s->info_get)
+    while (s->va != nr  &&  s->info_acked != s->info_put)
     {
+        /* Acknowledged frames we had gone back to send again need not go. */
+        if (s->info_acked == s->info_get)
+        {
+            if (++s->info_get >= V42_INFO_FRAMES)
+                s->info_get = 0;
+            s->vs = (s->vs + 1) & 0x7F;
+        }
         if (++s->info_acked >= V42_INFO_FRAMES)
             s->info_acked = 0;
         s->va = (s->va + 1) & 0x7F;

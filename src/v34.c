@@ -219,6 +219,8 @@ typedef struct
     bool in_mp;
     float pwr;               /* T/2 sample power, smoothed */
     float pwr_ref;           /* the far end's level when S arrived */
+    int hold;                /* T/2 samples before adapting again, after the far end was quiet */
+    float pwr_q;             /* T/2 sample power over the last few, to see a silence start at once */
 } qrx_t;
 
 struct dm_v34
@@ -229,6 +231,8 @@ struct dm_v34
     unsigned sr_allow;
     int force_carrier;
     int force_pe;
+    int req_trellis;          /* 0, 1, 2: 16, 32, 64 states */
+    bool req_shaping;
     bool lapm;
     float nominal_dbm0;
     int (*get_bit)(void *user);
@@ -323,6 +327,7 @@ struct dm_v34
     v34_cf_t rx_gain;         /* equaliser output to Figure 5 units */
     float rx_energy;
     float pwr;                /* received power after the canceller */
+    float pwr_fast;           /* the same, quicker, for noticing the far end has gone */
 
     /* what has been learnt */
     v34_info0_t info0_far;
@@ -1110,7 +1115,7 @@ static void track(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf_t u, v34
     /* Nothing is learnt while samples are missing or the far end is quiet,
      * and nothing measured either; nor is anything learnt while our own
      * Phase 3 signal is coming back at us (see ST_P3_TX_SECOND). */
-    if (v->n < v->freeze_until || q->pwr < 0.3f * q->pwr_ref)
+    if (v->n < v->freeze_until || q->pwr < 0.3f * q->pwr_ref || q->hold > 0)
         return;
     {
         float e2 = (crealf(ue) * crealf(ue) + cimagf(ue) * cimagf(ue)) / (dd > 0 ? dd : 1.0f);
@@ -1315,6 +1320,14 @@ static void rx_half(dm_v34_t *v, v34_cf_t y)
 
     q->h[idx & HMASK] = y;
     q->pwr += 0.02f * (crealf(y) * crealf(y) + cimagf(y) * cimagf(y) - q->pwr);
+    /* After a silence, or samples that never came, nothing is learnt until
+     * the equaliser's delay line holds the far end's signal again: what it
+     * decides meanwhile is decided from half a line of nothing. */
+    q->pwr_q += 0.3f * (crealf(y) * crealf(y) + cimagf(y) * cimagf(y) - q->pwr_q);
+    if (q->pwr < 0.3f * q->pwr_ref || q->pwr_q < 0.05f * q->pwr_ref || v->n < v->freeze_until)
+        q->hold = NEQ + 8;
+    else if (q->hold > 0)
+        q->hold--;
     switch (q->mode)
     {
     case RQ_HUNT:
@@ -1635,10 +1648,10 @@ static void rx_data_symbol(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf
 
         track(v, w, vout, u, d / v->rx_gain);
         v34_dec_symbol(&v->dec, y);
-        if (getenv("V34DBG") && (q->k % 2000) == 0)
-            DM_DEBUG("v34", "data k %lld snr %.1f bad %u theta %.3f nu %.5f |g| %.2f (tag=%s)", q->k,
-                     10.0f * log10f(v->rx_energy / (v->dec.err + 1e-9f)), v->dec.bad_frames, q->theta, q->nu,
-                     cabsf(v->rx_gain), v->tag);
+        if (getenv("V34DBG") && (q->k % 500) == 0)
+            DM_DEBUG("v34", "data %.2f k %lld snr %.1f bad %u theta %.3f nu %.5f cent %.2f tau-n %.2f mse %.1f (tag=%s)",
+                     v->n / 8000.0, q->k, 10.0f * log10f(v->rx_energy / (v->dec.err + 1e-9f)), v->dec.bad_frames,
+                     q->theta, q->nu, tap_centroid(q), q->tau - (double) v->n, snr_from_mse(q->mse), v->tag);
         /* Watch for the far end starting a rate renegotiation (11.6), or
          * answering ours. */
         if (v->stage == ST_DATA || v->stage == ST_RN)
@@ -1767,9 +1780,9 @@ static void build_mp(dm_v34_t *v, bool ack)
     mp.type = 1;
     mp.rate_c_to_a = (v->calling ? my_tx_max : rx) / 2400;
     mp.rate_a_to_c = (v->calling ? rx : my_tx_max) / 2400;
-    mp.trellis = 0;
+    mp.trellis = v->req_trellis;
     mp.nonlinear = false;
-    mp.expanded = false;
+    mp.expanded = v->req_shaping;
     mp.ack = ack;
     for (int r = 2400; r <= 33600; r += 2400)
         if (r <= v->max_rate)
@@ -1877,7 +1890,7 @@ static bool settle_rates(dm_v34_t *v)
     memset(&v->dp_rx, 0, sizeof(v->dp_rx));
     v->dp_rx.sr = v->sr_rx;
     v->dp_rx.rate = v->rate_rx;
-    v->dp_rx.trellis = 16;
+    v->dp_rx.trellis = 16 << mine.trellis;
     v->dp_rx.expanded = mine.expanded;
     return true;
 }
@@ -2356,7 +2369,6 @@ static void not_v34(dm_v34_t *v)
 
 static void begin_phase2(dm_v34_t *v)
 {
-    p2_start_rx(v);
     v34_p2tx_init(&v->p2tx, !v->calling, v->nominal_dbm0);
     v->have_info0 = false;
     v->ack_info0 = false;
@@ -2427,7 +2439,12 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         break;
     case ST_V8_C_CJ:
         if (v->v8h == v->v8t)
+        {
+            /* 11.2.1.1.1: the receiver listens for INFO0a through the
+             * silence. */
+            p2_start_rx(v);
             stage_enter(v, ST_V8_DONE, 0.075);
+        }
         break;
     case ST_V8_A_ANSAM:
         if (v->v8_got_msg)
@@ -2460,6 +2477,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         if (v->v8_got_cj)
         {
             v->txm = TXM_SILENCE;
+            p2_start_rx(v);
             stage_enter(v, ST_V8_DONE, 0.075);
         }
         break;
@@ -2492,6 +2510,16 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         }
         break;
     case ST_C2_REV2:
+        if (v->info0_count >= 2 && !v->ack_info0)
+        {
+            /* 11.2.2.1.1: the answerer is repeating INFO0a, so it never had
+             * ours. */
+            v->info0_count = 1;
+            p2_carrier(v, true);
+            send_info0(v);
+            stage_enter(v, ST_C2_INFO0, 10.0);
+            break;
+        }
         if (reversed && rev > (double) v->rev_sent)
         {
             /* 11.2.1.1.4 */
@@ -2563,6 +2591,15 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         }
         break;
     case ST_A2_REV1:
+        if (v->info0_count >= 2 && !v->ack_info0)
+        {
+            /* 11.2.2.2.1: the caller is repeating INFO0c, so it never had
+             * ours. */
+            v->info0_count = 1;
+            send_info0(v);
+            stage_enter(v, ST_A2_INFO0, 10.0);
+            break;
+        }
         if (reversed && rev > (double) v->rev_sent)
         {
             /* 11.2.1.2.4 and 5 */
@@ -2660,11 +2697,14 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             float snr = 10.0f * log10f(v->rx_energy / (v->dec.err + 1e-9f));
 
             v->snr_db = snr;
-            if (v->pwr < v->pmin)
+            if (getenv("V34DBG") && (n % 800) == 0)
+                DM_DEBUG("v34", "data %.2f s: pwr %.1f dBm0 snr %.1f (tag=%s)", n / 8000.0,
+                         10.0 * log10(v->pwr / v->p0 + 1e-12), snr, v->tag);
+            if (v->pwr_fast < v->pmin)
             {
                 if (v->low_since == 0)
                     v->low_since = n;
-                else if (n - v->low_since > MS(400))
+                else if (n - v->low_since > MS(300))
                 {
                     emit(v, DM_V34_CARRIER_DOWN);
                     restart_phase2(v, true, "the far end's signal has gone");
@@ -2835,6 +2875,7 @@ static void rx_sample(dm_v34_t *v, float x, bool missing)
     float e = missing ? 0.0f : v34_ec_run(&v->ec, x, n, v->pwr, v->pmin);
 
     v->pwr += 0.005f * (e * e - v->pwr);
+    v->pwr_fast += 0.05f * (e * e - v->pwr_fast);
     v->n++;
     switch (v->stage)
     {
@@ -2857,11 +2898,10 @@ static void rx_sample(dm_v34_t *v, float x, bool missing)
             fsk_rx(v->fsk_rx, &s, 1);
         break;
     }
-    case ST_V8_DONE:
     case ST_DEAD:
         break;
     default:
-        if (v->stage < ST_P3_TX_FIRST || v->stage == ST_RETRAIN)
+        if (v->stage <= ST_A2_INFO1 || v->stage == ST_RETRAIN)
         {
             reversed = v34_p2rx_sample(&v->p2rx, e, n, &rev);
             phase2_bits(v);
@@ -2920,6 +2960,8 @@ dm_v34_t *dm_v34_create(const dm_v34_params_t *p)
     v->sr_allow = p->symbol_rates ? (p->symbol_rates | 1u) & 0x3Fu : 0x3Fu;
     v->force_carrier = p->carrier;
     v->force_pe = p->pre_emphasis;
+    v->req_trellis = (p->trellis == 64) ? 2 : (p->trellis == 32) ? 1 : 0;
+    v->req_shaping = p->shaping;
     v->lapm = p->lapm;
     v->nominal_dbm0 = p->tx_power;
     v->get_bit = p->get_bit;

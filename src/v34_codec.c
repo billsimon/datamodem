@@ -747,15 +747,14 @@ void v34_data_energy(const v34_data_params_t *p, double *ex, double *exn)
 
 /* -------------------------------------------------------------- decoder */
 
-/* The two (s(2m), s(2m+1)) pairs that share Y4 Y3 Y2 Y1 and U0, grouped by
- * U0 and Y2 Y1 - which is all the 16-state code looks at - so eight pairs per
- * branch: [U0][Y2 Y1][8]. */
-static uint8_t branch_pairs[2][4][8];
+/* The two (s(2m), s(2m+1)) pairs that share Y4 Y3 Y2 Y1 and U0:
+ * [U0][Y4 Y3 Y2 Y1][2]. */
+static uint8_t branch_pairs[2][16][2];
 static pthread_once_t branch_once = PTHREAD_ONCE_INIT;
 
 static void build_branch_pairs(void)
 {
-    int n[2][4] = { { 0 } };
+    int n[2][16] = { { 0 } };
 
     for (int s0 = 0; s0 < 8; s0++)
         for (int s1 = 0; s1 < 8; s1++)
@@ -764,9 +763,9 @@ static void build_branch_pairs(void)
              * parity of the difference between the two symbols' rotations,
              * Z + 2 I1 + U0 against Z. */
             int u0 = (s0 ^ s1) & 1;
-            int y21 = TABLE13[s0][s1] & 3;
+            int yy = TABLE13[s0][s1];
 
-            branch_pairs[u0][y21][n[u0][y21]++] = (uint8_t) ((s0 << 3) | s1);
+            branch_pairs[u0][yy][n[u0][yy]++] = (uint8_t) ((s0 << 3) | s1);
         }
 }
 
@@ -781,7 +780,8 @@ void v34_dec_init(v34_dec_t *d, const v34_data_params_t *p, int dscr_tap, v34_pu
     d->dscr_tap = dscr_tap;
     d->put_bit = put_bit;
     d->user = user;
-    for (int s = 0; s < 16; s++)
+    d->states = (p->trellis == 32 || p->trellis == 64) ? p->trellis : 16;
+    for (int s = 0; s < 64; s++)
         d->pm[s] = 1e9f;
     /* The encoder starts at zero (10.1.3.1). */
     d->pm[0] = 0.0f;
@@ -963,11 +963,12 @@ static void subset_metrics(v34_cf_t y, float out[8])
 
 void v34_dec_symbol(v34_dec_t *d, v34_cf_t y)
 {
+    const int ns_count = d->states;
     float m0[8], m1[8];
-    float bm[2][4];
-    uint8_t bp[2][4];
-    float npm[16];
-    uint8_t np[16], npair[16];
+    float bm[2][16];
+    uint8_t bp[2][16];
+    float npm[64];
+    uint8_t np[64], npair[64];
     int v0;
     int best = 0;
     float lo = 1e30f;
@@ -982,50 +983,42 @@ void v34_dec_symbol(v34_dec_t *d, v34_cf_t y)
     subset_metrics(d->half, m0);
     subset_metrics(y, m1);
     for (int u = 0; u < 2; u++)
-        for (int k = 0; k < 4; k++)
+        for (int k = 0; k < 16; k++)
         {
-            bm[u][k] = 1e30f;
-            bp[u][k] = 0;
-            for (int t = 0; t < 8; t++)
-            {
-                int pr = branch_pairs[u][k][t];
-                float v = m0[pr >> 3] + m1[pr & 7];
+            int a = branch_pairs[u][k][0], b = branch_pairs[u][k][1];
+            float va = m0[a >> 3] + m1[a & 7], vb = m0[b >> 3] + m1[b & 7];
 
-                if (v < bm[u][k])
-                {
-                    bm[u][k] = v;
-                    bp[u][k] = (uint8_t) pr;
-                }
-            }
+            bm[u][k] = (va <= vb) ? va : vb;
+            bp[u][k] = (uint8_t) ((va <= vb) ? a : b);
         }
     /* No precoding, so C0 is zero and U0 = Y0 ^ V0. */
     v0 = v34_v0(&d->f, d->m_in);
-    for (int s = 0; s < 16; s++)
+    for (int s = 0; s < ns_count; s++)
         npm[s] = 1e30f;
-    for (int ps = 0; ps < 16; ps++)
+    for (int ps = 0; ps < ns_count; ps++)
     {
         int u = (ps & 1) ^ v0;
 
-        for (int k = 0; k < 4; k++)
+        for (int k = 0; k < 16; k++)
         {
-            int ns = conv16[ps][k];
+            int nx = (ns_count == 64) ? conv64[ps][k] : (ns_count == 32) ? conv32[ps][k] : conv16[ps][k];
             float v = d->pm[ps] + bm[u][k];
 
-            if (v < npm[ns])
+            if (v < npm[nx])
             {
-                npm[ns] = v;
-                np[ns] = (uint8_t) ps;
-                npair[ns] = bp[u][k];
+                npm[nx] = v;
+                np[nx] = (uint8_t) ps;
+                npair[nx] = bp[u][k];
             }
         }
     }
-    for (int s = 0; s < 16; s++)
+    for (int s = 0; s < ns_count; s++)
         if (npm[s] < lo)
         {
             lo = npm[s];
             best = s;
         }
-    for (int s = 0; s < 16; s++)
+    for (int s = 0; s < ns_count; s++)
     {
         d->pm[s] = npm[s] - lo;
         d->prev[d->vpos][s] = np[s];
