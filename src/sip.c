@@ -1,5 +1,6 @@
 #include "datamodem/sip.h"
 #include "datamodem/log.h"
+#include "datamodem/term.h"
 #include "datamodem/util.h"
 
 #include <pthread.h>
@@ -134,6 +135,9 @@ static call_view_t call_view(void)
 void dm_sip_wait_ms(int ms)
 {
     struct timespec ts;
+
+    /* The main thread's waits are where the status line keeps up. */
+    dm_term_tick();
 
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_nsec += (long) (ms % 1000) * 1000000L;
@@ -314,6 +318,13 @@ static void on_call_state(pjsua_call_id call_id, pjsip_event *e)
     snprintf(c->last_reason, sizeof(c->last_reason), "%.*s", (int) ci.last_status_text.slen,
              ci.last_status_text.ptr);
 
+    if (ci.state == PJSIP_INV_STATE_EARLY && !c->inbound && (ci.last_status == 180 || ci.last_status == 183))
+        dm_term_state("RINGING", "%d %s", ci.last_status, c->last_reason);
+    else if (ci.state == PJSIP_INV_STATE_CONFIRMED && !c->inbound)
+        dm_term_state("ANSWERED", "starting the modem");
+    else if (ci.state == PJSIP_INV_STATE_DISCONNECTED)
+        dm_term_state("HUNG UP", "%d %s", ci.last_status, c->last_reason);
+
     if (ci.state == PJSIP_INV_STATE_CONFIRMED && c->answered_ms == 0)
     {
         c->answered_ms = dm_now_ms();
@@ -418,6 +429,7 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     pthread_mutex_unlock(&g.lock);
 
     DM_INFO("sip", "inbound call %d from %s, answering", (int) call_id, from);
+    dm_term_state("ANSWERING", "%s", from);
 
     c = call_create(modem, true);
     if (c == NULL)
@@ -798,6 +810,7 @@ int dm_sip_start(const dm_config_t *cfg)
     }
 
     DM_INFO("sip", "registering %s at %s", id_uri, cfg->server);
+    dm_term_state("REGISTERING", "%s", id_uri);
     {
         int64_t deadline = dm_now_ms() + (int64_t) cfg->reg_timeout_s * 1000;
 
@@ -887,7 +900,7 @@ static void build_asserted_identity(const dm_config_t *cfg, char *out, size_t ou
         snprintf(out, out_len, "<sip:%s@%s>", cid, cfg->server);
 }
 
-int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem)
+int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem, volatile sig_atomic_t *stop)
 {
     pjsua_msg_data msg_data;
     pjsip_generic_string_hdr pai_hdr;
@@ -939,6 +952,7 @@ int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem)
 
     dst = pjs(uri);
     DM_INFO("dial", "calling %s", uri);
+    dm_term_state("DIALING", "%s", to);
 
     /* pjsua takes c as the call's user data here, and its callbacks can run
      * before this returns; they find c through it, and it is already
@@ -976,11 +990,25 @@ int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem)
             DM_ERROR("dial", "call failed: %d %s", status_code, reason);
             return DM_EXIT_CALL;
         }
-        if (dm_now_ms() >= deadline)
+        if (dm_now_ms() >= deadline || (stop != NULL && *stop != 0))
             break;
         dm_sip_wait_ms(100);
     }
 
+    if (stop != NULL && *stop != 0)
+    {
+        /* Ctrl-c while it rings: give up on it now, not when it times out. */
+        DM_INFO("dial", "cancelled");
+        dm_term_state("CANCELLED", "%s", to);
+        pjsua_call_hangup(call_id, PJSIP_SC_REQUEST_TERMINATED, NULL, NULL);
+        {
+            int64_t grace = dm_now_ms() + DM_HANGUP_GRACE_MS;
+
+            while (!call_view().disconnected && dm_now_ms() < grace)
+                dm_sip_wait_ms(100);
+        }
+        return DM_EXIT_CALL;
+    }
     DM_ERROR("dial", "no answer within %ds", cfg->connect_timeout_s);
     pjsua_call_hangup(call_id, PJSIP_SC_REQUEST_TIMEOUT, NULL, NULL);
     {
@@ -1011,6 +1039,7 @@ int dm_sip_answer(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomic
     g.inbound_enabled = true;
     pthread_mutex_unlock(&g.lock);
     DM_INFO("answer", "waiting for an inbound call%s", deadline ? "" : " (ctrl-c to stop)");
+    dm_term_state("WAITING", "for a call");
 
     while (*stop == 0)
     {

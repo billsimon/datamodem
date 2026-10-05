@@ -27,6 +27,14 @@ bool dm_tty_raw(char *err, size_t err_len);
  * handler. */
 void dm_tty_restore(void);
 
+/* Echo and line editing off, signals left on: for while a call is being set
+ * up with the screen ours, so that typing does not land on it and ctrl-c
+ * still quits. dm_tty_restore() undoes it. */
+void dm_tty_quiet(void);
+
+/* Straight to stdout, for escape sequences of our own. */
+bool dm_tty_write_raw(const void *data, size_t len);
+
 /* Writes data that came off the line. Always stdout, retrying short writes,
  * so `datamodem 5551234 > session.txt` captures exactly what the remote
  * system sent and nothing else. Returns false if the descriptor is gone. */

@@ -32,6 +32,12 @@ void dm_log_close(void);
  * it has to keep its own output tidy. */
 bool dm_log_shares_terminal(void);
 
+/* For the terminal UI: a function that sees every line that is logged (any
+ * thread; NULL to stop), and the least important level still written to the
+ * terminal when there is no log file - DM_LOG_ERROR - 1 for none at all. */
+void dm_log_set_tap(void (*tap)(dm_log_level_t level, const char *component, const char *msg));
+void dm_log_set_terminal_floor(int level);
+
 /* Parse "error"/"warn"/"info"/"debug"/"trace". Returns false on a bad name. */
 bool dm_log_level_parse(const char *name, dm_log_level_t *out);
 const char *dm_log_level_name(dm_log_level_t level);

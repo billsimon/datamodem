@@ -40,6 +40,11 @@ static unsigned long g_q_dropped;
 static pthread_t g_main;
 static bool g_have_main = false;
 static pthread_t g_writer;
+/* While the screen belongs to the terminal UI, nothing may be written on it
+ * but what that draws. g_floor is the least important level the terminal
+ * still gets (a log file is not affected); g_tap sees every line. */
+static int g_floor = DM_LOG_TRACE;
+static void (*g_tap)(dm_log_level_t, const char *, const char *) = NULL;
 static bool g_writer_running = false;
 static bool g_writer_stop = false;
 
@@ -233,6 +238,20 @@ void dm_log_close(void)
  * are going to the same screen they will interleave with the remote system's
  * output, which is worth one warning and worth knowing about in the session
  * code. */
+void dm_log_set_tap(void (*tap)(dm_log_level_t level, const char *component, const char *msg))
+{
+    pthread_mutex_lock(&g_lock);
+    g_tap = tap;
+    pthread_mutex_unlock(&g_lock);
+}
+
+void dm_log_set_terminal_floor(int level)
+{
+    pthread_mutex_lock(&g_lock);
+    g_floor = level;
+    pthread_mutex_unlock(&g_lock);
+}
+
 bool dm_log_shares_terminal(void)
 {
     return !g_own_out && isatty(STDERR_FILENO) && isatty(STDOUT_FILENO);
@@ -339,8 +358,19 @@ static void emit(dm_log_level_t level, const char *component, const char *event,
      * ours to size. */
     static __thread char line[LOG_LINE_MAX];
     int n;
+    void (*tap)(dm_log_level_t, const char *, const char *);
+    bool to_sink;
 
     if (!dm_log_enabled(level))
+        return;
+
+    pthread_mutex_lock(&g_lock);
+    tap = g_tap;
+    to_sink = g_own_out || (int) level <= g_floor;
+    pthread_mutex_unlock(&g_lock);
+    if (tap != NULL)
+        tap(level, component ? component : "datamodem", msg);
+    if (!to_sink)
         return;
 
     timestamp(ts, sizeof(ts));

@@ -74,6 +74,7 @@ add_executable(datamodem
   src/ring.c
   src/session.c
   src/sip.c
+  src/term.c
   src/tty.c
   src/util.c
   src/v32.c
@@ -88,6 +89,23 @@ target_include_directories(datamodem PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated"
   ${TIFF_INCLUDE_DIRS}
 )
+
+# A fuzzer for the terminal emulator, under the sanitizers. Not built by
+# default: cmake --build build --target term-fuzz && build/term-fuzz [seed]
+add_executable(term-fuzz EXCLUDE_FROM_ALL
+  tests/term-fuzz.c
+  src/term.c
+  src/tty.c
+  src/log.c
+  src/util.c
+)
+target_include_directories(term-fuzz PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_compile_options(term-fuzz PRIVATE -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined)
+target_link_options(term-fuzz PRIVATE -fsanitize=address,undefined)
+target_link_libraries(term-fuzz PRIVATE Threads::Threads)
+if(NOT APPLE)
+  target_link_libraries(term-fuzz PRIVATE util)
+endif()
 
 if(DATAMODEM_VENDOR_V22BIS)
   set(V22BIS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/spandsp-v22bis")

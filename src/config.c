@@ -120,6 +120,12 @@ static const opt_def_t OPTS[] = {
     KEY_OPT("escape-key", escape_key,
             "an extra single-keystroke escape, e.g. ^] - off by default because a real modem has none"),
     BOOL_OPT("local-echo", local_echo, "echo what you type, for a far end that does not (ATE1)"),
+    BOOL_OPT("tui", tui,
+             "take the whole terminal, with a status line at the bottom (default on when "
+             "interactive; --no-tui for plain line output)"),
+    STR_OPT("charset", charset,
+            "cp437 | utf8 | ascii: what the far end's 8-bit characters are (default cp437, "
+            "what PC BBSes draw with)"),
     INT_OPT("connect-timeout", connect_timeout_s, 5, 600,
             "seconds to wait for the call to be answered (default 60)"),
     INT_OPT("answer-timeout", answer_timeout_s, 0, 86400,
@@ -194,6 +200,8 @@ void dm_config_defaults(dm_config_t *cfg)
     cfg->escape_char = '+';
     cfg->escape_guard_ms = 1000;
     cfg->escape_key = -1;
+    cfg->tui = true;
+    snprintf(cfg->charset, sizeof(cfg->charset), "%s", "cp437");
     cfg->connect_timeout_s = 60;
     cfg->answer_timeout_s = 0;
     cfg->idle_timeout_s = 0;
@@ -681,6 +689,13 @@ bool dm_config_validate(const dm_config_t *cfg, char *err, size_t err_len)
             snprintf(err, err_len, "--codec must be pcmu or pcma");
             return false;
         }
+    }
+
+    if (strcasecmp(cfg->charset, "cp437") != 0 && strcasecmp(cfg->charset, "utf8") != 0 &&
+        strcasecmp(cfg->charset, "utf-8") != 0 && strcasecmp(cfg->charset, "ascii") != 0)
+    {
+        snprintf(err, err_len, "--charset must be cp437, utf8 or ascii");
+        return false;
     }
 
     if (cfg->command == DM_CMD_DIAL && cfg->to[0] == '\0')

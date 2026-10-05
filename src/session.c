@@ -1,6 +1,7 @@
 #include "datamodem/session.h"
 #include "datamodem/log.h"
 #include "datamodem/sip.h"
+#include "datamodem/term.h"
 #include "datamodem/tty.h"
 #include "datamodem/util.h"
 
@@ -199,6 +200,47 @@ static void drain_wake(dm_session_t *s)
 
     while (read(s->wake_rd, buf, sizeof(buf)) > 0)
         ;
+}
+
+/* The terminal UI's view of the call: what the modem is doing, in a word,
+ * and the link's numbers once there is a link. */
+static void update_screen(dm_session_t *s, const dm_modem_status_t *st)
+{
+    if (!dm_term_active())
+        return;
+    if (s->connected_ms != 0)
+    {
+        if (s->command_mode)
+            dm_term_state("COMMAND", "%s", "ATH hangs up, ATI for details");
+        else if (st->phase == DM_PHASE_TRAINING)
+            dm_term_state("RETRAINING", "%s", st->train_stage ? st->train_stage : "");
+        else
+            dm_term_state("ONLINE", "%s", "");
+    }
+    else if (st->phase == DM_PHASE_ANSWER_TONE)
+    {
+        dm_term_state("ANSWER TONE", "%s", s->cfg->command == DM_CMD_DIAL ? "listening for the far end's" : "sending 2100 Hz");
+    }
+    else if (st->phase == DM_PHASE_TRAINING)
+    {
+        dm_term_state("TRAINING", "%s %s", st->modulation, st->train_stage ? st->train_stage : "");
+    }
+    else if (st->phase == DM_PHASE_DATA && !st->data_ready)
+    {
+        dm_term_state("NEGOTIATING", "%d bps, V.42 error correction", st->bit_rate);
+    }
+    dm_term_link(st, s->connected_ms, s->command_mode);
+    dm_term_tick();
+}
+
+/* The far end asked the terminal something - where its cursor is, mostly,
+ * which is how a BBS finds out the terminal does ANSI. */
+static void term_reply(void *user, const void *data, size_t len)
+{
+    dm_session_t *s = user;
+
+    if (!s->command_mode)
+        dm_modem_send(s->modem, data, len);
 }
 
 static void finish(dm_session_t *s, dm_session_end_t reason)
@@ -692,6 +734,7 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
     fcntl(s.wake_rd, F_SETFL, O_NONBLOCK);
     fcntl(s.wake_wr, F_SETFL, O_NONBLOCK);
     dm_modem_set_wake(modem, wake_cb, &s);
+    dm_term_set_reply(term_reply, &s);
 
     train_deadline = s.started_ms + (int64_t) cfg->train_timeout_s * 1000;
 
@@ -782,6 +825,7 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
         dm_modem_status(modem, &st);
         if (dm_sip_link_quality(&s.quality))
             s.have_quality = true;
+        update_screen(&s, &st);
 
         /* Wait for a usable link rather than merely a carrier: with V.42
          * asked for there is a handshake still to run, and announcing
@@ -962,6 +1006,7 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
     }
 
     dm_modem_set_wake(modem, NULL, NULL);
+    dm_term_set_reply(NULL, NULL);
     close(s.wake_rd);
     close(s.wake_wr);
 

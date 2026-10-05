@@ -4,6 +4,7 @@
 #include "datamodem/modem.h"
 #include "datamodem/session.h"
 #include "datamodem/sip.h"
+#include "datamodem/term.h"
 #include "datamodem/tty.h"
 #include "datamodem/util.h"
 #include "datamodem/version.h"
@@ -56,7 +57,11 @@ static int run_session(const dm_config_t *cfg, dm_modem_t *modem)
     rc = dm_session_run(cfg, modem, &g_stop, &sr);
 
     dm_tty_restore();
+    if (dm_term_active())
+        dm_tty_quiet(); /* the screen is still ours until we are done */
+    dm_term_state("HANGING UP", "%s", dm_session_end_name(sr.reason));
     dm_sip_hangup(&cr);
+    dm_term_end(dm_session_end_name(sr.reason));
 
     dm_log_event(DM_LOG_INFO, "call", "cleared", "remote=\"%s\" sip_status=%d sip_reason=\"%s\" "
                                                  "duration_ms=%d",
@@ -82,7 +87,7 @@ static int cmd_dial(const dm_config_t *cfg)
         return rc;
     }
 
-    rc = dm_sip_dial(cfg, cfg->to, modem);
+    rc = dm_sip_dial(cfg, cfg->to, modem, &g_stop);
     if (rc == DM_EXIT_OK)
         rc = run_session(cfg, modem);
     else
@@ -173,6 +178,12 @@ int main(int argc, char *argv[])
     install_signal_handlers();
     dm_modem_init_logging(&cfg);
 
+    /* An interactive call takes the screen from here, so that everything
+     * from registering onwards is on the status line rather than scrolling
+     * past. */
+    if (cfg.command == DM_CMD_DIAL || cfg.command == DM_CMD_ANSWER)
+        dm_term_start(&cfg);
+
     DM_INFO("datamodem", "datamodem %s starting (%s build, spandsp %s, pjproject %s)", DATAMODEM_VERSION,
             DATAMODEM_BUILD_TYPE, DATAMODEM_SPANDSP_VERSION, DATAMODEM_PJPROJECT_VERSION);
     dm_config_log(&cfg);
@@ -195,6 +206,7 @@ int main(int argc, char *argv[])
     }
 
     DM_INFO("datamodem", "exit %d", rc);
+    dm_term_stop();
     dm_log_close();
     return rc;
 }

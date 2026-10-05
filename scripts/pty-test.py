@@ -97,10 +97,23 @@ def drain():
 threading.Thread(target=drain, daemon=True).start()
 
 
+# With the full-screen terminal on - the default on a pty - text reaches the
+# screen through the emulator, which moves the cursor rather than repainting
+# what is already there. Read a cursor movement as a space and drop the rest
+# of the escape sequences, and the words are what they were.
+CURSOR_MOVE = re.compile(r"\x1b\[[0-9;]*[HfG]")
+OTHER_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[78]")
+
+
+def screen_text():
+    text = seen.decode("utf-8", "replace")
+    return OTHER_ESCAPE.sub("", CURSOR_MOVE.sub(" ", text))
+
+
 def expect(pattern, timeout, label):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if re.search(pattern, seen.decode("utf-8", "replace")):
+        if re.search(pattern, screen_text()):
             check(True, label)
             return True
         time.sleep(0.1)

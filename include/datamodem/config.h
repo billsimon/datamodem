@@ -99,6 +99,8 @@ typedef struct
     int escape_guard_ms;           /* Hayes S12: silence needed either side of it */
     int escape_key;                /* immediate local escape, -1 = disabled */
     bool local_echo;               /* echo typed characters locally (ATE1) */
+    bool tui;                      /* full screen with a status line, when interactive */
+    char charset[16];              /* the far end's 8-bit characters: cp437 | utf8 | ascii */
     int connect_timeout_s;         /* SIP: ringing until answered */
     int answer_timeout_s;          /* `answer`: how long to wait for a call, 0 = forever */
     int idle_timeout_s;            /* hang up after this long with no data either way; 0 = off */

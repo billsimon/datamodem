@@ -28,7 +28,7 @@ void dm_sip_stop(void);
  * attached to the audio path and audio is already flowing; the caller then
  * runs the session and calls dm_sip_hangup() when done. Any other return
  * means there is nothing to run and the call has been cleared. */
-int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem);
+int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem, volatile sig_atomic_t *stop);
 
 /* Answers one inbound call, attaching `modem` to it. Waits up to
  * cfg->answer_timeout_s (0 = forever) or until *stop becomes non-zero. */

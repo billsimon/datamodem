@@ -80,10 +80,54 @@ datamodem 5551234 --server sip.example.com --username 1001 \
 echo -e 'help\r' | datamodem 5551234 --server sip.example.com --username 1001
 ```
 
+### The screen
+
+Run from a terminal, datamodem works the way a 1990s terminal program did.
+It clears the screen and takes it over, with a status line on the bottom
+row that follows the call from start to finish:
+
+```
+ REGISTERING 00:00:01 | sip:1001@sip.example.com                CP437 | ctrl-c quits
+ RINGING     00:00:04 | 180 Ringing                             CP437 | ctrl-c quits
+ TRAINING    00:00:09 | v32bis training on the answerer         CP437 | ctrl-c quits
+ ONLINE      00:12:31 | 14400 V.42/V.42bis | RX 48.2K TX 1.1K  CP437 | +++ for commands
+ OFFLINE     00:12:40 | 14400 V.42/V.42bis | the far end cleared the call  CP437
+```
+
+Everything above it is the far end's screen. When the call ends the status
+line stays where it is, frozen at the call's length, and the shell carries on
+from a new line below it.
+
+**Nothing the far end sends can reach the terminal itself.** A BBS sends ANSI
+- colour, cursor movement, screen clears - and line noise or a binary file
+sends anything at all, some of which, passed to a terminal, would switch its
+character set, change its modes or its title, move its scroll region or
+overwrite the status line, and some of that outlives the program. So the far
+end's bytes drive an emulated screen instead: ANSI-BBS, the way ANSI.SYS and
+the BBS terminals understood it, with colour, cursor movement, erasing,
+inserting and deleting, scrolling regions and saved cursors. Only what that
+emulator generates itself is ever written to the real terminal. It answers a
+BBS that asks where the cursor is - which is how most of them decide whether
+the terminal does ANSI - for the screen it is actually drawing on.
+
+**Eight-bit characters are the far end's code page.** `--charset cp437`, the
+default, is what every PC BBS drew its boxes and shading with, translated to
+the Unicode a modern terminal shows; `--charset utf8` is for a host that
+sends UTF-8, and `--charset ascii` shows anything above 127 as `?`.
+
+While a call is being set up, typing does not land on the screen and ctrl-c
+still quits - including while it rings. Warnings appear on the status line
+for a few seconds rather than in the middle of the far end's screen, errors
+are printed below it when the program ends, and the full log goes wherever
+`--log-file` says. `--no-tui` turns all this off for plain line-by-line
+output - which is still made safe to print, letting through text, colour and
+nothing else. It is off anyway when stdin or stdout is not a terminal.
+
 ### stdout is the line, stderr is the diagnostics
 
-While a call is up, stdout carries only the bytes that came off the line, and
-everything datamodem has to say about itself goes to stderr. So:
+When stdout is not a terminal, it carries exactly the bytes that came off
+the line, untouched, and everything datamodem has to say about itself goes
+to stderr. So:
 
 ```
 datamodem 5551234 > session.txt        # a clean transcript of the far end
@@ -1187,7 +1231,24 @@ that the three plus signs did not reach the far end.
 their input, so `isatty()` is false and none of the terminal handling runs. It
 puts datamodem on a real pty, checks that `ECHO`, `ICANON`, `ISIG` and `OPOST`
 are actually off while connected and actually back on afterwards, and drives
-`+++`, `ATI`, `ATO`, `+++` and `ATH` through it.
+`+++`, `ATI`, `ATO`, `+++` and `ATH` through it - with the full screen on, as
+it is on any terminal; `DM_FLAGS=--no-tui` runs it the plain way.
+
+`screen-test.py` points a hostile far end at the full screen: a BBS screen in
+colour and CP437, then everything that could damage a real terminal - escape
+sequences for the title, the character set, the alternate screen, mouse
+reporting, a full reset, scroll regions and cursor movement onto the status
+line - and 3 KB of random bytes. It checks that none of it reached the pty,
+and replays what did through a terminal emulator to check the screen itself.
+It needs `pip install pyte`, and skips without it.
+
+`term-fuzz` feeds the emulator random bytes and sequences at random window
+sizes, resizing as it goes, under the address and undefined-behaviour
+sanitizers:
+
+```
+cmake --build build --target term-fuzz && build/term-fuzz 1 30
+```
 
 ## Exit codes
 
@@ -1250,6 +1311,10 @@ are actually off while connected and actually back on afterwards, and drives
   20 ms of modem output and pushes 20 ms of the far end back in.
 - `session.c` — the loop that joins the terminal to the modem, the escape
   detector and the AT interpreter.
+- `term.c` — the full screen: an ANSI-BBS emulator the far end's bytes are
+  fed through, so that only what it draws reaches the terminal, CP437 and
+  UTF-8 decoding, the status line, and the plain-output sanitizer for when
+  the screen is not ours.
 - `ring.c` — the two byte queues across the thread boundary. The transmit
   queue holds about four seconds of line time, and not polling stdin when it
   is full is the whole of the flow control that way; the other way, the
