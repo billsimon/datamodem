@@ -296,6 +296,20 @@ far end turns out to have had are released rather than sent a second time.
 The remembered value is dropped once V(A) has passed it, or once sequence
 numbers could have wrapped round to it.
 
+### 12. A SABME during detection was not heard
+
+While in detection the receiver listens for ODP or ADP and nothing else, so
+a far end that sends SABME (or XID) instead is ignored until detection times
+out and calls V.42 unsupported. V.42 allows an originator to skip detection,
+and more to the point a far end that has already been through it will not
+go through it again: when a retrain lands in the middle of the handshake the
+two ends can come out of it at different stages, one still detecting, the
+other establishing. So bits now go to the HDLC receiver during detection
+too, and a good SABME or XID command ends detection and is answered as it
+would have been after it. Anything else that arrives then - damaged frames
+especially, since this is the receiver framing ODP and line noise - is
+dropped without being counted as an FCS error.
+
 ### The test hook
 
 `dm_v42_refuse_sabme` makes the answering end refuse that many SABMEs with

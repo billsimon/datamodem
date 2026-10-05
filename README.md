@@ -18,7 +18,7 @@ Login:
 ```
 
 There is no modem hardware and no sound card anywhere in this. The data pumps
-- spandsp's, and a V.32 and V.32bis of our own - are wired straight into a pjsip media
+- spandsp's, and a V.32, V.32bis and V.34 of our own - are wired straight into a pjsip media
 port, so the modulated audio is the RTP stream.
 
 Sibling project: [`faxmodem`](../faxmodem) does the same thing for T.30 fax.
@@ -60,6 +60,10 @@ of them; `examples/datamodem.conf` is a commented starting point.
 ```
 export DATAMODEM_PASSWORD=...
 datamodem +15551234567 --server sip.example.com --username 1001
+
+# up to 33600 bps, where the far end is a V.34 (or V.90...) modem; the two
+# probe the line and settle the rate in each direction between them
+datamodem 5551234 --server sip.example.com --username 1001 --modulation v34 --v42 detect
 
 # 14400 bps, where the far end is a V.32bis (or V.34, V.90...) modem; a far
 # end that only does V.32 gets 9600
@@ -136,6 +140,7 @@ off by default, because a real modem has no such thing.
 
 | `--modulation` | Standard | Rate | Calling end transmits | Answering end transmits |
 |---|---|---|---|---|
+| `v34` | ITU-T V.34 | 33600 down to 2400, in steps of 2400, each direction its own | 2400 to 3429 symbols/s, carrier chosen by probing | the same band |
 | `v32bis` | ITU-T V.32bis | 14400, 12000, 9600, 7200 or 4800 | 1800 Hz carrier | 1800 Hz carrier, the same band |
 | `v32` | ITU-T V.32 | 9600 or 4800 | 1800 Hz carrier | 1800 Hz carrier, the same band |
 | `v22bis` | ITU-T V.22bis | 2400 or 1200 | 1200 Hz carrier | 2400 Hz carrier |
@@ -144,7 +149,7 @@ off by default, because a real modem has no such thing.
 | `v21` (default) | ITU-T V.21 | 300 full duplex | 980/1180 Hz | 1650/1850 Hz |
 | `bell103` | Bell 103 | 300 full duplex | 1270/1070 Hz | 2225/2025 Hz |
 
-All seven carry data, verified byte-for-byte in both directions by `selftest`
+All eight carry data, verified byte-for-byte in both directions by `selftest`
 and over a real call by `loopback-test.sh`. **V.22bis needs the sources in
 `third_party/spandsp-v22bis` built in** — the V.22bis in most packaged
 libspandsp builds does not work; see below.
@@ -168,8 +173,9 @@ the 300 bps modes will survive it and the QAM ones will not.
 The default is still `v21`, because 300 bps will get through an audio path
 that nothing else will, and thirty characters a second is a perfectly usable
 interactive terminal — it is how everyone did this in 1982. Reach for
-`--modulation v32bis`, `v32` or `v22bis` when you want the speed and the line
-is good; V.32bis and V.32 need the far end to be a V.32 modem or anything
+`--modulation v34`, `v32bis`, `v32` or `v22bis` when you want the speed and
+the line is good; V.34 drops to V.32bis for a far end that does not answer
+V.8, and V.32bis and V.32 need the far end to be a V.32 modem or anything
 later (all of which fall back to it - V.32bis itself drops to V.32 for a far
 end that is only V.32), V.22bis is what nearly everything speaks.
 
@@ -396,11 +402,70 @@ figures (and agree with spandsp's V.17, which shares them), and the rate
 signals against its tables, but the same caution as for V.32 applies until
 it has.
 
-### Faster still
+### V.34: 33600 bps
 
-V.34 and V.90 are different machines altogether - V.34's line probing,
-shell mapping and precoding are each a project of their own - and nothing
-here implements them.
+`--modulation v34` is ITU-T V.34 (02/98), in `src/v34.c` with the bit-exact
+parts split out: `src/v34_codec.c` (framing, shell mapping, the trellis codes,
+precoding, the Viterbi decoder), `src/v34_info.c` (INFO sequences, MP, V.8's
+CM/JM/CJ) and `src/v34_dsp.c` (the Phase 2 DPSK, probing and its analysis).
+
+```
+datamodem 5551234 --server sip.example.com --username 1001 --modulation v34 --v42 detect
+```
+
+The start-up is four phases, each logged as it goes:
+
+1. **V.8.** The answerer sends ANSam, the 15 Hz-modulated answer tone; the
+   two exchange CM, JM and CJ at 300 bit/s and agree on V.34 and, if both
+   offer it, LAPM.
+2. **Probing and ranging.** INFO0 each way at 600 bit/s, the round trip
+   measured from reversals of tones A and B, then the 21-tone probe (L1,
+   L2). Each end works out from what it heard which of the six symbol rates,
+   which carrier and which pre-emphasis filter the line will carry, and how
+   fast, and tells the other in INFO1. Logged as `probed: sending at ...`.
+3. **Equaliser and echo canceller training** at the chosen symbol rate (S,
+   PP, TRN, J).
+4. **The MP exchange**, which settles the data rate in each direction from
+   the SNR the receiver measured on TRN. Logged as `trained: ...`.
+
+The two directions are independent: different symbol rates, carriers and
+data rates are normal, and `CONNECT` reports the rate we receive at.
+`--bit-rate` caps both. Both ends of a retrain (11.5), rate renegotiation
+without one (11.6) and cleardown (11.7) are implemented; a carrier lost for
+up to 15 seconds is retrained, not hung up on.
+
+Our receiver asks for the 16-state trellis code, no precoding and no
+non-linear encoder - which is what keeps it to a linear equaliser - but the
+transmitter does everything the far end's MP can ask for: all three trellis
+codes, precoding with the far end's coefficients, the non-linear encoder and
+expanded shaping.
+
+**A far end that does not do V.8** is taken to be an older modem, and the
+call carries on as V.32bis (`falling back to V.32 bis at up to 14400 bps`):
+as the caller, on hearing a plain answer tone rather than ANSam; as the
+answerer, when ANSam gets no CM. A far end that does V.8 but offers no V.34
+is hung up on.
+
+**Not implemented:** half duplex (clause 12), the auxiliary channel and
+Annex A.
+
+**What it has been tested against.** Datamodem against itself only, so far:
+over the selftest's simulated line at every symbol rate, both carriers, all
+pre-emphasis filters and all three codes, through G.711, with echo down to
+-6 dB, round trips to 700 ms, noise, bursts, dropouts, and clocks to
+±100 ppm apart; and over a real SIP call on loopback, at 33600 with V.42.
+Because both ends of every test are this code, the parts that have to be bit
+exact with somebody else's modem - the superconstellation, the shell
+mapper's tables, the trellis encoders, the framing of every rate - are
+checked against the Recommendation's tables and against spandsp's
+independent tables (`tests/v34_test.c`), not just against each other. **What
+it has not met is a real V.34 modem.** The paths only a real modem will
+exercise are V.8 interop, and the precoder, non-linear encoder and 32/64-state
+codes on transmit, since our own receiver never asks for them. Run those
+calls with `--log-level debug`: every phase logs what it heard and why it
+decided what it did.
+
+V.90 is a different machine again, and nothing here implements it.
 
 ## Error correction and compression
 
@@ -1026,7 +1091,7 @@ needs no network and no credentials, and it is the fastest way to tell a
 modulation problem from a SIP problem. Try it on each modulation:
 
 ```
-for m in v32bis v32 v22bis v22 v23 v21 bell103; do ./build/datamodem selftest --modulation $m; done
+for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do ./build/datamodem selftest --modulation $m; done
 for v in "" "--v42 detect" "--v42 detect --v42bis"; do
     ./build/datamodem selftest $v
 done
@@ -1047,6 +1112,35 @@ DATAMODEM_V32_NO_TRELLIS=1 ./build/datamodem selftest --modulation v32
 # 20 ms of loud noise every 3 seconds: damaged frames for V.42 to recover
 DATAMODEM_SELFTEST_LINE="delay=150,echo=-10,ulaw,burst=20/3" \
     ./build/datamodem selftest --modulation v32bis --v42 require
+```
+
+`drift=100` makes the answerer's clock 100 ppm fast as the caller hears it,
+and `cut=20/600` silences the line both ways for 600 ms, 20 seconds in:
+
+```
+# a dropout long enough to need a retrain
+DATAMODEM_SELFTEST_LINE="ulaw,delay=100,cut=15/2000" DATAMODEM_SELFTEST_BYTES=80000 \
+    ./build/datamodem selftest --modulation v34 --v42 require
+```
+
+V.34 has its own matrix, about forty cases covering every symbol rate,
+carrier, pre-emphasis filter and trellis code, echo, drift, dropouts,
+retrains and renegotiation, and its own unit tests for the bit-exact parts:
+
+```
+./scripts/v34-selftest.sh
+./build/v34test                # or ctest --test-dir build
+```
+
+and hooks that force what probing would otherwise choose:
+
+```
+DATAMODEM_V34_SYMBOL_RATES=0x08    # bit 0 = 2400 ... bit 5 = 3429; here 3000 only
+DATAMODEM_V34_CARRIER=high         # or low
+DATAMODEM_V34_PRE_EMPHASIS=5       # 0 to 10
+DATAMODEM_V34_TRELLIS=64           # what our receiver asks for: 16, 32 or 64
+DATAMODEM_V34_SHAPING=1            # ask for expanded shaping
+DATAMODEM_V34_RENEGOTIATE=2:14400  # caller renegotiates down 2 s in; ":answer" for the answerer
 ```
 
 A few more test hooks, none of them options:
@@ -1073,6 +1167,14 @@ DATAMODEM_V32_RENEGOTIATE=5:9600 DATAMODEM_SELFTEST_BYTES=50000 \
 # out, both ends retrain, and neither asks again
 DATAMODEM_V32_IGNORE_RENEGOTIATION=answer DATAMODEM_V32_RENEGOTIATE=5:9600 \
     DATAMODEM_SELFTEST_BYTES=50000 ./build/datamodem selftest --modulation v32bis --v42 require
+```
+
+The V.32bis fallback needs one end that is not V.34, which `selftest` cannot
+do; over a real call it can:
+
+```
+MODULATION=v32bis CALL_FLAGS="--modulation v34" ./scripts/loopback-test.sh
+MODULATION=v32bis ANS_FLAGS="--modulation v34" ./scripts/loopback-test.sh
 ```
 
 `loopback-test.sh` starts an answering datamodem and dials it over real SIP

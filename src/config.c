@@ -780,11 +780,13 @@ void dm_usage(void)
     printf("Logs go to stderr so that stdout carries only the remote system's output:\n"
            "  datamodem 5551234 > session.log      keeps a clean transcript\n"
            "  datamodem 5551234 --log-file dm.log  keeps the terminal clean\n\n");
-    printf("Modulations: v32bis (14400 down to 4800), v32 (9600/4800), v22bis (2400),\n"
-           "v22 (1200), v23 (1200 down / 75 up), v21 and bell103 (300). The default is v21\n"
-           "because 300 bps FSK gets through an audio path that QAM will not; use\n"
-           "--modulation v32bis, v32 or v22bis when the line is good. v32bis also talks to\n"
-           "a far end that is only V.32, at 9600.\n\n");
+    printf("Modulations: v34 (33600 down to 2400), v32bis (14400 down to 4800), v32\n"
+           "(9600/4800), v22bis (2400), v22 (1200), v23 (1200 down / 75 up), v21 and\n"
+           "bell103 (300). The default is v21 because 300 bps FSK gets through an audio\n"
+           "path that QAM will not; use --modulation v34, v32bis, v32 or v22bis when the\n"
+           "line is good. v34 probes the line and picks its own rate in each direction,\n"
+           "and drops to v32bis for a far end that does not do V.8; v32bis also talks\n"
+           "to a far end that is only V.32, at 9600.\n\n");
     printf("V.42 error correction and V.42bis compression are available on top of any of\n"
            "them, and are off by default because the V.42 handshake puts junk on the line\n"
            "when the far end does not answer it:\n"

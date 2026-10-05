@@ -156,6 +156,7 @@ static void reset_lapm(v42_state_t *s);
 static void lapm_hdlc_underflow(void *user_data);
 
 static int lapm_config(v42_state_t *ss);
+static void restart_lapm(v42_state_t *s);
 
 SPAN_DECLARE(const char *) lapm_status_to_str(int status)
 {
@@ -1516,6 +1517,27 @@ SPAN_DECLARE_NONSTD(void) lapm_receive(void *user_data, const uint8_t *frame, in
         span_log(&ss->logging, SPAN_LOG_DEBUG, "V.42 rx status is %s (%d)\n", signal_status_to_str(len), len);
         return;
     }
+    /* datamodem: a LAPM command while we are still in detection. V.42 lets
+       an originator skip detection and go straight to establishment, and a
+       far end that has been through it already - with us, before a retrain
+       took our half of it away - will not go through it again. Either way it
+       is plainly doing V.42, and the only sensible reply to its SABME or XID
+       is the one it would get after detection. Anything else that arrives
+       now, a damaged frame especially, is the receiver framing detection
+       patterns or line noise and says nothing. */
+    if (s->state == LAPM_DETECT)
+    {
+        if (!ok  ||  len < 2  ||  frame[0] != s->rsp_addr  ||  (frame[1] & 0x03) != LAPM_FRAMETYPE_U)
+            return;
+        if ((frame[1] & 0xEC) != LAPM_U_SABME  &&  (frame[1] & 0xEC) != LAPM_U_XID)
+            return;
+        span_log(&ss->logging, SPAN_LOG_FLOW, "LAPM command during detection: the far end is past it\n");
+        t400_stop(ss);
+        ss->neg.rx_negotiation_step = 5;
+        s->state = LAPM_IDLE;
+        report_rx_status_change(ss, s->state);
+        restart_lapm(ss);
+    }
     if (!ok)
     {
         /* datamodem: say so. A path that is corrupting the far end's answers
@@ -1944,9 +1966,17 @@ SPAN_DECLARE(void) v42_rx_bit(void *user_data, int bit)
 
     s = (v42_state_t *) user_data;
     if (s->lapm.state == LAPM_DETECT)
+    {
         negotiation_rx_bit(s, bit);
+        /* datamodem: and for frames from a far end already past detection;
+           see lapm_receive(). */
+        if (s->lapm.state == LAPM_DETECT)
+            hdlc_rx_put_bit(&s->lapm.hdlc_rx, bit);
+    }
     else
+    {
         hdlc_rx_put_bit(&s->lapm.hdlc_rx, bit);
+    }
     /*endif*/
 }
 /*- End of function --------------------------------------------------------*/

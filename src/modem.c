@@ -103,6 +103,10 @@
  * spandsp's v42.c and appears in no header, so the number is repeated here
  * and checked against the library at startup. */
 #define DM_LAPM_V42_UNSUPPORTED 8
+/* Likewise the two states of the same enum that say how far a handshake had
+ * got: still sending ODP, or past detection with no link yet. */
+#define DM_LAPM_DETECT 0
+#define DM_LAPM_IDLE 1
 
 /* V.42's detection phase recognises a repeating pattern, so what each end
  * needs is a number of bit periods, not a number of milliseconds. spandsp's
@@ -285,6 +289,7 @@ struct dm_modem
     bool connected;
     bool carrier_lost;
     bool answer_tone_seen;
+    bool v32_fallback_due;     /* V.34 found no V.8 at the far end; V.32 bis next frame */
     int bit_rate;
     unsigned retrains;
     int64_t connect_ms;
@@ -349,6 +354,11 @@ void dm_modem_init_logging(const dm_config_t *cfg)
             DM_WARN("modem", "this spandsp reports status %d as \"%s\", not V.42-unsupported; "
                              "falling back on the --v42-timeout backstop instead",
                     DM_LAPM_V42_UNSUPPORTED, name ? name : "?");
+        name = lapm_status_to_str(DM_LAPM_IDLE);
+        if (name == NULL || strstr(name, "IDLE") == NULL || lapm_status_to_str(DM_LAPM_DETECT) == NULL ||
+            strstr(lapm_status_to_str(DM_LAPM_DETECT), "DETECT") == NULL)
+            DM_WARN("modem", "this spandsp numbers its LAPM states differently; V.42 cut short by a "
+                             "retrain may restart from the wrong place");
     }
 }
 
@@ -1386,6 +1396,11 @@ static void note_connected(dm_modem_t *m)
          * the first moment the line rate is a fact rather than an offer. */
         if (m->v42 != NULL)
         {
+            /* Anything detection concluded before now came from framing
+             * training signals, or nothing, as if they were the far end. */
+            m->v42_peer_declined = false;
+            m->v42_establish_failed = false;
+            m->v42_adp_declined = false;
             m->v42_deadline_ms = m->connect_ms + (int64_t) m->v42_timeout_s * 1000;
             v42_arm(m, m->tx_bit_rate);
         }
@@ -1398,6 +1413,31 @@ static void note_connected(dm_modem_t *m)
     else
     {
         DM_INFO("modem", "carrier recovered at %d bps (tag=%s)", m->bit_rate, m->tag);
+        /* A dropout in the middle of V.42 detection or establishment takes
+         * the ODP, the ADP or the SABME with it, and spandsp, which has no
+         * idea the line went away, concludes from the silence that the far
+         * end does not do V.42. Give the handshake the time it would have
+         * had on the new carrier. Where detection had already finished,
+         * though, the far end may well have LAPM up and be deaf to
+         * detection patterns - so start again only as far back as we had
+         * got: detection if it was still going, SABME if it was past it. */
+        if (m->v42 != NULL && !m->lapm_up && !m->v42_fell_back && !m->v42_adp_declined)
+        {
+            bool detecting = m->v42->lapm.state == DM_LAPM_DETECT ||
+                             (m->v42_peer_declined && !m->v42_establish_failed);
+
+            DM_INFO("modem", "V.42 was still %s; starting %s again (tag=%s)",
+                    detecting ? "in detection" : "establishing",
+                    detecting ? "detection" : "establishment", m->tag);
+            m->v42_peer_declined = false;
+            m->v42_establish_failed = false;
+            m->v42_retry_at_ms = 0;
+            m->v42_deadline_ms = dm_now_ms() + (int64_t) m->v42_timeout_s * 1000;
+            if (detecting)
+                v42_arm(m, m->tx_bit_rate);
+            else if (m->v42->lapm.state == DM_LAPM_IDLE)
+                m->v42_retry_at_ms = dm_now_ms();
+        }
     }
     /* Whatever was measured before this carrier belongs to the last one. A
      * training pattern framed as characters is not evidence about the rate. */
@@ -1598,6 +1638,10 @@ static void v34_event(void *user, dm_v34_event_t ev)
         v42_set_bit_rate(m, m->tx_bit_rate);
         DM_INFO("modem", "rate changed to %d bps in, %d out (tag=%s)", m->bit_rate, m->tx_bit_rate, m->tag);
         break;
+    case DM_V34_NO_V8:
+        if (!m->carrier_lost)
+            m->v32_fallback_due = true;
+        break;
     case DM_V34_CLEARDOWN:
     case DM_V34_NOT_V34:
         if (!m->carrier_lost)
@@ -1728,6 +1772,10 @@ static void check_v42_deadline(dm_modem_t *m)
         return;
     if (m->carrier_lost)
         return;
+    /* Nor while a retrain is under way: nothing can be said either way
+     * until the carrier is back, and note_connected() starts again then. */
+    if (m->carrier_down_ms != 0)
+        return;
 
     /* An establishment retry that has come due. */
     if (m->v42_retry_at_ms != 0 && dm_now_ms() >= m->v42_retry_at_ms)
@@ -1828,6 +1876,126 @@ static void start_pump(dm_modem_t *m, const char *why)
     m->phase = DM_PHASE_TRAINING;
     dm_log_event(DM_LOG_INFO, "modem", "training", "tag=%s modulation=%s role=%s offered_rate=%d why=%s",
                  m->tag, m->mod_name, m->calling ? "originate" : "answer", m->offered_rate, why);
+}
+
+/* The V.32 or V.32 bis pump, for m->mod. listen_first has it running, silent,
+ * through the wait for the answer tone, so that it can hear AC from an
+ * answering modem that sends none. */
+static bool create_v32_pump(dm_modem_t *m, bool listen_first)
+{
+    dm_v32_params_t vp;
+
+    memset(&vp, 0, sizeof(vp));
+    vp.calling = m->calling;
+    vp.v32bis = (m->mod == DM_MOD_V32BIS);
+    vp.max_rate = m->offered_rate;
+    /* Test hook, not an option: every 9600 bit/s V.32 modem has to be
+     * able to fall back to the nonredundant 16-point code (1e), and this
+     * is how that path gets exercised against ourselves. */
+    vp.trellis = (getenv("DATAMODEM_V32_NO_TRELLIS") == NULL);
+    vp.listen_first = listen_first;
+    if (!vp.trellis)
+        DM_WARN("modem", "DATAMODEM_V32_NO_TRELLIS: this end will not offer trellis coding%s. "
+                         "This is a test hook.",
+                vp.v32bis ? " - ignored by V.32bis, whose rates are all trellis coded" : "");
+    /* Test hook, not an option: "5:9600" has the calling end ask for
+     * 9600 five seconds into the call, "5:9600:answer" the answering
+     * end. It is how V.32 bis's rate renegotiation, which a clean line
+     * never needs, gets exercised against ourselves. */
+    {
+        const char *rn = getenv("DATAMODEM_V32_RENEGOTIATE");
+        double secs = 0.0;
+        int rate = 0;
+        char role[16] = "";
+
+        if (rn != NULL && sscanf(rn, "%lf:%d:%15s", &secs, &rate, role) >= 2 && secs > 0.0 &&
+            (strcmp(role, "answer") == 0) == !m->calling)
+        {
+            m->reneg_after_ms = (int) (secs * 1000.0);
+            m->reneg_rate = rate;
+            DM_WARN("modem", "DATAMODEM_V32_RENEGOTIATE: this end will ask for %d bps %.1f "
+                             "seconds into the call. This is a test hook.", rate, secs);
+        }
+    }
+    /* Test hook: "answer" or "call" makes that end ignore the far end's
+     * requests to change rate, as a far end might that does not do 8/V.32
+     * bis properly - so the asking end's give-up-and-retrain gets run. */
+    {
+        const char *deaf = getenv("DATAMODEM_V32_IGNORE_RENEGOTIATION");
+
+        if (deaf != NULL && strcmp(deaf, m->calling ? "call" : "answer") == 0)
+        {
+            vp.deaf_to_renegotiation = true;
+            DM_WARN("modem", "DATAMODEM_V32_IGNORE_RENEGOTIATION: this end will not hear requests to "
+                             "change rate. This is a test hook.");
+        }
+    }
+    vp.tx_power = m->tx_power;
+    vp.tag = m->tag;
+    vp.get_bit = tx_get_bit;
+    vp.put_bit = rx_put_bit;
+    vp.event = v32_event;
+    vp.user = m;
+    m->v32 = dm_v32_create(&vp);
+    return m->v32 != NULL;
+}
+
+/* What a V.34 modem does when the far end turns out not to do V.8: carry on
+ * as V.32 bis, which every V.34 modem also is. Neither end has trained yet,
+ * so nothing is lost but time.
+ *
+ * The caller has heard a plain answer tone - V.25's ANS, not V.8's ANSam -
+ * which the far end will go on sending for up to four seconds before AC; a
+ * V.32 bis caller is entitled to start AA once it has heard a second of it
+ * (5.4.1), so it waits that long again and listens for AC throughout. The
+ * answerer has sent ANSam and heard no CM in answer, which is what a V.32
+ * caller would do: it heard an answer tone, and is sending AA and waiting for
+ * AC, which is what V.32 bis answering sends first.
+ *
+ * Called from dm_modem_tx with the lock held, never from inside the V.34
+ * pump's own callbacks, since it frees it. */
+static void fall_back_to_v32bis(dm_modem_t *m)
+{
+    static const int rates[] = { 14400, 12000, 9600, 7200, 4800 };
+    int rate = 4800;
+
+    m->v32_fallback_due = false;
+    for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++)
+    {
+        if (rates[i] <= m->offered_rate)
+        {
+            rate = rates[i];
+            break;
+        }
+    }
+    dm_v34_free(m->v34);
+    m->v34 = NULL;
+    m->mod = DM_MOD_V32BIS;
+    m->mod_name = modulation_name(m->mod);
+    m->offered_rate = rate;
+    m->carrier_grace_ms = DM_CARRIER_GRACE_V32_MS;
+    if (!create_v32_pump(m, m->calling))
+    {
+        m->carrier_lost = true;
+        m->phase = DM_PHASE_DOWN;
+        DM_ERROR("modem", "could not start the V.32 bis data pump to fall back to (tag=%s)", m->tag);
+        return;
+    }
+    DM_INFO("modem", "falling back to V.32 bis at up to %d bps (tag=%s)", rate, m->tag);
+    v42_set_bit_rate(m, rate);
+    m->pump_started = false;
+    m->phase = DM_PHASE_ANSWER_TONE;
+    if (m->calling)
+    {
+        m->answer_tone_seen = true;
+        m->wait_samples = 0;
+        m->ans_tail_running = true;
+        m->ans_tail_samples = DM_SAMPLE_RATE;
+    }
+    else
+    {
+        m->answer_tone_samples = 0;
+    }
 }
 
 dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
@@ -2029,63 +2197,7 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     }
     else if (is_v32(m->mod))
     {
-        dm_v32_params_t vp;
-
-        memset(&vp, 0, sizeof(vp));
-        vp.calling = m->calling;
-        vp.v32bis = (m->mod == DM_MOD_V32BIS);
-        vp.max_rate = m->offered_rate;
-        /* Test hook, not an option: every 9600 bit/s V.32 modem has to be
-         * able to fall back to the nonredundant 16-point code (1e), and this
-         * is how that path gets exercised against ourselves. */
-        vp.trellis = (getenv("DATAMODEM_V32_NO_TRELLIS") == NULL);
-        /* Running, silent, through the wait for the answer tone below, so
-         * that it can hear AC from an answering modem that sends none. */
-        vp.listen_first = m->calling && params->answer_wait_s > 0;
-        if (!vp.trellis)
-            DM_WARN("modem", "DATAMODEM_V32_NO_TRELLIS: this end will not offer trellis coding%s. "
-                             "This is a test hook.",
-                    vp.v32bis ? " - ignored by V.32bis, whose rates are all trellis coded" : "");
-        /* Test hook, not an option: "5:9600" has the calling end ask for
-         * 9600 five seconds into the call, "5:9600:answer" the answering
-         * end. It is how V.32 bis's rate renegotiation, which a clean line
-         * never needs, gets exercised against ourselves. */
-        {
-            const char *rn = getenv("DATAMODEM_V32_RENEGOTIATE");
-            double secs = 0.0;
-            int rate = 0;
-            char role[16] = "";
-
-            if (rn != NULL && sscanf(rn, "%lf:%d:%15s", &secs, &rate, role) >= 2 && secs > 0.0 &&
-                (strcmp(role, "answer") == 0) == !m->calling)
-            {
-                m->reneg_after_ms = (int) (secs * 1000.0);
-                m->reneg_rate = rate;
-                DM_WARN("modem", "DATAMODEM_V32_RENEGOTIATE: this end will ask for %d bps %.1f "
-                                 "seconds into the call. This is a test hook.", rate, secs);
-            }
-        }
-        /* Test hook: "answer" or "call" makes that end ignore the far end's
-         * requests to change rate, as a far end might that does not do 8/V.32
-         * bis properly - so the asking end's give-up-and-retrain gets run. */
-        {
-            const char *deaf = getenv("DATAMODEM_V32_IGNORE_RENEGOTIATION");
-
-            if (deaf != NULL && strcmp(deaf, m->calling ? "call" : "answer") == 0)
-            {
-                vp.deaf_to_renegotiation = true;
-                DM_WARN("modem", "DATAMODEM_V32_IGNORE_RENEGOTIATION: this end will not hear requests to "
-                                 "change rate. This is a test hook.");
-            }
-        }
-        vp.tx_power = m->tx_power;
-        vp.tag = m->tag;
-        vp.get_bit = tx_get_bit;
-        vp.put_bit = rx_put_bit;
-        vp.event = v32_event;
-        vp.user = m;
-        m->v32 = dm_v32_create(&vp);
-        if (m->v32 == NULL)
+        if (!create_v32_pump(m, m->calling && params->answer_wait_s > 0))
         {
             DM_ERROR("modem", "could not start the %s data pump", m->mod_name);
             dm_modem_destroy(m);
@@ -2430,6 +2542,8 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
     }
     if (m->drop_ceiling_to > 0)
         apply_rate_ceiling(m);
+    if (m->v32_fallback_due)
+        fall_back_to_v32bis(m);
     if (m->phase == DM_PHASE_ANSWER_TONE)
     {
         if (m->v32 != NULL && m->calling)

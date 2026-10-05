@@ -211,6 +211,8 @@ typedef struct
     int alt_run;             /* S: alternating label differences */
     int last_diff;
     bool s_dd_seen;
+    long long s_dd_at;
+    v34_cf_t u_prev;
     uint32_t scr_a, scr_b;
     int ones_a;
     uint32_t sr16;           /* the last 32 bits of stream B */
@@ -483,8 +485,6 @@ static void v8_put_bit(void *user, int bit)
     /* 1111111111 0 00000 111 1, in time order */
     if (v->v8_sr == 0xFFC0Fu)
     {
-        if (getenv("V34DBG"))
-            DM_DEBUG("v34", "V.8 sync at %.3f (tag=%s)", v->n / 8000.0, v->tag);
         if (v->v8_synced && v->v8_rxn > 0)
         {
             if (v->v8_rxn == v->v8_lastn && memcmp(v->v8_rx, v->v8_last, (size_t) v->v8_rxn) == 0 &&
@@ -518,8 +518,6 @@ static void v8_put_bit(void *user, int bit)
         for (int i = 0; i < 8; i++)
             o |= (uint8_t) (((v->v8_sr >> (8 - i)) & 1) << i);
         v->v8_bitcnt = 0;
-        if (getenv("V34DBG"))
-            DM_DEBUG("v34", "V.8 octet %02x at %.3f (tag=%s)", o, v->n / 8000.0, v->tag);
         if (o == 0)
         {
             /* CJ is three zero octets. No CM or JM octet is zero, so two
@@ -1102,12 +1100,13 @@ static void eq_half(dm_v34_t *v, v34_cf_t y, long long idx)
     u = vout * (cosf(q->theta) - I * sinf(q->theta));
     rx_symbol(v, w, vout, u);
     q->k++;
-    /* What the loops have learnt of the far end's clock and carrier goes on
-     * applying through silences and missing samples, when nothing else is
-     * learnt: the drift does not stop. */
+    /* What the timing loop has learnt of the far end's clock goes on applying
+     * through silences and missing samples, when nothing is learnt: the drift
+     * does not stop. The carrier's offset is not carried on the same way:
+     * its estimate is noisier, and over a second of silence a small error in
+     * it turns the phase round, where leaving the phase alone loses only what
+     * a real offset - a fraction of a hertz - adds up to. */
     q->tau += q->tfreq;
-    if (q->hold > 0 || q->pwr < 0.3f * q->pwr_ref || v->n < v->freeze_until)
-        q->theta += q->nu;
 }
 
 static void timing_track(qrx_t *q, const v34_cf_t *w, v34_cf_t vout, v34_cf_t err);
@@ -1131,6 +1130,29 @@ static void track(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf_t u, v34
 
         q->mse += 0.01f * (e2 - q->mse);
         q->mse_fast += 0.05f * (e2 - q->mse_fast);
+        /* A decision this far from what was received is a guess - the far
+         * end fading out, a burst of noise - and the loops must not steer by
+         * it: a handful of them at the start of a silence once turned the
+         * clock estimate round, and the silence then carried it half a
+         * symbol off. */
+        if (q->mode != RQ_TRAIN && e2 > 0.15f)
+        {
+            float uu = crealf(u) * crealf(u) + cimagf(u) * cimagf(u);
+
+            /* ... except the phase itself, while what arrives is a signal
+             * of the right size: a phase that has slipped after a silence
+             * makes every decision look like this, and would never be
+             * pulled back otherwise. */
+            if (uu > 0.5f * dd && uu < 2.0f * dd)
+            {
+                q->theta += q->a1 * pe;
+                if (q->theta > PI)
+                    q->theta -= (float) (2.0 * PI);
+                else if (q->theta < -PI)
+                    q->theta += (float) (2.0 * PI);
+            }
+            return;
+        }
     }
     if (q->mode == RQ_TRAIN)
     {
@@ -1314,8 +1336,6 @@ static void align_pp(dm_v34_t *v)
         pw += crealf(r) * crealf(r) + cimagf(r) * cimagf(r);
     }
     rho = best / sqrt(96.0 * pw + 1e-12);
-    if (getenv("V34DBG"))
-        DM_DEBUG("v34", "align: best %g pw %g bc %lld c0 %lld rho %g", best, pw, bc, c0, rho);
     if (rho < 0.5)
     {
         DM_DEBUG("v34", "PP is not where S-bar put it (correlation %.2f); listening again (tag=%s)", rho, v->tag);
@@ -1472,8 +1492,18 @@ static bool dd_watch_s(dm_v34_t *v, v34_cf_t u, int quad)
     qrx_t *q = &v->q;
     int diff = (quad - q->q_prev) & 3;
     v34_cf_t e = u - pt4(quad);
-    bool near = crealf(e) * crealf(e) + cimagf(e) * cimagf(e) < 0.2f;
+    v34_cf_t step = u * conjf(q->u_prev);
+    float mu = crealf(u) * crealf(u) + cimagf(u) * cimagf(u);
+    /* A clean quarter turn from the last symbol, at about the right size:
+     * whatever the phase, which may well be off after a silence. */
+    bool near = mu > 0.5f && mu < 1.6f && fabsf(crealf(step)) < 0.35f * cabsf(step);
     bool turned = false;
+
+    q->u_prev = u;
+    (void) e;
+    /* Quarter turns clockwise, as the labels count them. */
+    if (near)
+        diff = (cimagf(step) < 0.0f) ? 1 : 3;
 
     /* Our own S coming back is not the far end's (11.3.1.1.7). */
     if (v->stage == ST_P3_TX_SECOND && v->n < v->j_start + (v->rtd > 0 ? v->rtd : 0) + MS(20))
@@ -1482,13 +1512,9 @@ static bool dd_watch_s(dm_v34_t *v, v34_cf_t u, int quad)
         q->last_diff = -1;
         return false;
     }
-    if (getenv("V34DBG") && v->stage == ST_P3_TX_SECOND && (q->k % 50) == 0)
-        DM_DEBUG("v34", "watch %.3f: |e|^2 %.3f |u| %.2f diff %d alt %d pwr %.3f/%.3f mse %.1f", v->n / 8000.0,
-                 crealf(e) * crealf(e) + cimagf(e) * cimagf(e), cabsf(u), diff, q->alt_run, q->pwr, q->pwr_ref,
-                 snr_from_mse(q->mse));
     if (near && (diff == 1 || diff == 3) && q->last_diff >= 0 && diff != q->last_diff)
         q->alt_run++;
-    else if (near && diff == 3 && q->last_diff == 3 && q->alt_run >= 20)
+    else if (near && diff == 3 && q->last_diff == 3 && (q->alt_run >= 20 || q->s_dd_seen))
         turned = true;
     else
         q->alt_run = 0;
@@ -1496,8 +1522,14 @@ static bool dd_watch_s(dm_v34_t *v, v34_cf_t u, int quad)
     if (q->alt_run == 20 && !q->s_dd_seen)
     {
         q->s_dd_seen = true;
+        q->s_dd_at = q->k;
         p4_heard_s(v);
     }
+    /* S is 128 symbols: once it has been seen, the turn need not have a
+     * clean run right before it - a decision spoiled near the end of S must
+     * not hide it - but it must come soon. */
+    if (q->s_dd_seen && !turned && q->k - q->s_dd_at > 200)
+        q->s_dd_seen = false;
     if (turned)
     {
         q->alt_run = 0;
@@ -1540,7 +1572,7 @@ static void timing_track(qrx_t *q, const v34_cf_t *w, v34_cf_t vout, v34_cf_t er
      * rate is chosen; then gentler, because data has more noise in it.
      * Critically damped either way. */
     {
-        double kp = (q->mode == RQ_DATA) ? 0.004 : 0.012;
+        double kp = (q->mode == RQ_DATA) ? 0.004 : 0.008;
 
         q->tfreq += kp * kp / 4.0 * e * q->th;
         q->tau += kp * e * q->th;
@@ -1582,7 +1614,7 @@ static void rx_symbol(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf_t u)
             q->mode = RQ_DD;
             q->beta = 0.02f;
             q->a1 = 0.05f;
-            q->a2 = 0.001f;
+            q->a2 = 0.0004f;
             q->q_prev = quad_of(u);
             q->centroid0 = tap_centroid(q);
             rx_dd_reset(q);
@@ -1601,10 +1633,6 @@ static void rx_symbol(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf_t u)
 
         track(v, w, vout, u, pt4(quad));
         v->snr_db = snr_from_mse(q->mse);
-        if (getenv("V34DBG") && (q->k % 128) == 0)
-            DM_DEBUG("v34", "dd k %lld stage %s snr %.1f cent %.3f/%.3f tfreq %.1f ppm nu %.6f (tag=%s)", q->k,
-                     STAGE_NAMES[v->stage], v->snr_db, tap_centroid(q), q->centroid0, q->tfreq / q->sps * 1e6, q->nu,
-                     v->tag);
         if (q->pwr < 0.05f * q->pwr_ref)
         {
             /* The far end is silent. */
@@ -1720,10 +1748,13 @@ static void rx_data_symbol(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf
 
         track(v, w, vout, u, d / v->rx_gain);
         v34_dec_symbol(&v->dec, y);
-        if (getenv("V34DBG") && (q->k % 2000) == 0)
-            DM_DEBUG("v34", "data %.2f k %lld snr %.1f bad %u theta %.3f nu %.5f cent %.2f tfreq %.2f ppm (tag=%s)",
-                     v->n / 8000.0, q->k, 10.0f * log10f(v->rx_energy / (v->dec.err + 1e-9f)), v->dec.bad_frames,
-                     q->theta, q->nu, tap_centroid(q), q->tfreq / q->sps * 1e6, v->tag);
+        /* Now and then, how reception is going: what to look at first when a
+         * real far end misbehaves. */
+        if (q->k % (10 * 3429) == 0 && dm_log_enabled(DM_LOG_DEBUG))
+            DM_DEBUG("v34", "receiving at %d: SNR %.1f dB, the far end's clock %+.1f ppm and carrier %+.2f Hz from "
+                            "ours, %u frames the shell mapper could not have made (tag=%s)",
+                     v->rate_rx, 10.0f * log10f(v->rx_energy / (v->dec.err + 1e-9f)), -q->tfreq / q->sps * 1e6,
+                     q->nu * v34_symbol_rate(q->sr) / (2.0 * PI), v->dec.bad_frames, v->tag);
         /* Watch for the far end starting a rate renegotiation (11.6), or
          * answering ours. */
         if (v->stage == ST_DATA || v->stage == ST_RN)
@@ -2318,15 +2349,7 @@ static bool phase2_frame(dm_v34_t *v, int k)
 
         if (!v34_info0_unpack(bits, n, &i0))
         {
-            if (getenv("V34DBG"))
-            {
-                char t[80];
-
-                for (int i = 0; i < n && i < 79; i++)
-                    t[i] = (char) ('0' + bits[i]);
-                t[n < 79 ? n : 79] = 0;
-                DM_DEBUG("v34", "slicer %d: INFO0 failed its CRC: %s (tag=%s)", k, t, v->tag);
-            }
+            DM_TRACE("v34", "an INFO0 failed its CRC (slicer %d) (tag=%s)", k, v->tag);
             return false;
         }
         v->info0_count++;
@@ -2430,11 +2453,11 @@ static void cleardown(dm_v34_t *v, const char *why)
     emit(v, DM_V34_CLEARDOWN);
 }
 
-static void not_v34(dm_v34_t *v)
+static void not_v34(dm_v34_t *v, bool no_v8)
 {
     v->txm = TXM_SILENCE;
     stage_enter(v, ST_DEAD, 0.0);
-    emit(v, DM_V34_NOT_V34);
+    emit(v, no_v8 ? DM_V34_NO_V8 : DM_V34_NOT_V34);
 }
 
 /* --------------------------------------------------------- control loop */
@@ -2470,10 +2493,10 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         }
         else if (t == MODEM_CONNECT_TONES_ANS || t == MODEM_CONNECT_TONES_ANS_PR)
         {
-            DM_WARN("v34", "the far end answered with a plain answer tone and no V.8, so it is not a V.34 modem "
+            DM_INFO("v34", "the far end answered with a plain answer tone and no V.8, so it is not a V.34 modem "
                            "(tag=%s)",
                     v->tag);
-            not_v34(v);
+            not_v34(v, true);
         }
         break;
     }
@@ -2486,7 +2509,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             DM_INFO("v34", "V.8: the answering modem offers%s (tag=%s)", d, v->tag);
             if (!v->v8_far.v34)
             {
-                not_v34(v);
+                not_v34(v, false);
                 break;
             }
             /* 11.1.1.1: complete the CM octet in hand, then CJ. Messages are
@@ -2528,7 +2551,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             DM_INFO("v34", "V.8: the calling modem offers%s (tag=%s)", d, v->tag);
             if (!v->v8_far.v34)
             {
-                not_v34(v);
+                not_v34(v, false);
                 break;
             }
             jm.call_function = v->v8_far.call_function;
@@ -2541,8 +2564,8 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         }
         else if (v->ansam_done_at > 0 && n - v->ansam_done_at > MS(1000))
         {
-            DM_WARN("v34", "no CM in answer to ANSam: the calling modem does not do V.8 (tag=%s)", v->tag);
-            not_v34(v);
+            DM_INFO("v34", "no CM in answer to ANSam: the calling modem does not do V.8 (tag=%s)", v->tag);
+            not_v34(v, true);
         }
         break;
     case ST_V8_A_JM:
@@ -2570,9 +2593,6 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             v->info0_count = 1;
             send_info0(v);
         }
-        if (reversed && getenv("V34DBG"))
-            DM_DEBUG("v34", "C2 reversal at %.0f: n %lld since %lld prev %lld..%lld have %d pending %d", rev, n,
-                     r->tone_since, r->prev_since, r->prev_until, v->have_info0, v34_p2tx_pending(&v->p2tx));
         if (reversed && v->have_info0 && v34_p2tx_pending(&v->p2tx) == 0)
         {
             /* 11.2.1.1.3: our reversal 40 ms after theirs. */
@@ -2624,9 +2644,6 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         }
         break;
     case ST_C2_L:
-        if (getenv("V34DBG") && (n % 400) == 0)
-            DM_DEBUG("v34", "C2_L tone %.2f level %.1f since %lld l2_at %lld probe %d (tag=%s)", r->tone,
-                     10*log10f(r->level+1e-9f), r->tone_since, v->p2_l2_at, v->p2tx.probe, v->tag);
         /* 11.2.1.1.7: tone A while L2 goes out. */
         if (v->p2_l2_at < 0 && v->p2tx.probe && tone && n - r->tone_since > MS(30) &&
             n > v->rev_sent + MS(10 + 160 + 100))
@@ -2769,9 +2786,6 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             float snr = 10.0f * log10f(v->rx_energy / (v->dec.err + 1e-9f));
 
             v->snr_db = snr;
-            if (getenv("V34DBG") && (n % 800) == 0)
-                DM_DEBUG("v34", "data %.2f s: pwr %.1f dBm0 snr %.1f (tag=%s)", n / 8000.0,
-                         10.0 * log10(v->pwr / v->p0 + 1e-12), snr, v->tag);
             if (v->pwr_fast < v->pmin)
             {
                 if (v->low_since == 0)
@@ -2848,7 +2862,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         case ST_V8_A_JM:
         case ST_V8_C_CJ:
             DM_WARN("v34", "V.8 stalled at '%s' (tag=%s)", STAGE_NAMES[v->stage], v->tag);
-            not_v34(v);
+            not_v34(v, false);
             return;
         case ST_RETRAIN:
             /* 11.5.1 and 11.5.2: our tone, then Phase 2 from the reversal. */

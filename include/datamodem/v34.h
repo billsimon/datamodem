@@ -31,8 +31,9 @@
  * encoding, so it can stay a linear equaliser and a 16-state Viterbi
  * decoder. Not implemented: half-duplex operation (clause 12), the
  * auxiliary channel and Annex A's control channel, which are offered to
- * nobody; and falling back to V.32 bis when the far end turns out not to do
- * V.8, which is reported (DM_V34_NOT_V34) for the caller to deal with. */
+ * nobody. A far end that turns out not to do V.8 is reported (DM_V34_NO_V8)
+ * for the user of this to fall back to V.32 bis, which is not this file's
+ * business. */
 #ifndef DATAMODEM_V34_H
 #define DATAMODEM_V34_H
 
@@ -49,7 +50,9 @@ typedef enum
     DM_V34_TRAINING_FAILED,  /* a stage of the handshake timed out; trying again */
     DM_V34_CLEARDOWN,        /* the far end cleared down, or the two found no rate in common */
     DM_V34_RATE_CHANGED,     /* rates renegotiated without a retrain; data is crossing again */
-    DM_V34_NOT_V34           /* the far end answered without V.8, or does not do V.34 */
+    DM_V34_NOT_V34,          /* V.8 found the far end does not do V.34, or V.8 stalled */
+    DM_V34_NO_V8             /* the far end does not do V.8 at all: a plain answer tone, or no CM
+                                in answer to ANSam - an older modem, which may well do V.32 bis */
 } dm_v34_event_t;
 
 typedef struct
