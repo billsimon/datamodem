@@ -65,6 +65,9 @@ case_ "V.42, 150 ms dropout, 80 kB"   DATAMODEM_SELFTEST_BYTES=80000 DATAMODEM_S
 case_ "V.42, 2 s dropout: retrain"    DATAMODEM_SELFTEST_BYTES=80000 DATAMODEM_SELFTEST_LINE=ulaw,delay=100,cut=15/2000 -- --v42 require
 case_ "renegotiate down, caller asks" DATAMODEM_V34_RENEGOTIATE=2:14400 DATAMODEM_SELFTEST_BYTES=40000 DATAMODEM_SELFTEST_LINE=ulaw,delay=100 -- --v42 require
 case_ "renegotiate, answerer asks"    DATAMODEM_V34_RENEGOTIATE=2:19200:answer DATAMODEM_SELFTEST_BYTES=40000 DATAMODEM_SELFTEST_LINE=ulaw,delay=100 -- --v42 require
+case_ "clock +100 ppm, V.42, 100 kB"  DATAMODEM_SELFTEST_BYTES=100000 DATAMODEM_SELFTEST_LINE=ulaw,drift=100 -- --v42 require
+case_ "clock -100 ppm, V.42, 100 kB"  DATAMODEM_SELFTEST_BYTES=100000 DATAMODEM_SELFTEST_LINE=ulaw,drift=-100 -- --v42 require
+case_ "clock 40 ppm, echo, 300 ms"    DATAMODEM_SELFTEST_BYTES=50000 DATAMODEM_SELFTEST_LINE=ulaw,drift=40,delay=150,echo=-12 -- --v42 require
 case_ "async, 200 kB"                 DATAMODEM_SELFTEST_BYTES=200000 DATAMODEM_SELFTEST_LINE=ulaw
 case_ "rate ceiling 14400"            DATAMODEM_SELFTEST_LINE=ulaw -- --bit-rate 14400
 case_ "rate ceiling 2400"             DATAMODEM_SELFTEST_LINE=ulaw -- --bit-rate 2400

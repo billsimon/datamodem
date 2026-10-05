@@ -188,6 +188,7 @@ typedef struct
     float mse;
     float mse_fast;          /* the same, quicker, to start mse from once training is done */
     float centroid0;
+    double tfreq;            /* timing loop's integrator: samples per symbol the far end's clock is off by */
     long long k;             /* equaliser outputs since symbol 0 */
     rq_t mode;
 
@@ -1101,7 +1102,15 @@ static void eq_half(dm_v34_t *v, v34_cf_t y, long long idx)
     u = vout * (cosf(q->theta) - I * sinf(q->theta));
     rx_symbol(v, w, vout, u);
     q->k++;
+    /* What the loops have learnt of the far end's clock and carrier goes on
+     * applying through silences and missing samples, when nothing else is
+     * learnt: the drift does not stop. */
+    q->tau += q->tfreq;
+    if (q->hold > 0 || q->pwr < 0.3f * q->pwr_ref || v->n < v->freeze_until)
+        q->theta += q->nu;
 }
+
+static void timing_track(qrx_t *q, const v34_cf_t *w, v34_cf_t vout, v34_cf_t err);
 
 /* Phase and equaliser update towards d - what was sent, or a decision. */
 static void track(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf_t u, v34_cf_t d)
@@ -1123,19 +1132,40 @@ static void track(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf_t u, v34
         q->mse += 0.01f * (e2 - q->mse);
         q->mse_fast += 0.05f * (e2 - q->mse_fast);
     }
-    if (v->stage == ST_P3_TX_SECOND)
-        return;
     if (q->mode == RQ_TRAIN)
     {
         rls_update(q, w, err);
-        return;
+        /* The phase loop runs alongside, gently, once the first periods of
+         * PP have set the equaliser up: least squares on its own trails a
+         * carrier that rotates - a far end some ppm out - by most of its
+         * memory, which at 100 ppm was a fifth of a radian. */
+        if (q->k < 96)
+            return;
     }
     q->theta += q->a1 * pe + q->nu;
     q->nu += q->a2 * pe;
+    /* A frequency offset beyond what the far end's carrier may have (2.1 of
+     * V.34 allows 0.01%, under 0.4 Hz) is the loop chasing noise. */
+    if (q->nu > 0.003f)
+        q->nu = 0.003f;
+    else if (q->nu < -0.003f)
+        q->nu = -0.003f;
     if (q->theta > PI)
         q->theta -= (float) (2.0 * PI);
     else if (q->theta < -PI)
         q->theta += (float) (2.0 * PI);
+    /* While our own Phase 3 signal is coming back and the canceller has not
+     * yet found it, the phase loop may follow the far end but the equaliser
+     * must not learn our echo. */
+    if (q->mode == RQ_TRAIN)
+    {
+        if (q->k >= 288)
+            timing_track(q, w, vout, err);
+        return;
+    }
+    timing_track(q, w, vout, err);
+    if (v->stage == ST_P3_TX_SECOND && (v->ec.state == V34_EC_WAIT || v->ec.state == V34_EC_CORR))
+        return;
     {
         float norm = 0.0f;
         v34_cf_t g;
@@ -1306,6 +1336,8 @@ static void align_pp(dm_v34_t *v)
     q->lambda = 0.995;
     rls_init(q, 0.02 * pw / 96.0 + 1e-6);
     q->theta = q->nu = 0.0f;
+    q->a1 = 0.02f;
+    q->a2 = 0.0002f;
     q->mse = q->mse_fast = 1.0f;
     q->mode = RQ_TRAIN;
     q->trn_scr = 0;
@@ -1450,6 +1482,10 @@ static bool dd_watch_s(dm_v34_t *v, v34_cf_t u, int quad)
         q->last_diff = -1;
         return false;
     }
+    if (getenv("V34DBG") && v->stage == ST_P3_TX_SECOND && (q->k % 50) == 0)
+        DM_DEBUG("v34", "watch %.3f: |e|^2 %.3f |u| %.2f diff %d alt %d pwr %.3f/%.3f mse %.1f", v->n / 8000.0,
+                 crealf(e) * crealf(e) + cimagf(e) * cimagf(e), cabsf(u), diff, q->alt_run, q->pwr, q->pwr_ref,
+                 snr_from_mse(q->mse));
     if (near && (diff == 1 || diff == 3) && q->last_diff >= 0 && diff != q->last_diff)
         q->alt_run++;
     else if (near && diff == 3 && q->last_diff == 3 && q->alt_run >= 20)
@@ -1473,6 +1509,46 @@ static bool dd_watch_s(dm_v34_t *v, v34_cf_t u, int quad)
         }
     }
     return false;
+}
+
+/* The far end's symbol clock against ours, which 2.1 allows to be 100 ppm
+ * out. The equaliser could follow a drifting clock by moving its taps, but
+ * only as fast as it learns, and badly: so the sampling instant is steered
+ * directly. The error a timing offset makes is the output's slope times the
+ * offset, and the slope is the difference between the output and what the
+ * same taps make of the line half a symbol older. A second-order loop, so
+ * that a steady drift leaves no steady error. */
+static void timing_track(qrx_t *q, const v34_cf_t *w, v34_cf_t vout, v34_cf_t err)
+{
+    v34_cf_t older = 0.0f;
+    v34_cf_t slope;
+    float sp, e;
+
+    for (int i = 0; i < NEQ - 1; i++)
+        older += q->c[i] * w[i + 1];
+    slope = vout - older;
+    sp = crealf(slope) * crealf(slope) + cimagf(slope) * cimagf(slope);
+    if (sp < 1e-6f)
+        return;
+    /* Positive when a later sample would have been better. */
+    e = crealf(conjf(err) * slope) / sp;
+    if (e > 0.5f)
+        e = 0.5f;
+    else if (e < -0.5f)
+        e = -0.5f;
+    /* Quick through training, to have found a clock offset by the time the
+     * rate is chosen; then gentler, because data has more noise in it.
+     * Critically damped either way. */
+    {
+        double kp = (q->mode == RQ_DATA) ? 0.004 : 0.012;
+
+        q->tfreq += kp * kp / 4.0 * e * q->th;
+        q->tau += kp * e * q->th;
+    }
+    if (q->tfreq > 0.0005 * q->sps)
+        q->tfreq = 0.0005 * q->sps;
+    else if (q->tfreq < -0.0005 * q->sps)
+        q->tfreq = -0.0005 * q->sps;
 }
 
 static void rx_symbol(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf_t u)
@@ -1526,8 +1602,9 @@ static void rx_symbol(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf_t u)
         track(v, w, vout, u, pt4(quad));
         v->snr_db = snr_from_mse(q->mse);
         if (getenv("V34DBG") && (q->k % 128) == 0)
-            DM_DEBUG("v34", "dd k %lld stage %s snr %.1f pwr %.3f ref %.3f (tag=%s)", q->k, STAGE_NAMES[v->stage],
-                     v->snr_db, q->pwr, q->pwr_ref, v->tag);
+            DM_DEBUG("v34", "dd k %lld stage %s snr %.1f cent %.3f/%.3f tfreq %.1f ppm nu %.6f (tag=%s)", q->k,
+                     STAGE_NAMES[v->stage], v->snr_db, tap_centroid(q), q->centroid0, q->tfreq / q->sps * 1e6, q->nu,
+                     v->tag);
         if (q->pwr < 0.05f * q->pwr_ref)
         {
             /* The far end is silent. */
@@ -1555,11 +1632,6 @@ static void rx_symbol(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf_t u)
             break;
         }
         dd_bits(v, quad);
-        /* The taps drifting is the far end's clock against ours: if the
-         * energy moves to older samples, the symbols are arriving earlier
-         * than we take them. */
-        if ((q->k & 63) == 0 && v->stage != ST_P3_TX_SECOND)
-            q->tau -= 0.05 * (tap_centroid(q) - q->centroid0) * q->th;
         break;
     }
 
@@ -1648,10 +1720,10 @@ static void rx_data_symbol(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf
 
         track(v, w, vout, u, d / v->rx_gain);
         v34_dec_symbol(&v->dec, y);
-        if (getenv("V34DBG") && (q->k % 500) == 0)
-            DM_DEBUG("v34", "data %.2f k %lld snr %.1f bad %u theta %.3f nu %.5f cent %.2f tau-n %.2f mse %.1f (tag=%s)",
+        if (getenv("V34DBG") && (q->k % 2000) == 0)
+            DM_DEBUG("v34", "data %.2f k %lld snr %.1f bad %u theta %.3f nu %.5f cent %.2f tfreq %.2f ppm (tag=%s)",
                      v->n / 8000.0, q->k, 10.0f * log10f(v->rx_energy / (v->dec.err + 1e-9f)), v->dec.bad_frames,
-                     q->theta, q->nu, tap_centroid(q), q->tau - (double) v->n, snr_from_mse(q->mse), v->tag);
+                     q->theta, q->nu, tap_centroid(q), q->tfreq / q->sps * 1e6, v->tag);
         /* Watch for the far end starting a rate renegotiation (11.6), or
          * answering ours. */
         if (v->stage == ST_DATA || v->stage == ST_RN)

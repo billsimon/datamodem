@@ -6,6 +6,7 @@
 #include "datamodem/v34.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2863,7 +2864,8 @@ int64_t dm_modem_since_rx_ms(dm_modem_t *m)
  * through G.711; burst=20/3 adds 20 ms of loud noise every 3 seconds, which
  * damages a frame or two without making the line look bad on average - how
  * V.42's recovery gets exercised; cut=20/600 silences the line both ways for
- * 600 ms, 20 seconds in, which a modem can only recover from by retraining. A test hook, not an option - it is how V.32's echo
+ * 600 ms, 20 seconds in, which a modem can only recover from by retraining;
+ * drift=100 makes the answerer's clock 100 ppm fast as the caller hears it. A test hook, not an option - it is how V.32's echo
  * canceller and round-trip measurement get tested without a phone line. */
 #define SELFTEST_LINE_MAX (SELFTEST_CHUNK * 128) /* 2.5 s of each direction */
 
@@ -2879,6 +2881,7 @@ typedef struct
     int burst_every;          /* samples */
     long cut_at;              /* line silent from here, both ways, 0 = never */
     int cut_len;
+    double drift;             /* the answerer's clock against the caller's, parts per million */
     int16_t hist[2][SELFTEST_LINE_MAX];
     long pos;
 } selftest_line_t;
@@ -2913,6 +2916,15 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
             noise_db = atof(tok + 6);
         else if (strcmp(tok, "ulaw") == 0)
             ln->ulaw = true;
+        else if (strncmp(tok, "drift=", 6) == 0)
+        {
+            ln->drift = atof(tok + 6);
+            if (fabs(ln->drift) > 500.0)
+            {
+                DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: drift= is in parts per million, at most 500");
+                return false;
+            }
+        }
         else if (strncmp(tok, "cut=", 4) == 0)
         {
             double at = 0.0, ms = 0.0;
@@ -2941,7 +2953,7 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
         }
         else
         {
-            DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise=, burst=, cut= or ulaw",
+            DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise=, burst=, cut=, drift= or ulaw",
                      tok);
             return false;
         }
@@ -2960,6 +2972,11 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
         ln->echo_gain = powf(10.0f, (float) echo_db / 20.0f);
     if (noise_db < 0.0)
         ln->noise = awgn_init_dbm0(NULL, 1234567, (float) noise_db);
+    if (ln->drift != 0.0 && ln->delay + 256 >= SELFTEST_LINE_MAX - SELFTEST_CHUNK)
+    {
+        DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: too much delay to drift as well");
+        return false;
+    }
     snprintf(desc, desc_len, "delay %.0f ms each way, echo %s, noise %s, %s", delay_ms,
              echo ? "on" : "none", ln->noise ? "on" : "none", ln->ulaw ? "G.711 mu-law" : "linear");
     if (echo)
@@ -3001,6 +3018,30 @@ static void selftest_line_run(selftest_line_t *ln, dm_modem_t *caller, dm_modem_
         for (int e = 0; e < 2; e++)
         {
             float x = (t >= ln->delay) ? ln->hist[1 - e][(t - ln->delay) % SELFTEST_LINE_MAX] : 0.0f;
+
+            /* What the caller hears from an answerer whose clock runs fast or
+             * slow: read the answerer's samples at a drifting instant, by
+             * windowed sinc interpolation. 128 samples further back, so that
+             * a few minutes' drift either way stays in the history. */
+            if (ln->drift != 0.0 && e == 0)
+            {
+                double at = (double) t - ln->delay - 128.0 + (double) t * ln->drift * 1e-6;
+                long i0 = (long) floor(at);
+                double fr = at - (double) i0;
+                double acc = 0.0;
+
+                for (int k = -24; k <= 24; k++)
+                {
+                    double u = (double) k - fr;
+                    double w = 0.42 + 0.5 * cos(M_PI * u / 25.0) + 0.08 * cos(2.0 * M_PI * u / 25.0);
+                    double sinc = (fabs(u) < 1e-9) ? 1.0 : sin(M_PI * u) / (M_PI * u);
+                    long j = i0 + k;
+
+                    if (j >= 0)
+                        acc += w * sinc * ln->hist[1][j % SELFTEST_LINE_MAX];
+                }
+                x = (float) acc;
+            }
 
             if (ln->echo_gain > 0.0f && t >= ln->echo_delay)
                 x += ln->echo_gain * ln->hist[e][(t - ln->echo_delay) % SELFTEST_LINE_MAX];

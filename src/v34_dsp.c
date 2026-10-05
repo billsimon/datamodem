@@ -576,7 +576,7 @@ void v34_probe_analyse(v34_probe_t *p)
     {
         int bin = V34_PROBE_HZ[t] / 50;
         double s = 0.0, nz = 0.0;
-        v34_cf_t mean = 0.0f;
+        double mmean = 0.0;
         double var = 0.0;
 
         for (int b = 0; b < p->blocks; b++)
@@ -584,7 +584,7 @@ void v34_probe_analyse(v34_probe_t *p)
             v34_cf_t v = p->x[b][bin];
 
             s += crealf(v) * crealf(v) + cimagf(v) * cimagf(v);
-            mean += v;
+            mmean += cabsf(v);
             for (int d = -1; d <= 1; d += 2)
             {
                 v34_cf_t w = p->x[b][bin + d];
@@ -594,17 +594,20 @@ void v34_probe_analyse(v34_probe_t *p)
         }
         s /= p->blocks;
         nz /= 2.0 * p->blocks;
-        mean /= (float) p->blocks;
+        mmean /= p->blocks;
         for (int b = 0; b < p->blocks; b++)
         {
-            v34_cf_t v = p->x[b][bin] - mean;
+            double d = cabsf(p->x[b][bin]) - mmean;
 
-            var += crealf(v) * crealf(v) + cimagf(v) * cimagf(v);
+            var += d * d;
         }
-        var /= p->blocks;
-        /* The noise in the tone's own bin shows up as its wander from block
-         * to block; the bins between the tones see the rest. Whichever is
-         * worse, plus a floor for G.711 and the arithmetic. */
+        /* Twice: the magnitude sees only half of a complex noise. */
+        var = 2.0 * var / p->blocks;
+        /* The noise in the tone's own bin shows up as its magnitude's wander
+         * from block to block - not its phase's, which a far end whose clock
+         * is some ppm out turns steadily - and the bins between the tones
+         * see the rest. Whichever is worse, plus a floor for G.711 and the
+         * arithmetic. */
         if (var > nz)
             nz = var;
         if (nz < s * 1e-6)
