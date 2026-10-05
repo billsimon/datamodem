@@ -121,7 +121,8 @@ for a few seconds rather than in the middle of the far end's screen, errors
 are printed below it when the program ends, and the full log goes wherever
 `--log-file` says. `--no-tui` turns all this off for plain line-by-line
 output - which is still made safe to print, letting through text, colour and
-nothing else. It is off anyway when stdin or stdout is not a terminal.
+nothing else, and still answers a BBS that asks where the cursor is. It is
+off anyway when stdin or stdout is not a terminal.
 
 ### stdout is the line, stderr is the diagnostics
 
@@ -1240,7 +1241,8 @@ sequences for the title, the character set, the alternate screen, mouse
 reporting, a full reset, scroll regions and cursor movement onto the status
 line - and 3 KB of random bytes. It checks that none of it reached the pty,
 and replays what did through a terminal emulator to check the screen itself.
-It needs `pip install pyte`, and skips without it.
+It needs `pip install pyte`, and skips without it. `DM_FLAGS=--no-tui` points
+the same far end at the plain output instead, which needs no pyte.
 
 `term-fuzz` feeds the emulator random bytes and sequences at random window
 sizes, resizing as it goes, under the address and undefined-behaviour

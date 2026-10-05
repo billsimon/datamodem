@@ -1611,17 +1611,144 @@ void dm_term_stop(void)
 
 static struct
 {
-    int state;          /* 0 text, 1 ESC, 2 CSI, 3 string */
+    int state;          /* 0 text, 1 ESC, 2 CSI, 3 string, 4 rest of a CSI */
     char seq[64];
     size_t seqlen;
     decoder_t dec;
     bool coloured;
+    /* Where the far end thinks its cursor is, on a screen the size of the
+     * terminal, for answering it when it asks - which is how most BBSes
+     * decide whether the terminal does ANSI, and some how big it is. Most
+     * of what moves it never reaches the terminal, so it is the screen the
+     * far end believes it is drawing, not where the text is landing. cx may
+     * be cols: the last column written, the wrap still to come. */
+    bool placed;
+    int cx, cy, sx, sy;
+    int cols, rows;
 } S;
+
+static void sanitize_size(void)
+{
+    struct winsize ws;
+
+    S.cols = 80;
+    S.rows = 24;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0)
+    {
+        S.cols = ws.ws_col;
+        S.rows = ws.ws_row;
+    }
+    if (!S.placed)
+    {
+        /* Line output goes on at the bottom of a terminal that scrolls. */
+        S.cy = S.rows - 1;
+        S.placed = true;
+    }
+    if (S.cx > S.cols)
+        S.cx = S.cols;
+    if (S.cy >= S.rows)
+        S.cy = S.rows - 1;
+}
+
+static int sanitize_param(int i, int def)
+{
+    int n = 0, v = 0;
+
+    for (size_t k = 0; k <= S.seqlen; k++)
+    {
+        if (k == S.seqlen || S.seq[k] == ';')
+        {
+            if (n == i)
+                return v > 0 ? v : def;
+            n++;
+            v = 0;
+        }
+        else if (v < 10000)
+        {
+            v = v * 10 + (S.seq[k] - '0');
+        }
+    }
+    return def;
+}
+
+/* A CSI sequence's effect on where the far end thinks the cursor is, and
+ * the answers to its queries - the same ones the emulator gives. */
+static void sanitize_csi(unsigned char final)
+{
+    int n = sanitize_param(0, 1);
+
+    switch (final)
+    {
+    case 'A':
+        S.cy -= n;
+        break;
+    case 'B':
+        S.cy += n;
+        break;
+    case 'C':
+        S.cx += n;
+        break;
+    case 'D':
+        S.cx = (S.cx < S.cols ? S.cx : S.cols - 1) - n;
+        break;
+    case 'G':
+        S.cx = n - 1;
+        break;
+    case 'd':
+        S.cy = n - 1;
+        break;
+    case 'H':
+    case 'f':
+        S.cy = n - 1;
+        S.cx = sanitize_param(1, 1) - 1;
+        break;
+    case 'J':
+        if (sanitize_param(0, 0) == 2) /* ANSI.SYS homes the cursor */
+            S.cx = S.cy = 0;
+        break;
+    case 's':
+        S.sx = S.cx;
+        S.sy = S.cy;
+        break;
+    case 'u':
+        S.cx = S.sx;
+        S.cy = S.sy;
+        break;
+    case 'n':
+        if (sanitize_param(0, 0) == 6)
+        {
+            char buf[32];
+
+            snprintf(buf, sizeof(buf), "\033[%d;%dR", S.cy + 1, (S.cx < S.cols ? S.cx : S.cols - 1) + 1);
+            reply(buf);
+        }
+        else if (sanitize_param(0, 0) == 5)
+        {
+            reply("\033[0n");
+        }
+        break;
+    case 'c':
+        if (sanitize_param(0, 0) == 0)
+            reply("\033[?1;0c");
+        break;
+    default:
+        break;
+    }
+    if (S.cx < 0)
+        S.cx = 0;
+    if (S.cx >= S.cols && strchr("ABCDGHdfJu", final) != NULL) /* moving ends a pending wrap */
+        S.cx = S.cols - 1;
+    if (S.cy < 0)
+        S.cy = 0;
+    if (S.cy >= S.rows)
+        S.cy = S.rows - 1;
+}
 
 size_t dm_term_sanitize(const unsigned char *in, size_t len, char *out)
 {
     size_t o = 0;
 
+    sanitize_size();
     for (size_t i = 0; i < len; i++)
     {
         unsigned char b = in[i];
@@ -1636,13 +1763,30 @@ size_t dm_term_sanitize(const unsigned char *in, size_t len, char *out)
             else if (b == '\r' || b == '\n' || b == '\b' || b == '\t' || b == '\a')
             {
                 out[o++] = (char) b;
+                if (b == '\r')
+                    S.cx = 0;
+                else if (b == '\n' && S.cy < S.rows - 1)
+                    S.cy++;
+                else if (b == '\b' && S.cx > 0)
+                    S.cx = (S.cx < S.cols ? S.cx : S.cols - 1) - 1;
+                else if (b == '\t')
+                    S.cx = S.cx / 8 * 8 + 8 < S.cols ? S.cx / 8 * 8 + 8 : S.cols - 1;
             }
             else if (b >= 0x20 && b != 0x7F)
             {
                 int32_t cp = decode(&S.dec, g_charset, b);
 
                 if (cp >= 0x20)
+                {
                     o += encode((uint32_t) cp, out + o);
+                    if (S.cx >= S.cols)
+                    {
+                        S.cx = 0;
+                        if (S.cy < S.rows - 1)
+                            S.cy++;
+                    }
+                    S.cx++;
+                }
             }
             break;
         case 1:
@@ -1658,6 +1802,16 @@ size_t dm_term_sanitize(const unsigned char *in, size_t len, char *out)
             }
             else
             {
+                if (b == '7')
+                {
+                    S.sx = S.cx;
+                    S.sy = S.cy;
+                }
+                else if (b == '8')
+                {
+                    S.cx = S.sx;
+                    S.cy = S.sy;
+                }
                 S.state = 0;
             }
             break;
@@ -1669,7 +1823,8 @@ size_t dm_term_sanitize(const unsigned char *in, size_t len, char *out)
              * without them a banner collapses against the left margin. Up,
              * down, to a row, clearing the screen and every private or
              * intermediate form stay out: they reach beyond the line, into
-             * the shell's own output or the terminal's state. */
+             * the shell's own output or the terminal's state. Queries are
+             * answered here instead, as the emulator answers them. */
             if ((b >= '0' && b <= '9') || b == ';')
             {
                 if (S.seqlen < sizeof(S.seq) - 1)
@@ -1689,6 +1844,8 @@ size_t dm_term_sanitize(const unsigned char *in, size_t len, char *out)
                     if (b == 'm')
                         S.coloured = true;
                 }
+                if (b >= 0x40 && b <= 0x7E)
+                    sanitize_csi(b);
                 S.state = (b >= 0x20 && b < 0x40) ? 4 : 0; /* 4: swallow the rest */
             }
             break;

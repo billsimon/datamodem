@@ -13,8 +13,12 @@ far end's sequences may reach it, and replayed through a terminal emulator
 the screen has to show the far end's text above an intact status line, and
 hand the shell a fresh line below that line at the end.
 
+DM_FLAGS=--no-tui runs the dialler the plain way instead: the same far end,
+and the same checks that nothing of it reached the pty and that its cursor
+position query was answered, but no screen to look at.
+
 Needs pyte (pip install pyte), a terminal emulator in Python, to see the
-screen; skips without it.
+screen; skips without it, unless there is no screen to see.
 """
 import fcntl
 import os
@@ -28,13 +32,16 @@ import tempfile
 import termios
 import time
 
-try:
-    import pyte
-except ImportError:
-    print("SKIP: needs pyte (pip install pyte)")
-    sys.exit(0)
-
 BIN = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "build/datamodem")
+EXTRA = os.environ.get("DM_FLAGS", "").split()
+PLAIN = "--no-tui" in EXTRA
+
+if not PLAIN:
+    try:
+        import pyte
+    except ImportError:
+        print("SKIP: needs pyte (pip install pyte)")
+        sys.exit(0)
 W, H = 80, 24
 MODULATION = os.environ.get("MODULATION", "v32bis")
 work = tempfile.mkdtemp(prefix="datamodem-screen")
@@ -75,7 +82,7 @@ if pid == 0:
     os.environ["LC_ALL"] = "en_US.UTF-8"
     os.execv(BIN, [BIN, "sip:ans@127.0.0.1:5080", "--server", "127.0.0.1", "--username", "call", "--no-register",
                    "--local-port", "5070", "--rtp-port", "4200", "--modulation", MODULATION, "--idle-timeout",
-                   "10", "--max-call", "120", "--log-file", f"{work}/dial.log"])
+                   "10", "--max-call", "120", "--log-file", f"{work}/dial.log"] + EXTRA)
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", H, W, 0, 0))
 out = bytearray()
 start = time.time()
@@ -111,25 +118,31 @@ forbidden = {b"\x1b]": "a window title", b"\x1b(0": "a character set switch", b"
              b"\x1b[5i": "the printer", b"\x1b[1;24r": "a scroll region over the status line"}
 for seq, name in forbidden.items():
     check(seq not in out, f"{name} did not reach the terminal")
-
-# The screen as it was in use: everything up to the hand-back.
-handback = out.rfind(b"\x1b[r")
-screen = pyte.Screen(W, H)
-pyte.ByteStream(screen).feed(bytes(out[:handback] if handback > 0 else out))
-rows = screen.display
-status = rows[-1]
-text = "\n".join(rows)
-check("OFFLINE" in status, "the status line is on the bottom row, and says the call is over")
-check(screen.buffer[H - 1][2].reverse, "the status line is in reverse video")
-check("OVERWRITE" not in text, "the far end could not write on the status line")
-check("END OF PAYLOAD" in text, "the far end's last line is on the screen")
 check("╔" in out.decode("utf-8", "replace"), "CP437 box drawing came out as Unicode")
 
-after = pyte.Screen(W, H)
-pyte.ByteStream(after).feed(bytes(out))
-check("OFFLINE" in after.display[-2] and after.display[-1].strip() == "",
-      "the shell gets a fresh line below the status line")
-check(after.margins is None, "the scroll region was given back")
+if PLAIN:
+    for seq, name in {b"\x1b[2J": "a screen clear", b"\x1b[H": "cursor home", b"\x1b[6n": "the query itself",
+                      b"\x1b[99;1H": "cursor movement off the line", b"\x1b[J": "erase below"}.items():
+        check(seq not in out, f"{name} did not reach the terminal")
+    check(b"END OF PAYLOAD" in out, "the far end's last line was printed")
+else:
+    # The screen as it was in use: everything up to the hand-back.
+    handback = out.rfind(b"\x1b[r")
+    screen = pyte.Screen(W, H)
+    pyte.ByteStream(screen).feed(bytes(out[:handback] if handback > 0 else out))
+    rows = screen.display
+    status = rows[-1]
+    text = "\n".join(rows)
+    check("OFFLINE" in status, "the status line is on the bottom row, and says the call is over")
+    check(screen.buffer[H - 1][2].reverse, "the status line is in reverse video")
+    check("OVERWRITE" not in text, "the far end could not write on the status line")
+    check("END OF PAYLOAD" in text, "the far end's last line is on the screen")
+
+    after = pyte.Screen(W, H)
+    pyte.ByteStream(after).feed(bytes(out))
+    check("OFFLINE" in after.display[-2] and after.display[-1].strip() == "",
+          "the shell gets a fresh line below the status line")
+    check(after.margins is None, "the scroll region was given back")
 with open(f"{work}/answer.out", "rb") as f:
     check(f.read().startswith(b"\x1b[") , "the far end's cursor position query was answered")
 

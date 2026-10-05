@@ -75,7 +75,9 @@ void dm_term_tick(void);
  * input from a pipe): the far end's bytes made safe to print in line -
  * printable text, CR, LF, backspace, tab, colour and the movements that stay
  * on the current line (cursor forward, back, to a column, erase in line),
- * its code page translated - and nothing else. Returns the length written to out, which
+ * its code page translated - and nothing else. Queries are answered through
+ * dm_term_set_reply()'s hook, as the emulator answers them, for a screen the
+ * size of the terminal. Returns the length written to out, which
  * must hold DM_TERM_SANITIZE_CAP(len) bytes. */
 #define DM_TERM_SANITIZE_CAP(len) (4 * (len) + 80)
 size_t dm_term_sanitize(const unsigned char *in, size_t len, char *out);
