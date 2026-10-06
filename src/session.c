@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -34,6 +35,12 @@ extern char **environ;
 /* --exec: how long the command has to exit after the call ends and it is
  * sent SIGHUP, before SIGKILL. */
 #define DM_EXEC_EXIT_GRACE_MS 5000
+
+/* --exec: how much of the command's output may wait between it and us,
+ * beyond the transmit queue's few seconds of line time. A pipe holds 64 KB,
+ * which at 300 bps is over half an hour the caller's keystrokes would wait
+ * behind; a socket with a small send buffer makes the command wait instead. */
+#define DM_EXEC_OUTPUT_BUFFER 1024
 /* ------------------------------------------------------- escape detector */
 
 void dm_escape_init(dm_escape_t *e, int escape_char, int guard_ms)
@@ -736,12 +743,18 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
         DM_ERROR("exec", "pipe: %s", strerror(errno));
         return false;
     }
-    if (pipe(from_child) != 0)
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, from_child) != 0)
     {
-        DM_ERROR("exec", "pipe: %s", strerror(errno));
+        DM_ERROR("exec", "socketpair: %s", strerror(errno));
         close(to_child[0]);
         close(to_child[1]);
         return false;
+    }
+    {
+        int size = DM_EXEC_OUTPUT_BUFFER;
+
+        setsockopt(from_child[1], SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+        setsockopt(from_child[0], SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
     }
 
     argv[0] = "sh";
