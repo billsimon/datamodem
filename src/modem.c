@@ -4268,8 +4268,150 @@ static bool compare_stream(const char *what, const unsigned char *sent, size_t s
     return false;
 }
 
+/* DATAMODEM_REPLAY=call.wav, a test hook: instead of two modems back to
+ * back, one calling modem against a recording of a real far end - the left
+ * channel of what DATAMODEM_RECORD wrote, or any 8 kHz 16-bit WAV. The far
+ * end cannot answer what we send now, only what was sent on the day, so
+ * past the first exchange the two drift apart; but everything up to it -
+ * which answer tone this is, when CM goes out, what is heard after it and
+ * what we step down to - is played out exactly, and said with the time into
+ * the recording at which it happened. */
+static int selftest_replay(const dm_config_t *cfg, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    unsigned char hdr[12];
+    unsigned char chunk[8];
+    int channels = 0;
+    int bits = 0;
+    uint32_t rate = 0;
+    long data_len = -1;
+    dm_modem_params_t params;
+    dm_modem_t *m;
+    dm_modem_status_t st;
+    char last_mod[16] = "";
+    char last_stage[96] = "";
+    int last_phase = -1;
+    bool ready = false;
+    long frames = 0;
+    unsigned char got[4096];
+    size_t got_n = 0;
+
+    if (f == NULL || fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0)
+    {
+        DM_ERROR("selftest", "DATAMODEM_REPLAY: %s is not a WAV file", path);
+        if (f != NULL)
+            fclose(f);
+        return DM_EXIT_CONFIG;
+    }
+    while (fread(chunk, 1, 8, f) == 8)
+    {
+        long len = (long) (chunk[4] | chunk[5] << 8 | chunk[6] << 16 | (uint32_t) chunk[7] << 24);
+
+        if (memcmp(chunk, "fmt ", 4) == 0)
+        {
+            unsigned char fmt[16];
+
+            if (len < 16 || fread(fmt, 1, 16, f) != 16)
+                break;
+            channels = fmt[2] | fmt[3] << 8;
+            rate = (uint32_t) (fmt[4] | fmt[5] << 8 | fmt[6] << 16 | (uint32_t) fmt[7] << 24);
+            bits = fmt[14] | fmt[15] << 8;
+            fseek(f, len - 16, SEEK_CUR);
+        }
+        else if (memcmp(chunk, "data", 4) == 0)
+        {
+            data_len = len;
+            break;
+        }
+        else
+        {
+            fseek(f, len, SEEK_CUR);
+        }
+    }
+    if (data_len < 0 || rate != DM_SAMPLE_RATE || bits != 16 || channels < 1)
+    {
+        DM_ERROR("selftest", "DATAMODEM_REPLAY: %s must be 16-bit 8000 Hz PCM (it is %d-bit, %u Hz, %d channels)",
+                 path, bits, rate, channels);
+        fclose(f);
+        return DM_EXIT_CONFIG;
+    }
+
+    dm_modem_params_from_config(cfg, true, "replay", &params);
+    m = dm_modem_create(&params);
+    if (m == NULL)
+    {
+        fclose(f);
+        return DM_EXIT_CONFIG;
+    }
+    dm_modem_arm(m);
+    DM_INFO("selftest", "replaying %s: %.1f seconds of a far end, to a calling modem", path,
+            (double) data_len / (2.0 * channels) / DM_SAMPLE_RATE);
+
+    for (;;)
+    {
+        int16_t out[SELFTEST_CHUNK];
+        int16_t in[SELFTEST_CHUNK];
+        int n = 0;
+        double t = (double) frames * SELFTEST_CHUNK / DM_SAMPLE_RATE;
+
+        while (n < SELFTEST_CHUNK)
+        {
+            unsigned char b[2 * 8];
+
+            if (fread(b, 2, (size_t) channels, f) != (size_t) channels)
+                break;
+            in[n++] = (int16_t) (b[0] | b[1] << 8);
+        }
+        if (n < SELFTEST_CHUNK)
+            break;
+        dm_clock_advance_ms(SELFTEST_CHUNK * 1000 / DM_SAMPLE_RATE);
+        dm_modem_tx(m, out, SELFTEST_CHUNK);
+        dm_modem_rx(m, in, SELFTEST_CHUNK);
+        frames++;
+
+        dm_modem_status(m, &st);
+        if (strcmp(st.modulation, last_mod) != 0 || (int) st.phase != last_phase ||
+            strcmp(st.train_stage ? st.train_stage : "", last_stage) != 0)
+        {
+            DM_INFO("selftest", "%6.2f s  %-7s %-11s %s", t, st.modulation, st.phase_text,
+                    st.train_stage ? st.train_stage : "");
+            snprintf(last_mod, sizeof(last_mod), "%s", st.modulation);
+            snprintf(last_stage, sizeof(last_stage), "%s", st.train_stage ? st.train_stage : "");
+            last_phase = (int) st.phase;
+        }
+        if (!ready && dm_modem_data_ready(m))
+        {
+            ready = true;
+            DM_INFO("selftest", "%6.2f s  link up: %s at %d bps, %s", t, st.modulation, st.bit_rate, st.protocol);
+        }
+        if (got_n < sizeof(got))
+            got_n += dm_modem_recv(m, got + got_n, sizeof(got) - got_n);
+    }
+    fclose(f);
+
+    dm_modem_status(m, &st);
+    if (got_n > 0)
+    {
+        char text[256];
+        size_t k = 0;
+
+        for (size_t i = 0; i < got_n && k < sizeof(text) - 1; i++)
+            text[k++] = (got[i] >= 0x20 && got[i] < 0x7f) ? (char) got[i] : '.';
+        text[k] = '\0';
+        DM_INFO("selftest", "received %zu bytes: %s", got_n, text);
+    }
+    dm_log_event(DM_LOG_INFO, "selftest", "replay", "modulation=%s rate=%d protocol=%s link=%s seconds=%.1f",
+                 st.modulation, st.bit_rate, st.protocol, ready ? "up" : "never",
+                 (double) frames * SELFTEST_CHUNK / DM_SAMPLE_RATE);
+    dm_modem_destroy(m);
+    return ready ? DM_EXIT_OK : DM_EXIT_NO_CARRIER;
+}
+
 int dm_modem_selftest(const dm_config_t *cfg)
 {
+    if (getenv("DATAMODEM_REPLAY") != NULL && *getenv("DATAMODEM_REPLAY") != '\0')
+        return selftest_replay(cfg, getenv("DATAMODEM_REPLAY"));
+
     dm_modem_params_t call_params;
     dm_modem_params_t ans_params;
     dm_modem_t *caller = NULL;

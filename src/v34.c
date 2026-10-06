@@ -305,8 +305,11 @@ struct dm_v34
     bool ansam_claimed;       /* spandsp says ANSam; ansam_verify() has the last word */
     /* The answer tone's envelope, every 10 ms, for ansam_verify(). */
     float env_re, env_im;
+    float env_pwr;            /* the whole block's power, to tell a tone from noise */
     double env_phase;
     int env_n;
+    int tone_run;             /* blocks in a row that were the 2100 Hz tone */
+    int tone_gap;             /* allowance for the block a phase reversal empties */
     float env[ENV_BLOCKS];
     int env_count;
     uint32_t v8_sr;
@@ -2562,7 +2565,10 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
     {
         int t = modem_connect_tones_rx_get(v->ansam_rx);
 
-        if (t == MODEM_CONNECT_TONES_ANSAM || t == MODEM_CONNECT_TONES_ANSAM_PR)
+        /* spandsp's detector takes two and a half seconds to call ANSam -
+         * which on a real call left an answerer one second of our CM before
+         * its ANSam ran out. A second of the tone is enough to measure. */
+        if (t == MODEM_CONNECT_TONES_ANSAM || t == MODEM_CONNECT_TONES_ANSAM_PR || v->tone_run >= ENV_BLOCKS)
             v->ansam_claimed = true;
         if (v->ansam_claimed)
         {
@@ -3065,13 +3071,35 @@ static void rx_sample(dm_v34_t *v, float x, bool missing)
          * 10 ms, which passes 15 Hz and a tone up to V.25's 15 Hz off. */
         v->env_re += e * (float) cos(v->env_phase);
         v->env_im -= e * (float) sin(v->env_phase);
+        v->env_pwr += e * e;
         v->env_phase += 2.0 * M_PI * 2100.0 / 8000.0;
         if (v->env_phase > 2.0 * M_PI)
             v->env_phase -= 2.0 * M_PI;
         if (++v->env_n == ENV_BLOCK)
         {
-            v->env[v->env_count++ % ENV_BLOCKS] = sqrtf(v->env_re * v->env_re + v->env_im * v->env_im) / ENV_BLOCK;
-            v->env_re = v->env_im = 0.0f;
+            float a = sqrtf(v->env_re * v->env_re + v->env_im * v->env_im) / ENV_BLOCK;
+            float ms = v->env_pwr / ENV_BLOCK;
+
+            v->env[v->env_count++ % ENV_BLOCKS] = 2.0f * a;
+            /* A tone of amplitude A mixes down to A/2 and has A^2/2 of mean
+             * square: most of the block, at a level worth hearing, is the
+             * answer tone. One block that is not - where a phase reversal
+             * fell - does not end the run. */
+            if (ms > v->pmin && 2.0f * a * a >= 0.6f * ms)
+            {
+                v->tone_run++;
+                v->tone_gap = 0;
+            }
+            else if (v->tone_run > 0 && v->tone_gap == 0)
+            {
+                v->tone_run++;
+                v->tone_gap = 1;
+            }
+            else
+            {
+                v->tone_run = 0;
+            }
+            v->env_re = v->env_im = v->env_pwr = 0.0f;
             v->env_n = 0;
         }
         break;
