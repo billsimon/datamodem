@@ -3116,6 +3116,11 @@ int dm_v34_tx_rate(const dm_v34_t *v)
     return (v->stage == ST_DATA || v->tx_in_data) ? v->rate_tx : 0;
 }
 
+bool dm_v34_engaged(const dm_v34_t *v)
+{
+    return v->stage != ST_V8_C_LISTEN && v->stage != ST_V8_A_ANSAM && v->stage != ST_DEAD;
+}
+
 int dm_v34_rx_rate(const dm_v34_t *v)
 {
     return (v->stage == ST_DATA || v->rx_in_data) ? v->rate_rx : 0;

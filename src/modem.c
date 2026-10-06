@@ -181,6 +181,43 @@ typedef enum
     DM_MOD_V34
 } dm_mod_t;
 
+/* What the far end sounds like while we are still finding out what it is.
+ * See listen_block(). */
+typedef enum
+{
+    HEARD_NONE = 0,
+    HEARD_AC,        /* a V.32 answering modem: 600 and 3000 Hz */
+    HEARD_AA,        /* a V.32 calling modem: 1800 Hz */
+    HEARD_USB1,      /* a V.22 bis or V.22 answering modem's unscrambled ones */
+    HEARD_V21_ANS,   /* V.21 channel 2, the answering modem's: mark 1650 Hz */
+    HEARD_BELL_ANS,  /* Bell 103's answering band: mark 2225 Hz */
+    HEARD_V21_ORIG,  /* V.21 channel 1, the calling modem's: mark 980 Hz */
+    HEARD_BELL_ORIG, /* Bell 103's originating band: mark 1270 Hz */
+    HEARD_LOW_FSK,   /* one or the other: which, takes more than one block to say */
+    HEARD_COUNT
+} heard_t;
+
+/* 40 ms. Over exactly this many samples, Goertzel bins 25 Hz apart are
+ * orthogonal - which is what separates Bell 103's 2225 Hz from the 2250 Hz
+ * that a V.22 bis answering modem's unscrambled ones put most of their power
+ * at. */
+#define DM_LISTEN_BLOCK 320
+#define DM_LISTEN_OWN_MAX 2
+
+typedef struct
+{
+    int16_t buf[DM_LISTEN_BLOCK];
+    int n;
+    int run[HEARD_COUNT];      /* consecutive blocks each has been heard in */
+    float own[DM_LISTEN_OWN_MAX]; /* what we are sending: its echo is not the far end */
+    int n_own;
+    float v21_tones;           /* HEARD_LOW_FSK: the power at each one's tones, this block */
+    float bell_tones;
+    float v21_sum;             /* and over the run of blocks it has lasted */
+    float bell_sum;
+    int fsk_blocks;
+} dm_listen_t;
+
 typedef enum
 {
     DM_V42_OFF = 0,
@@ -192,7 +229,8 @@ struct dm_modem
 {
     pthread_mutex_t lock;
 
-    /* Settings, fixed after create. */
+    /* Settings, fixed after create - except the modulation itself, and
+     * what follows from it, which change when we step down. */
     dm_mod_t mod;
     const char *mod_name;
     bool calling;
@@ -289,7 +327,29 @@ struct dm_modem
     bool connected;
     bool carrier_lost;
     bool answer_tone_seen;
-    bool v32_fallback_due;     /* V.34 found no V.8 at the far end; V.32 bis next frame */
+
+    /* Stepping down. Until the far end has answered in some modulation's
+     * terms we are hunting: listening for what it is, and on the answering
+     * side offering one modulation after another. See hunt_tick(). */
+    dm_mod_t ceiling;          /* --modulation: the fastest we will try */
+    bool step_down;
+    int rate_cap;              /* --bit-rate, 0 = none */
+    bool hunting;
+    dm_listen_t listen;
+    long long samples;         /* line time since the modem was armed */
+    bool switch_due;           /* change to switch_to at the next frame */
+    dm_mod_t switch_to;
+    char switch_why[96];
+    bool switch_confirmed;     /* switch_to is FSK, and its far end has been heard already */
+    bool no_v8;                /* V.34 found no V.8 at the far end */
+    bool aa_heard;             /* answering: a V.32 caller's AA, at any point */
+    long long aa_from;         /* calling: when our V.32 pump started sending AA, -1 if not */
+    int window;                /* answering: which of ANSWER_CYCLE is on offer, -1 = V.8 */
+    long window_left;          /* samples before offering the next */
+    bool fsk_carrier;
+    bool fsk_confirmed;        /* the far end's FSK tone has been heard, not just energy */
+    long long fsk_mark_from;   /* calling: when our own carrier went out, -1 = not yet */
+    size_t tx_limit;           /* DM_TX_SECONDS of the current line rate, in bytes */
     int bit_rate;
     unsigned retrains;
     int64_t connect_ms;
@@ -541,6 +601,345 @@ static int default_rate(dm_mod_t mod)
     }
 }
 
+/* The most a modulation will run at under a --bit-rate ceiling: the cap
+ * itself when the modulation has that rate, else the next one down. 0 is no
+ * ceiling. */
+static int rate_for(dm_mod_t mod, int cap)
+{
+    static const int v32bis[] = { 14400, 12000, 9600, 7200, 4800 };
+    int best = default_rate(mod);
+
+    if (cap <= 0 || cap >= best)
+        return best;
+    switch (mod)
+    {
+    case DM_MOD_V34:
+        return cap >= 2400 ? cap / 2400 * 2400 : 2400;
+    case DM_MOD_V32BIS:
+        for (size_t i = 0; i < sizeof(v32bis) / sizeof(v32bis[0]); i++)
+            if (v32bis[i] <= cap)
+                return v32bis[i];
+        return 4800;
+    case DM_MOD_V32:
+        return 4800;
+    case DM_MOD_V22BIS:
+        return 1200;
+    default:
+        return best;
+    }
+}
+
+/* ------------------------------------------------------------ stepping down
+ *
+ * Fastest first. V.32 bis and V.22 bis each already talk to the modulation
+ * below them - a V.32 bis modem trains with a V.32 one at 9600, and V.22 bis
+ * with V.22 at 1200 - so between them they cover V.32 and V.22 too; the two
+ * are rungs of their own only for a --modulation that starts there. V.21
+ * and Bell 103 are both 300 bps, in different bands. V.23 is on no ladder:
+ * its 75 bps back channel is nothing anyone wants to fall back to, and
+ * nothing falls back to it. */
+static const dm_mod_t LADDER[] = { DM_MOD_V34, DM_MOD_V32BIS, DM_MOD_V32, DM_MOD_V22BIS,
+                                   DM_MOD_V22, DM_MOD_V21,    DM_MOD_BELL103 };
+
+static int rung(dm_mod_t mod)
+{
+    for (int i = 0; i < (int) (sizeof(LADDER) / sizeof(LADDER[0])); i++)
+        if (LADDER[i] == mod)
+            return i;
+    return -1;
+}
+
+static bool may_run(const dm_modem_t *m, dm_mod_t mod)
+{
+    if (mod == m->ceiling)
+        return true;
+    return m->step_down && rung(m->ceiling) >= 0 && rung(mod) > rung(m->ceiling);
+}
+
+/* Which of a pair - the better first - this modem may run, or -1. */
+static int pick(const dm_modem_t *m, dm_mod_t better, dm_mod_t other)
+{
+    if (may_run(m, better))
+        return (int) better;
+    if (may_run(m, other))
+        return (int) other;
+    return -1;
+}
+
+static int pick_v32(const dm_modem_t *m)
+{
+    return pick(m, DM_MOD_V32BIS, DM_MOD_V32);
+}
+
+static int pick_v22(const dm_modem_t *m)
+{
+    return pick(m, DM_MOD_V22BIS, DM_MOD_V22);
+}
+
+static bool is_v22(dm_mod_t mod)
+{
+    return mod == DM_MOD_V22BIS || mod == DM_MOD_V22;
+}
+
+/* What an answering modem offers, in turn, to a caller that has not said
+ * what it is. V.32 bis Annex A's automode for the first two: V.22 bis's
+ * unscrambled ones for Ta = 3 s, listening for S1 or SB1 in the low band,
+ * then V.32's AC. Then V.21's and Bell 103's answering carriers, which are
+ * what callers at 300 bps wait to hear before they say anything. Round again
+ * after that, until the session's --train-timeout. Each offer is only
+ * withdrawn while nobody is answering it. */
+static const dm_mod_t ANSWER_CYCLE[] = { DM_MOD_V22BIS, DM_MOD_V32BIS, DM_MOD_V21, DM_MOD_BELL103 };
+#define DM_ANSWER_CYCLE_LEN ((int) (sizeof(ANSWER_CYCLE) / sizeof(ANSWER_CYCLE[0])))
+#define DM_WINDOW_MS 3000
+
+/* The modulation this modem would run for one of ANSWER_CYCLE, or -1. */
+static int cycle_mod(const dm_modem_t *m, int i)
+{
+    switch (ANSWER_CYCLE[i])
+    {
+    case DM_MOD_V22BIS:
+        return pick_v22(m);
+    case DM_MOD_V32BIS:
+        return pick_v32(m);
+    default:
+        return may_run(m, ANSWER_CYCLE[i]) ? (int) ANSWER_CYCLE[i] : -1;
+    }
+}
+
+static int cycle_index(dm_mod_t mod)
+{
+    if (is_v22(mod))
+        return 0;
+    if (is_v32(mod))
+        return 1;
+    return mod == DM_MOD_V21 ? 2 : 3;
+}
+
+/* Is there anywhere to step down to? */
+static bool can_step_down(const dm_modem_t *m)
+{
+    if (!m->step_down || rung(m->ceiling) < 0)
+        return false;
+    return rung(m->ceiling) < rung(DM_MOD_BELL103);
+}
+
+/* V.21 and Bell 103 receivers take any energy at all for a carrier, so a V.32
+ * caller's AA, or our own echo, would connect them to nothing. They wait to
+ * hear the far end's tone in its band. V.23 is left as it was. */
+static bool fsk_needs_tone(dm_mod_t mod)
+{
+    return mod == DM_MOD_V21 || mod == DM_MOD_BELL103;
+}
+
+/* --------------------------------------------------------------- listening
+ *
+ * Which modem is at the far end, from what it sends before it has heard
+ * anything it recognises: tones, mostly, at frequencies that do not overlap.
+ * A Goertzel filter per frequency over each 40 ms block, against the block's
+ * whole power less the echo of whatever we are sending ourselves; a signal
+ * counts once it holds for several blocks running. */
+
+/* Power at f, scaled so that a tone of amplitude A reads A^2 - twice the mean
+ * square it contributes. */
+static float goertzel(const int16_t *x, int n, float f)
+{
+    float c = 2.0f * cosf(2.0f * (float) M_PI * f / DM_SAMPLE_RATE);
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+
+    for (int i = 0; i < n; i++)
+    {
+        float s0 = (float) x[i] + c * s1 - s2;
+
+        s2 = s1;
+        s1 = s0;
+    }
+    return (s1 * s1 + s2 * s2 - c * s1 * s2) * 4.0f / ((float) n * (float) n);
+}
+
+/* The strongest tone between lo and hi, in 5 Hz steps: a far end's crystal
+ * or a long-distance carrier system may have moved it from nominal. */
+static float tone_peak(const int16_t *x, int n, float lo, float hi, float *at)
+{
+    float best = 0.0f;
+
+    *at = lo;
+    for (float f = lo; f <= hi + 0.1f; f += 5.0f)
+    {
+        float p = goertzel(x, n, f);
+
+        if (p > best)
+        {
+            best = p;
+            *at = f;
+        }
+    }
+    return best;
+}
+
+/* The power between lo and hi, less the echo of our own tones: over a
+ * 320-sample block the Goertzel bins every 25 Hz are orthogonal, and between
+ * them add up to all of it. */
+static float band_power(const dm_listen_t *l, float lo, float hi)
+{
+    float sum = 0.0f;
+
+    for (float f = lo; f <= hi + 0.1f; f += 25.0f)
+    {
+        bool own = false;
+
+        for (int i = 0; i < l->n_own; i++)
+            own = own || fabsf(f - l->own[i]) < 12.5f;
+        if (!own)
+            sum += goertzel(l->buf, DM_LISTEN_BLOCK, f);
+    }
+    return sum;
+}
+
+static void listen_reset(dm_listen_t *l)
+{
+    l->n = 0;
+    memset(l->run, 0, sizeof(l->run));
+    l->v21_sum = l->bell_sum = 0.0f;
+    l->fsk_blocks = 0;
+}
+
+static void listen_set_own(dm_listen_t *l, float a, float b)
+{
+    l->n_own = 0;
+    if (a > 0.0f)
+        l->own[l->n_own++] = a;
+    if (b > 0.0f)
+        l->own[l->n_own++] = b;
+}
+
+/* Whether we are sending anything between lo and hi ourselves: a signal
+ * there would only be our own echo, and is not looked for. */
+static bool own_between(const dm_listen_t *l, float lo, float hi)
+{
+    for (int i = 0; i < l->n_own; i++)
+        if (l->own[i] >= lo - 25.0f && l->own[i] <= hi + 25.0f)
+            return true;
+    return false;
+}
+
+/* A block quieter than -48 dBm0 has nothing in it worth naming. */
+#define DM_LISTEN_FLOOR 4100.0f
+/* How much of what is left once our own echo is set aside a signal's tones
+ * have to account for. A clean tone is over 0.9; noise, speech and
+ * wideband data are nowhere near half. */
+#define DM_LISTEN_SHARE 0.5f
+
+static heard_t listen_block(dm_listen_t *l)
+{
+    const int16_t *x = l->buf;
+    const int n = DM_LISTEN_BLOCK;
+    float ms = 0.0f;
+    float whole;
+    float at;
+    float a;
+    float b;
+
+    for (int i = 0; i < n; i++)
+        ms += (float) x[i] * (float) x[i];
+    ms /= (float) n;
+    if (ms < DM_LISTEN_FLOOR)
+        return HEARD_NONE;
+    whole = 2.0f * ms;
+    for (int i = 0; i < l->n_own; i++)
+        whole -= goertzel(x, n, l->own[i]);
+    if (whole < 2.0f * DM_LISTEN_FLOOR)
+        return HEARD_NONE;      /* nothing but our own echo */
+
+    /* AC: both of its tones, neither of them incidental. */
+    a = goertzel(x, n, 600.0f);
+    b = goertzel(x, n, 3000.0f);
+    if (!own_between(l, 600.0f, 600.0f) && a + b >= DM_LISTEN_SHARE * whole && a >= 0.15f * whole &&
+        b >= 0.15f * whole)
+        return HEARD_AC;
+    if (!own_between(l, 1780.0f, 1820.0f) && tone_peak(x, n, 1780.0f, 1820.0f, &at) >= DM_LISTEN_SHARE * whole)
+        return HEARD_AA;
+
+    /* Between 2190 and 2275 Hz is either Bell 103's answering mark, a pure
+     * tone at 2225, or V.22's unscrambled ones: 600 baud of the same phase
+     * step, which is most of its power at 2250 and a fourteenth of it 600 Hz
+     * higher. The second line is what tells them apart; the frequency
+     * agrees. */
+    a = own_between(l, 2005.0f, 2275.0f) ? 0.0f : tone_peak(x, n, 2190.0f, 2275.0f, &at);
+    if (a >= DM_LISTEN_SHARE * whole)
+    {
+        float side = goertzel(x, n, at + 600.0f);
+
+        if (at >= 2235.0f && at <= 2265.0f && side >= 0.02f * a)
+            return HEARD_USB1;
+        if (at <= 2245.0f && side < 0.01f * a)
+            return HEARD_BELL_ANS;
+        return HEARD_NONE;
+    }
+    /* Bell 103 carrying data, its power spread around 2025 and 2225 Hz. */
+    if (!own_between(l, 2005.0f, 2275.0f) && band_power(l, 1925.0f, 2325.0f) >= DM_LISTEN_SHARE * whole &&
+        goertzel(x, n, 2850.0f) < 0.01f * whole &&
+        tone_peak(x, n, 2005.0f, 2045.0f, &at) + a >= 0.2f * whole)
+        return HEARD_BELL_ANS;
+
+    /* V.21 channel 2 idling at mark, or carrying data: then the power is
+     * spread around both its tones rather than at them. */
+    if (!own_between(l, 1630.0f, 1670.0f) && !own_between(l, 1830.0f, 1870.0f) &&
+        band_power(l, 1550.0f, 1950.0f) >= DM_LISTEN_SHARE * whole &&
+        (own_between(l, 1800.0f, 1800.0f) || goertzel(x, n, 1800.0f) < 0.4f * whole) &&
+        tone_peak(x, n, 1630.0f, 1670.0f, &at) + tone_peak(x, n, 1830.0f, 1870.0f, &at) >= 0.2f * whole)
+        return HEARD_V21_ANS;
+
+    /* The two calling bands overlap - V.21's 980 and 1180 Hz, Bell 103's
+     * 1070 and 1270 - so the band says FSK and the tones say whose. Idling
+     * at mark that is plain at once; carrying data, the power smears between
+     * them, and listen_feed() decides over several blocks. */
+    if (!own_between(l, 960.0f, 1290.0f) && band_power(l, 880.0f, 1370.0f) >= DM_LISTEN_SHARE * whole)
+    {
+        l->v21_tones = (tone_peak(x, n, 960.0f, 1000.0f, &at) + tone_peak(x, n, 1160.0f, 1200.0f, &at)) / whole;
+        l->bell_tones = (tone_peak(x, n, 1050.0f, 1090.0f, &at) + tone_peak(x, n, 1250.0f, 1290.0f, &at)) / whole;
+        return HEARD_LOW_FSK;
+    }
+    return HEARD_NONE;
+}
+
+static const char *heard_name(heard_t h)
+{
+    switch (h)
+    {
+    case HEARD_AC:
+        return "V.32's AC";
+    case HEARD_AA:
+        return "V.32's AA";
+    case HEARD_USB1:
+        return "V.22's unscrambled ones";
+    case HEARD_V21_ANS:
+        return "V.21's answering carrier";
+    case HEARD_BELL_ANS:
+        return "Bell 103's answering carrier";
+    case HEARD_V21_ORIG:
+        return "V.21's calling carrier";
+    case HEARD_BELL_ORIG:
+        return "Bell 103's calling carrier";
+    default:
+        return "nothing";
+    }
+}
+
+/* Where to start. Stepping down, a --bit-rate below anything the
+ * modulation can do starts at the fastest one that can: --bit-rate 1200 is
+ * V.22 bis, not an error about V.34. */
+static dm_mod_t start_mod(dm_mod_t mod, int cap, bool step_down)
+{
+    static const int slowest[] = { 2400, 4800, 4800, 1200, 1200, 300, 300 };
+    int r = rung(mod);
+
+    while (step_down && cap > 0 && r >= 0 && r + 1 < (int) (sizeof(LADDER) / sizeof(LADDER[0])) &&
+           cap < slowest[r])
+        r++;
+    return r >= 0 ? LADDER[r] : mod;
+}
+
 bool dm_modem_params_check(const dm_modem_params_t *p, char *err, size_t err_len)
 {
     dm_mod_t mod;
@@ -552,6 +951,7 @@ bool dm_modem_params_check(const dm_modem_params_t *p, char *err, size_t err_len
                  p->modulation ? p->modulation : "");
         return false;
     }
+    mod = start_mod(mod, p->bit_rate, p->step_down);
     if (!parse_parity(p->parity, &tmp))
     {
         snprintf(err, err_len, "parity must be none, even or odd");
@@ -669,6 +1069,7 @@ void dm_modem_params_from_config(const dm_config_t *cfg, bool calling, const cha
     out->v42bis_dict = cfg->v42bis_dict;
     out->v42bis_max_string = cfg->v42bis_max_string;
     out->calling_tone = cfg->calling_tone;
+    out->step_down = cfg->step_down;
     out->tag = tag;
 }
 
@@ -1346,10 +1747,21 @@ static int tx_get_bit(void *user)
 {
     dm_modem_t *m = user;
 
+    /* An FSK transmitter asks for bits from the moment it starts, but until
+     * the far end's carrier has been heard there is nobody to send them to:
+     * hold the line at mark, as a modem not yet connected does. Anything
+     * else - V.42's ODP especially - is mistaken for something else by a
+     * far end still working out what we are. */
+    if (is_fsk(m->mod) && !m->connected)
+        return 1;
     if (m->v42 != NULL && !m->v42_fell_back)
         return v42_tx_bit(m->v42);
     return async_framer_get_bit(m);
 }
+
+static void settle(dm_modem_t *m, const char *why);
+static void fsk_maybe_connect(dm_modem_t *m);
+static bool fsk_needs_tone(dm_mod_t mod);
 
 static void note_connected(dm_modem_t *m)
 {
@@ -1358,6 +1770,7 @@ static void note_connected(dm_modem_t *m)
     if (m->carrier_lost)
         return; /* already given up on; a new call is the only way back */
 
+    settle(m, "trained");
     m->connected = true;
     m->carrier_down_ms = 0;
     m->phase = DM_PHASE_DATA;
@@ -1453,9 +1866,16 @@ static void rx_status(void *user, int status)
     {
     case SIG_STATUS_CARRIER_UP:
         DM_DEBUG("modem", "carrier detected (tag=%s)", m->tag);
-        /* FSK has no training phase to succeed: the carrier is the connection. */
+        /* FSK has no training phase to succeed: the carrier is the
+         * connection - once it is known to be the far end's. */
         if (is_fsk(m->mod))
-            note_connected(m);
+        {
+            m->fsk_carrier = true;
+            if (fsk_needs_tone(m->mod))
+                fsk_maybe_connect(m);
+            else
+                note_connected(m);
+        }
         break;
 
     case SIG_STATUS_TRAINING_SUCCEEDED:
@@ -1485,6 +1905,7 @@ static void rx_status(void *user, int status)
         break;
 
     case SIG_STATUS_CARRIER_DOWN:
+        m->fsk_carrier = false;
         /* Not the end of the call yet. Stop treating what arrives as data,
          * start the clock, and let dm_modem_tx() decide if it stays away.
          * See DM_CARRIER_GRACE_MS. */
@@ -1639,8 +2060,10 @@ static void v34_event(void *user, dm_v34_event_t ev)
         DM_INFO("modem", "rate changed to %d bps in, %d out (tag=%s)", m->bit_rate, m->tx_bit_rate, m->tag);
         break;
     case DM_V34_NO_V8:
+        /* Dealt with at the next frame - see after_v8() - since it frees
+         * the pump whose callback this is. */
         if (!m->carrier_lost)
-            m->v32_fallback_due = true;
+            m->no_v8 = true;
         break;
     case DM_V34_CLEARDOWN:
     case DM_V34_NOT_V34:
@@ -1872,10 +2295,15 @@ static void start_pump(dm_modem_t *m, const char *why)
         return;
     m->pump_started = true;
     if (m->v32 != NULL)
+    {
         dm_v32_start(m->v32);
+        if (m->calling)
+            m->aa_from = m->samples;
+    }
     m->phase = DM_PHASE_TRAINING;
-    dm_log_event(DM_LOG_INFO, "modem", "training", "tag=%s modulation=%s role=%s offered_rate=%d why=%s",
+    dm_log_event(DM_LOG_INFO, "modem", "training", "tag=%s modulation=%s role=%s offered_rate=%d why=\"%s\"",
                  m->tag, m->mod_name, m->calling ? "originate" : "answer", m->offered_rate, why);
+    fsk_maybe_connect(m);
 }
 
 /* The V.32 or V.32 bis pump, for m->mod. listen_first has it running, silent,
@@ -1940,53 +2368,291 @@ static bool create_v32_pump(dm_modem_t *m, bool listen_first)
     return m->v32 != NULL;
 }
 
-/* What a V.34 modem does when the far end turns out not to do V.8: carry on
- * as V.32 bis, which every V.34 modem also is. Neither end has trained yet,
- * so nothing is lost but time.
- *
- * The caller has heard a plain answer tone - V.25's ANS, not V.8's ANSam -
- * which the far end will go on sending for up to four seconds before AC; a
- * V.32 bis caller is entitled to start AA once it has heard a second of it
- * (5.4.1), so it waits that long again and listens for AC throughout. The
- * answerer has sent ANSam and heard no CM in answer, which is what a V.32
- * caller would do: it heard an answer tone, and is sending AA and waiting for
- * AC, which is what V.32 bis answering sends first.
- *
- * Called from dm_modem_tx with the lock held, never from inside the V.34
- * pump's own callbacks, since it frees it. */
-static void fall_back_to_v32bis(dm_modem_t *m)
+/* The data pump for m->mod. listen_first is for a calling V.32 pump: see
+ * create_v32_pump(). */
+static bool create_pump(dm_modem_t *m, bool listen_first)
 {
-    static const int rates[] = { 14400, 12000, 9600, 7200, 4800 };
-    int rate = 4800;
-
-    m->v32_fallback_due = false;
-    for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++)
+    if (is_fsk(m->mod))
     {
-        if (rates[i] <= m->offered_rate)
+        m->fsk_tx = fsk_tx_init(NULL, fsk_spec_for(m->mod, m->calling, true), tx_get_bit, m);
+        m->fsk_rx = fsk_rx_init(NULL, fsk_spec_for(m->mod, m->calling, false), FSK_FRAME_MODE_ASYNC,
+                                rx_put_bit, m);
+        if (m->fsk_tx == NULL || m->fsk_rx == NULL)
         {
-            rate = rates[i];
-            break;
+            DM_ERROR("modem", "could not start the %s data pump", m->mod_name);
+            return false;
+        }
+        fsk_tx_power(m->fsk_tx, m->tx_power);
+        fsk_rx_set_modem_status_handler(m->fsk_rx, rx_status, m);
+    }
+    else if (is_v32(m->mod))
+    {
+        if (!create_v32_pump(m, listen_first))
+        {
+            DM_ERROR("modem", "could not start the %s data pump", m->mod_name);
+            return false;
         }
     }
+    else if (m->mod == DM_MOD_V34)
+    {
+        dm_v34_params_t vp;
+
+        memset(&vp, 0, sizeof(vp));
+        vp.calling = m->calling;
+        vp.max_rate = m->offered_rate;
+        vp.tx_power = m->tx_power;
+        vp.lapm = m->v42_mode != DM_V42_OFF;
+        /* Test hook, not an option: a mask of the symbol rates to allow,
+         * bit 0 2400 ... bit 5 3429, so that each can be exercised. */
+        if (getenv("DATAMODEM_V34_SYMBOL_RATES") != NULL)
+        {
+            vp.symbol_rates = (unsigned) strtoul(getenv("DATAMODEM_V34_SYMBOL_RATES"), NULL, 0);
+            DM_WARN("modem", "DATAMODEM_V34_SYMBOL_RATES=0x%x: only those symbol rates. This is a test hook.",
+                    vp.symbol_rates);
+        }
+        /* Test hooks: "high" or "low", and 0 to 10 - what this end asks the
+         * far end to transmit with, whatever probing says. */
+        vp.pre_emphasis = -1;
+        if (getenv("DATAMODEM_V34_CARRIER") != NULL)
+        {
+            vp.carrier = strcmp(getenv("DATAMODEM_V34_CARRIER"), "high") == 0 ? 2 : 1;
+            DM_WARN("modem", "DATAMODEM_V34_CARRIER: asking for the %s carrier. This is a test hook.",
+                    vp.carrier == 2 ? "high" : "low");
+        }
+        /* Test hooks: the trellis code and shaping our receiver asks the far
+         * end's transmitter for. */
+        if (getenv("DATAMODEM_V34_TRELLIS") != NULL)
+        {
+            vp.trellis = atoi(getenv("DATAMODEM_V34_TRELLIS"));
+            DM_WARN("modem", "DATAMODEM_V34_TRELLIS: asking for the %d-state code. This is a test hook.",
+                    vp.trellis);
+        }
+        if (getenv("DATAMODEM_V34_SHAPING") != NULL)
+        {
+            vp.shaping = true;
+            DM_WARN("modem", "DATAMODEM_V34_SHAPING: asking for expanded shaping. This is a test hook.");
+        }
+        if (getenv("DATAMODEM_V34_PRE_EMPHASIS") != NULL)
+        {
+            vp.pre_emphasis = atoi(getenv("DATAMODEM_V34_PRE_EMPHASIS"));
+            DM_WARN("modem", "DATAMODEM_V34_PRE_EMPHASIS: asking for filter %d. This is a test hook.",
+                    vp.pre_emphasis);
+        }
+        vp.tag = m->tag;
+        vp.get_bit = tx_get_bit;
+        vp.put_bit = rx_put_bit;
+        vp.event = v34_event;
+        {
+            const char *rn = getenv("DATAMODEM_V34_RENEGOTIATE");
+            double secs = 0.0;
+            int rate = 0;
+            char role[16] = "";
+
+            if (rn != NULL && sscanf(rn, "%lf:%d:%15s", &secs, &rate, role) >= 2 && secs > 0.0 &&
+                (strcmp(role, "answer") == 0) == !m->calling)
+            {
+                m->reneg_after_ms = (int) (secs * 1000.0);
+                m->reneg_rate = rate;
+                DM_WARN("modem", "DATAMODEM_V34_RENEGOTIATE: this end will ask for at most %d bps inbound %.1f "
+                                 "seconds into the call. This is a test hook.", rate, secs);
+            }
+        }
+        vp.user = m;
+        m->v34 = dm_v34_create(&vp);
+        if (m->v34 == NULL)
+        {
+            DM_ERROR("modem", "could not start the %s data pump", m->mod_name);
+            return false;
+        }
+    }
+    else
+    {
+        m->v22 = v22bis_init(NULL, m->offered_rate, m->guard, m->calling ? TRUE : FALSE, tx_get_bit, m,
+                             rx_put_bit, m);
+        if (m->v22 == NULL)
+        {
+            DM_ERROR("modem", "could not start the %s data pump", m->mod_name);
+            return false;
+        }
+        v22bis_tx_power(m->v22, m->tx_power);
+        v22bis_set_modem_status_handler(m->v22, rx_status, m);
+        attach_logging(v22bis_get_logging_state(m->v22), m->tag);
+
+#if !defined(DATAMODEM_VENDORED_V22BIS)
+        /* Built against the system libspandsp. Many packaged builds of it -
+         * including the one Homebrew ships - complete V.22bis training,
+         * report a connection, and then deliver a constant 0x55 forever,
+         * because the receive equaliser has already diverged. Say so rather
+         * than let it look like a bad line. See third_party/spandsp-v22bis.
+         * `datamodem selftest --modulation v22bis` settles it either way. */
+        DM_WARN("modem", "this build uses the system libspandsp for V.22bis; if it is one of "
+                         "the many that train and then carry nothing, expect a constant 0x55. "
+                         "Run 'datamodem selftest --modulation v22bis' to check.");
+#endif
+    }
+    return true;
+}
+
+static void free_pump(dm_modem_t *m)
+{
+    dm_v32_free(m->v32);
+    m->v32 = NULL;
     dm_v34_free(m->v34);
     m->v34 = NULL;
-    m->mod = DM_MOD_V32BIS;
-    m->mod_name = modulation_name(m->mod);
-    m->offered_rate = rate;
-    m->carrier_grace_ms = DM_CARRIER_GRACE_V32_MS;
-    if (!create_v32_pump(m, m->calling))
+    if (m->v22 != NULL)
+    {
+        v22bis_release(m->v22);
+        v22bis_free(m->v22);
+        m->v22 = NULL;
+    }
+    if (m->fsk_tx != NULL)
+    {
+        fsk_tx_release(m->fsk_tx);
+        fsk_tx_free(m->fsk_tx);
+        m->fsk_tx = NULL;
+    }
+    if (m->fsk_rx != NULL)
+    {
+        fsk_rx_release(m->fsk_rx);
+        fsk_rx_free(m->fsk_rx);
+        m->fsk_rx = NULL;
+    }
+}
+
+/* Everything that follows from the modulation: its rates, how long a retrain
+ * may take, and how much the transmit queue may hold. */
+static void set_modulation(dm_modem_t *m, dm_mod_t mod)
+{
+    size_t limit;
+
+    m->mod = mod;
+    m->mod_name = modulation_name(mod);
+    m->offered_rate = rate_for(mod, m->rate_cap);
+    m->carrier_grace_ms = is_v32(mod)             ? DM_CARRIER_GRACE_V32_MS
+                          : (mod == DM_MOD_V34) ? DM_CARRIER_GRACE_V34_MS
+                                                : DM_CARRIER_GRACE_MS;
+    m->tx_bit_rate = m->offered_rate;
+    if (is_fsk(mod))
+    {
+        m->offered_rate = fsk_rate_for(mod, m->calling, false);
+        /* V.23 is not symmetric: the calling end receives at 1200 and
+         * transmits at 75, so how long our own data takes to get out is a
+         * different number from the one we report as the connection rate. */
+        m->tx_bit_rate = fsk_rate_for(mod, m->calling, true);
+    }
+    m->bit_rate = m->offered_rate;
+    /* Ten bits carries one 8N1 character, near enough for sizing. */
+    limit = (size_t) m->offered_rate / 10 * DM_TX_SECONDS;
+    if (limit < DM_TX_QUEUE_MIN)
+        limit = DM_TX_QUEUE_MIN;
+    __atomic_store_n(&m->tx_limit, limit, __ATOMIC_RELAXED);
+}
+
+/* What we are sending while we listen, whose echo is not the far end. */
+static void listen_own(dm_modem_t *m)
+{
+    dm_listen_t *l = &m->listen;
+
+    if (m->calling)
+    {
+        if (is_v32(m->mod))
+            listen_set_own(l, 1800.0f, 0.0f);
+        else if (m->mod == DM_MOD_V21)
+            listen_set_own(l, 980.0f, 1180.0f);
+        else if (m->mod == DM_MOD_BELL103)
+            listen_set_own(l, 1270.0f, 1070.0f);
+        else
+            listen_set_own(l, 0.0f, 0.0f);
+    }
+    else if (m->phase == DM_PHASE_ANSWER_TONE || m->mod == DM_MOD_V34)
+        listen_set_own(l, 2100.0f, 0.0f);
+    else if (is_v22(m->mod))
+        listen_set_own(l, 2250.0f, 2850.0f);
+    else if (is_v32(m->mod))
+        listen_set_own(l, 600.0f, 3000.0f);
+    else if (m->mod == DM_MOD_V21)
+        listen_set_own(l, 1650.0f, 1850.0f);
+    else if (m->mod == DM_MOD_BELL103)
+        listen_set_own(l, 2225.0f, 2025.0f);
+    else
+        listen_set_own(l, 0.0f, 0.0f);
+}
+
+static bool listening(const dm_modem_t *m)
+{
+    return m->hunting || (fsk_needs_tone(m->mod) && !m->fsk_confirmed);
+}
+
+/* The far end has answered in our terms; whatever happens now is this
+ * modulation's handshake, and offering it anything else would only break
+ * it. */
+static void settle(dm_modem_t *m, const char *why)
+{
+    if (!m->hunting)
+        return;
+    m->hunting = false;
+    DM_INFO("modem", "settled on %s: %s (tag=%s)", m->switch_due ? modulation_name(m->switch_to) : m->mod_name,
+            why, m->tag);
+}
+
+/* Changes pump at the start of the next frame, in dm_modem_tx: not from
+ * inside a pump's callbacks, which is where most of the reasons arise, and
+ * not between a pump's transmit and receive halves of a frame. */
+static void request_step(dm_modem_t *m, int mod, const char *why)
+{
+    if (mod < 0 || m->switch_due || m->carrier_lost || mod == (int) m->mod)
+        return;
+    m->switch_due = true;
+    m->switch_to = (dm_mod_t) mod;
+    m->switch_confirmed = false;
+    snprintf(m->switch_why, sizeof(m->switch_why), "%s", why);
+}
+
+/* How long an answering modem offers one modulation before the next. */
+static long window_samples(const dm_modem_t *m, dm_mod_t mod)
+{
+    int ms = DM_WINDOW_MS;
+
+    /* AC has to reach the caller and its AA come back. */
+    if (is_v32(mod))
+        ms += m->path_delay_ms;
+    return (long) ms * DM_SAMPLE_RATE / 1000;
+}
+
+static void step_now(dm_modem_t *m)
+{
+    dm_mod_t to = m->switch_to;
+    const char *was = m->mod_name;
+
+    m->switch_due = false;
+    free_pump(m);
+    set_modulation(m, to);
+    m->pump_started = false;
+    m->fsk_carrier = false;
+    m->fsk_confirmed = m->switch_confirmed;
+    m->fsk_mark_from = -1;
+    m->aa_from = -1;
+    listen_reset(&m->listen);
+    if (!create_pump(m, m->calling && is_v32(to)))
     {
         m->carrier_lost = true;
         m->phase = DM_PHASE_DOWN;
-        DM_ERROR("modem", "could not start the V.32 bis data pump to fall back to (tag=%s)", m->tag);
+        DM_ERROR("modem", "could not start the %s data pump (tag=%s)", m->mod_name, m->tag);
         return;
     }
-    DM_INFO("modem", "falling back to V.32 bis at up to %d bps (tag=%s)", rate, m->tag);
-    v42_set_bit_rate(m, rate);
-    m->pump_started = false;
-    m->phase = DM_PHASE_ANSWER_TONE;
-    if (m->calling)
+    dm_log_event(DM_LOG_INFO, "modem", "modulation", "tag=%s from=%s to=%s rate=%d why=\"%s\"", m->tag, was,
+                 m->mod_name, m->offered_rate, m->switch_why);
+    v42_set_bit_rate(m, m->tx_bit_rate);
+    if (!m->calling)
     {
+        m->window = cycle_index(to);
+        m->window_left = window_samples(m, to);
+    }
+    if (m->calling && is_v32(to))
+    {
+        /* V.32 bis Annex A's calling modem: AA once it has heard a second of
+         * answer tone, and on with the handshake whenever AC comes. */
+        m->phase = DM_PHASE_ANSWER_TONE;
         m->answer_tone_seen = true;
         m->wait_samples = 0;
         m->ans_tail_running = true;
@@ -1995,6 +2661,299 @@ static void fall_back_to_v32bis(dm_modem_t *m)
     else
     {
         m->answer_tone_samples = 0;
+        start_pump(m, m->switch_why);
+    }
+}
+
+/* Answering: withdraw what is on offer and offer the next thing. */
+static void next_offer(dm_modem_t *m, const char *why)
+{
+    for (int k = 1; k <= DM_ANSWER_CYCLE_LEN; k++)
+    {
+        int i = (m->window + k + DM_ANSWER_CYCLE_LEN) % DM_ANSWER_CYCLE_LEN;
+        int mod = cycle_mod(m, i);
+
+        if (mod < 0)
+            continue;
+        if (mod == (int) m->mod)
+        {
+            m->window = i;
+            m->window_left = window_samples(m, m->mod);
+        }
+        else
+        {
+            request_step(m, mod, why);
+        }
+        return;
+    }
+}
+
+/* V.34 found the far end has no V.8: it answered with a plain answer tone,
+ * or did not answer our ANSam with CM. It is an older modem, and V.32 bis is
+ * the place to start. An answering V.32 caller will have been sending AA at
+ * our ANSam, taking it for ANS; anything older waits to hear its own
+ * answering signal, which is Annex A's V.22 bis first. */
+static void after_v8(dm_modem_t *m)
+{
+    int v32 = pick_v32(m);
+
+    if (!m->step_down || v32 < 0)
+    {
+        m->carrier_lost = true;
+        m->phase = DM_PHASE_DOWN;
+        DM_ERROR("modem", "the far end does not do V.8, so it is no V.34 modem, and --no-step-down "
+                          "rules out anything slower (tag=%s)",
+                 m->tag);
+        return;
+    }
+    if (m->calling)
+        request_step(m, v32, "a plain answer tone, without V.8");
+    else if (m->aa_heard)
+        request_step(m, v32, "no CM in answer to ANSam, but AA: a V.32 caller");
+    else
+        next_offer(m, "no CM in answer to ANSam");
+}
+
+/* The answering modem's answer tone is over. Annex A: a caller that sent AA
+ * during it is V.32; one that did not may be V.22 bis, and gets unscrambled
+ * ones first. */
+static void answer_tone_done(dm_modem_t *m)
+{
+    if (m->switch_due)
+        return;
+    if (m->hunting && is_v32(m->mod) && !m->aa_heard && pick_v22(m) >= 0)
+    {
+        request_step(m, pick_v22(m), "no AA during the answer tone");
+        return;
+    }
+    start_pump(m, "answer tone sent");
+}
+
+static const char *hunt_engaged(const dm_modem_t *m)
+{
+    if (m->v34 != NULL && dm_v34_engaged(m->v34))
+        return m->calling ? "ANSam heard" : "CM heard";
+    if (m->v32 != NULL && dm_v32_engaged(m->v32))
+        return m->calling ? "AC heard" : "AA heard";
+    /* The V.22 bis receiver has heard S1, or 270 ms of what really are
+     * scrambled ones - not just something in its band, which a V.32
+     * caller's AA or a 300 bps caller's carrier also is. */
+    if (m->v22 != NULL && !m->calling &&
+        (m->v22->negotiated_bit_rate == 2400 ||
+         m->v22->rx.training == V22BIS_RX_TRAINING_STAGE_SCRAMBLED_ONES_AT_1200_SUSTAINING ||
+         m->v22->rx.training == V22BIS_RX_TRAINING_STAGE_WAIT_FOR_SCRAMBLED_ONES_AT_2400 ||
+         m->v22->rx.training == V22BIS_RX_TRAINING_STAGE_NORMAL_OPERATION))
+        return "S1 or SB1 heard";
+    if (m->fsk_rx != NULL && m->fsk_confirmed)
+        return "its carrier heard";
+    return NULL;
+}
+
+/* Once a frame, from dm_modem_tx with the lock held. */
+static void hunt_tick(dm_modem_t *m, int samples)
+{
+    const char *why;
+
+    if (m->no_v8)
+    {
+        m->no_v8 = false;
+        after_v8(m);
+    }
+    if (m->switch_due)
+        step_now(m);
+    if (!m->hunting)
+        return;
+    if ((why = hunt_engaged(m)) != NULL)
+    {
+        settle(m, why);
+        return;
+    }
+    /* A calling modem only listens - it is the answering one that offers. */
+    if (m->calling || m->window < 0 || m->phase == DM_PHASE_ANSWER_TONE)
+        return;
+    m->window_left -= samples;
+    if (m->window_left > 0)
+        return;
+    /* Something in the low band is being looked at as SB1 right now; let it
+     * be decided, but not for long, since a 300 bps caller's carrier looks
+     * like that for ever. */
+    if (m->v22 != NULL && m->v22->rx.training == V22BIS_RX_TRAINING_STAGE_SCRAMBLED_ONES_AT_1200 &&
+        m->window_left > -DM_SAMPLE_RATE / 2)
+        return;
+    {
+        char what[64];
+
+        snprintf(what, sizeof(what), "nobody answered %s", m->mod_name);
+        next_offer(m, what);
+    }
+}
+
+/* A calling FSK modem holds its carrier at mark this long before it passes
+ * data, so that the answering one - which only connects once it has heard
+ * that carrier - is listening by the time the first character arrives. */
+#define DM_FSK_MARK_MS 500
+
+/* An FSK link is connected once the far end's carrier is up, its tone has
+ * been heard as well, and our own pump is running - and, calling, our own
+ * carrier has had time to be heard. */
+static void fsk_maybe_connect(dm_modem_t *m)
+{
+    if (!fsk_needs_tone(m->mod) || !m->fsk_confirmed || !m->fsk_carrier || !m->pump_started || m->connected)
+        return;
+    if (m->calling &&
+        (m->fsk_mark_from < 0 ||
+         m->samples - m->fsk_mark_from < (long long) (DM_FSK_MARK_MS + m->path_delay_ms / 2) * DM_SAMPLE_RATE / 1000))
+        return;
+    note_connected(m);
+}
+
+static void fsk_heard(dm_modem_t *m, dm_mod_t mod, heard_t h)
+{
+    if (m->mod == mod)
+    {
+        if (!m->fsk_confirmed)
+        {
+            m->fsk_confirmed = true;
+            DM_DEBUG("modem", "%s heard (tag=%s)", heard_name(h), m->tag);
+        }
+        settle(m, heard_name(h));
+        /* A calling modem sitting out the rest of an answer tone that has
+         * already finished. */
+        if (m->calling && m->phase == DM_PHASE_ANSWER_TONE)
+            start_pump(m, heard_name(h));
+        fsk_maybe_connect(m);
+        return;
+    }
+    if (!m->hunting || !may_run(m, mod))
+        return;
+    request_step(m, (int) mod, heard_name(h));
+    m->switch_confirmed = true;
+    settle(m, heard_name(h));
+}
+
+/* A signal has been heard for `run` blocks running. From dm_modem_rx, with
+ * the lock held, after the pump has had the audio. */
+static void hunt_heard(dm_modem_t *m, heard_t h, int run)
+{
+    /* Each needs 160 ms of itself: Annex A's 155 ms for USB1, and long
+     * enough for the others that a passing coincidence does not count. */
+    if (run < 4)
+        return;
+    switch (h)
+    {
+    case HEARD_AC:
+        if (m->calling && m->hunting && m->v32 == NULL)
+            request_step(m, pick_v32(m), "AC heard");
+        break;
+    case HEARD_USB1:
+        if (!m->calling || !m->hunting)
+            break;
+        if (m->v22 != NULL)
+        {
+            settle(m, heard_name(h));
+            if (m->phase == DM_PHASE_ANSWER_TONE)
+                start_pump(m, heard_name(h));
+            break;
+        }
+        /* Annex A A.2.1.3: a V.32 caller that has been sending AA long enough
+         * for the far end to have heard it takes unscrambled ones as the
+         * answer - that far end is no V.32 modem. Otherwise A.2.1.2: they may
+         * be an automode answerer's first offer, with AC to follow, so wait
+         * Tc > 3.1 s to be sure. */
+        if (run < ((m->aa_from >= 0 && m->samples - m->aa_from >= DM_SAMPLE_RATE * 3 / 2) ? 4 : 78))
+            break;
+        if (pick_v22(m) >= 0)
+        {
+            request_step(m, pick_v22(m), heard_name(h));
+            settle(m, heard_name(h));
+        }
+        break;
+    case HEARD_V21_ANS:
+        if (m->calling)
+            fsk_heard(m, DM_MOD_V21, h);
+        break;
+    case HEARD_BELL_ANS:
+        if (m->calling)
+            fsk_heard(m, DM_MOD_BELL103, h);
+        break;
+    case HEARD_AA:
+        if (m->calling)
+            break;
+        if (!m->aa_heard)
+        {
+            m->aa_heard = true;
+            DM_DEBUG("modem", "AA heard: the caller is a V.32 modem (tag=%s)", m->tag);
+        }
+        /* V.8 and the answer tone are seen out first; V.32's pump hears it
+         * for itself. */
+        if (m->hunting && m->v32 == NULL && m->v34 == NULL && m->phase != DM_PHASE_ANSWER_TONE)
+            request_step(m, pick_v32(m), heard_name(h));
+        break;
+    case HEARD_V21_ORIG:
+        /* V.8's CM is V.21 channel 1 too. A V.21 caller says nothing until
+         * it hears our channel 2, so while V.8 is still listening this is
+         * a V.8 caller. */
+        if (!m->calling && m->v34 == NULL)
+            fsk_heard(m, DM_MOD_V21, h);
+        break;
+    case HEARD_BELL_ORIG:
+        if (!m->calling)
+            fsk_heard(m, DM_MOD_BELL103, h);
+        break;
+    default:
+        break;
+    }
+}
+
+static void listen_feed(dm_modem_t *m, const int16_t *x, int count)
+{
+    dm_listen_t *l = &m->listen;
+
+    while (count > 0 && listening(m))
+    {
+        int take = DM_LISTEN_BLOCK - l->n;
+        heard_t h;
+
+        if (take > count)
+            take = count;
+        memcpy(l->buf + l->n, x, (size_t) take * sizeof(int16_t));
+        l->n += take;
+        x += take;
+        count -= take;
+        if (l->n < DM_LISTEN_BLOCK)
+            break;
+        l->n = 0;
+        listen_own(m);
+        h = listen_block(l);
+        if (h == HEARD_LOW_FSK)
+        {
+            /* FSK keeps a third or more of its power at its own two tones
+             * even carrying data; V.22's low channel, also in this band,
+             * spreads its evenly over 600 Hz. */
+            float floor = 0.3f * (float) ++l->fsk_blocks;
+
+            l->v21_sum += l->v21_tones;
+            l->bell_sum += l->bell_tones;
+            if (l->v21_sum >= 1.5f * l->bell_sum && l->v21_sum >= floor)
+                h = HEARD_V21_ORIG;
+            else if (l->bell_sum >= 1.5f * l->v21_sum && l->bell_sum >= floor)
+                h = HEARD_BELL_ORIG;
+            else
+                h = HEARD_NONE;
+        }
+        else
+        {
+            l->v21_sum = l->bell_sum = 0.0f;
+            l->fsk_blocks = 0;
+        }
+        for (int k = 1; k < HEARD_COUNT; k++)
+            l->run[k] = (k == (int) h) ? l->run[k] + 1 : 0;
+        if (h != HEARD_NONE)
+        {
+            if (l->run[h] == 1)
+                DM_TRACE("modem", "hearing %s (tag=%s)", heard_name(h), m->tag);
+            hunt_heard(m, h, l->run[h]);
+        }
     }
 }
 
@@ -2015,6 +2974,7 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
 
     pthread_mutex_init(&m->lock, NULL);
     parse_modulation(params->modulation, &m->mod);
+    m->mod = start_mod(m->mod, params->bit_rate, params->step_down);
     parse_parity(params->parity, &m->parity);
     parse_guard(params->guard_tone, &m->guard);
     m->mod_name = modulation_name(m->mod);
@@ -2024,21 +2984,15 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     m->v14 = params->v14;
     m->tx_power = (float) params->tx_power;
     m->path_delay_ms = params->path_delay_ms;
-    m->offered_rate = (m->mod == DM_MOD_V22 || params->bit_rate == 0) ? default_rate(m->mod)
-                                                                      : params->bit_rate;
-    m->carrier_grace_ms = is_v32(m->mod)             ? DM_CARRIER_GRACE_V32_MS
-                          : (m->mod == DM_MOD_V34) ? DM_CARRIER_GRACE_V34_MS
-                                                   : DM_CARRIER_GRACE_MS;
-    m->tx_bit_rate = m->offered_rate;
-    if (is_fsk(m->mod))
-    {
-        m->offered_rate = fsk_rate_for(m->mod, m->calling, false);
-        /* V.23 is not symmetric: the calling end receives at 1200 and
-         * transmits at 75, so how long our own data takes to get out is a
-         * different number from the one we report as the connection rate. */
-        m->tx_bit_rate = fsk_rate_for(m->mod, m->calling, true);
-    }
-    m->bit_rate = m->offered_rate;
+    m->ceiling = m->mod;
+    m->step_down = params->step_down;
+    m->rate_cap = params->bit_rate;
+    set_modulation(m, m->mod);
+    m->hunting = can_step_down(m);
+    m->aa_from = -1;
+    m->fsk_mark_from = -1;
+    m->window = (m->mod == DM_MOD_V34) ? -1 : cycle_index(m->mod);
+    m->window_left = window_samples(m, m->mod);
     m->phase = DM_PHASE_IDLE;
     m->last_rx_ms = dm_now_ms();
     snprintf(m->tag, sizeof(m->tag), "%s", params->tag ? params->tag : (params->calling ? "out" : "in"));
@@ -2051,17 +3005,12 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
         m->guard = V22BIS_GUARD_TONE_NONE;
     }
 
+    /* Sized for the fastest we will run; stepping down only lowers the limit
+     * on how much of it may be used. */
+    if (!dm_ring_init(&m->tx, m->tx_limit) || !dm_ring_init(&m->rx, DM_RX_QUEUE))
     {
-        /* Ten bits carries one 8N1 character, near enough for sizing. */
-        size_t tx_cap = (size_t) m->offered_rate / 10 * DM_TX_SECONDS;
-
-        if (tx_cap < DM_TX_QUEUE_MIN)
-            tx_cap = DM_TX_QUEUE_MIN;
-        if (!dm_ring_init(&m->tx, tx_cap) || !dm_ring_init(&m->rx, DM_RX_QUEUE))
-        {
-            dm_modem_destroy(m);
-            return NULL;
-        }
+        dm_modem_destroy(m);
+        return NULL;
     }
 
     m->arx = async_rx_init(NULL, m->data_bits, m->parity, m->stop_bits, m->v14 ? TRUE : FALSE,
@@ -2181,127 +3130,10 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
         }
     }
 
-    if (is_fsk(m->mod))
+    if (!create_pump(m, m->calling && params->answer_wait_s > 0))
     {
-        m->fsk_tx = fsk_tx_init(NULL, fsk_spec_for(m->mod, m->calling, true), tx_get_bit, m);
-        m->fsk_rx = fsk_rx_init(NULL, fsk_spec_for(m->mod, m->calling, false), FSK_FRAME_MODE_ASYNC,
-                                rx_put_bit, m);
-        if (m->fsk_tx == NULL || m->fsk_rx == NULL)
-        {
-            DM_ERROR("modem", "could not start the %s data pump", m->mod_name);
-            dm_modem_destroy(m);
-            return NULL;
-        }
-        fsk_tx_power(m->fsk_tx, m->tx_power);
-        fsk_rx_set_modem_status_handler(m->fsk_rx, rx_status, m);
-    }
-    else if (is_v32(m->mod))
-    {
-        if (!create_v32_pump(m, m->calling && params->answer_wait_s > 0))
-        {
-            DM_ERROR("modem", "could not start the %s data pump", m->mod_name);
-            dm_modem_destroy(m);
-            return NULL;
-        }
-    }
-    else if (m->mod == DM_MOD_V34)
-    {
-        dm_v34_params_t vp;
-
-        memset(&vp, 0, sizeof(vp));
-        vp.calling = m->calling;
-        vp.max_rate = m->offered_rate;
-        vp.tx_power = m->tx_power;
-        vp.lapm = m->v42_mode != DM_V42_OFF;
-        /* Test hook, not an option: a mask of the symbol rates to allow,
-         * bit 0 2400 ... bit 5 3429, so that each can be exercised. */
-        if (getenv("DATAMODEM_V34_SYMBOL_RATES") != NULL)
-        {
-            vp.symbol_rates = (unsigned) strtoul(getenv("DATAMODEM_V34_SYMBOL_RATES"), NULL, 0);
-            DM_WARN("modem", "DATAMODEM_V34_SYMBOL_RATES=0x%x: only those symbol rates. This is a test hook.",
-                    vp.symbol_rates);
-        }
-        /* Test hooks: "high" or "low", and 0 to 10 - what this end asks the
-         * far end to transmit with, whatever probing says. */
-        vp.pre_emphasis = -1;
-        if (getenv("DATAMODEM_V34_CARRIER") != NULL)
-        {
-            vp.carrier = strcmp(getenv("DATAMODEM_V34_CARRIER"), "high") == 0 ? 2 : 1;
-            DM_WARN("modem", "DATAMODEM_V34_CARRIER: asking for the %s carrier. This is a test hook.",
-                    vp.carrier == 2 ? "high" : "low");
-        }
-        /* Test hooks: the trellis code and shaping our receiver asks the far
-         * end's transmitter for. */
-        if (getenv("DATAMODEM_V34_TRELLIS") != NULL)
-        {
-            vp.trellis = atoi(getenv("DATAMODEM_V34_TRELLIS"));
-            DM_WARN("modem", "DATAMODEM_V34_TRELLIS: asking for the %d-state code. This is a test hook.",
-                    vp.trellis);
-        }
-        if (getenv("DATAMODEM_V34_SHAPING") != NULL)
-        {
-            vp.shaping = true;
-            DM_WARN("modem", "DATAMODEM_V34_SHAPING: asking for expanded shaping. This is a test hook.");
-        }
-        if (getenv("DATAMODEM_V34_PRE_EMPHASIS") != NULL)
-        {
-            vp.pre_emphasis = atoi(getenv("DATAMODEM_V34_PRE_EMPHASIS"));
-            DM_WARN("modem", "DATAMODEM_V34_PRE_EMPHASIS: asking for filter %d. This is a test hook.",
-                    vp.pre_emphasis);
-        }
-        vp.tag = m->tag;
-        vp.get_bit = tx_get_bit;
-        vp.put_bit = rx_put_bit;
-        vp.event = v34_event;
-        {
-            const char *rn = getenv("DATAMODEM_V34_RENEGOTIATE");
-            double secs = 0.0;
-            int rate = 0;
-            char role[16] = "";
-
-            if (rn != NULL && sscanf(rn, "%lf:%d:%15s", &secs, &rate, role) >= 2 && secs > 0.0 &&
-                (strcmp(role, "answer") == 0) == !m->calling)
-            {
-                m->reneg_after_ms = (int) (secs * 1000.0);
-                m->reneg_rate = rate;
-                DM_WARN("modem", "DATAMODEM_V34_RENEGOTIATE: this end will ask for at most %d bps inbound %.1f "
-                                 "seconds into the call. This is a test hook.", rate, secs);
-            }
-        }
-        vp.user = m;
-        m->v34 = dm_v34_create(&vp);
-        if (m->v34 == NULL)
-        {
-            DM_ERROR("modem", "could not start the %s data pump", m->mod_name);
-            dm_modem_destroy(m);
-            return NULL;
-        }
-    }
-    else
-    {
-        m->v22 = v22bis_init(NULL, m->offered_rate, m->guard, m->calling ? TRUE : FALSE, tx_get_bit, m,
-                             rx_put_bit, m);
-        if (m->v22 == NULL)
-        {
-            DM_ERROR("modem", "could not start the %s data pump", m->mod_name);
-            dm_modem_destroy(m);
-            return NULL;
-        }
-        v22bis_tx_power(m->v22, m->tx_power);
-        v22bis_set_modem_status_handler(m->v22, rx_status, m);
-        attach_logging(v22bis_get_logging_state(m->v22), m->tag);
-
-#if !defined(DATAMODEM_VENDORED_V22BIS)
-        /* Built against the system libspandsp. Many packaged builds of it -
-         * including the one Homebrew ships - complete V.22bis training,
-         * report a connection, and then deliver a constant 0x55 forever,
-         * because the receive equaliser has already diverged. Say so rather
-         * than let it look like a bad line. See third_party/spandsp-v22bis.
-         * `datamodem selftest --modulation v22bis` settles it either way. */
-        DM_WARN("modem", "this build uses the system libspandsp for V.22bis; if it is one of "
-                         "the many that train and then carry nothing, expect a constant 0x55. "
-                         "Run 'datamodem selftest --modulation v22bis' to check.");
-#endif
+        dm_modem_destroy(m);
+        return NULL;
     }
 
     /* Pre-carrier signalling. The answering end announces itself with a 2100
@@ -2376,9 +3208,10 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
         start_pump(m, "no answer-tone phase");
 
     dm_log_event(DM_LOG_INFO, "modem", "engine started",
-                 "tag=%s modulation=%s role=%s rate=%d format=%d%c%d guard=%s answer_tone_ms=%d "
+                 "tag=%s modulation=%s step_down=%s role=%s rate=%d format=%d%c%d guard=%s answer_tone_ms=%d "
                  "answer_wait_s=%d v42=%s v42bis=%s",
-                 m->tag, m->mod_name, m->calling ? "originate" : "answer", m->offered_rate, m->data_bits,
+                 m->tag, m->mod_name, m->hunting ? "on" : "off", m->calling ? "originate" : "answer",
+                 m->offered_rate, m->data_bits,
                  m->parity == ASYNC_PARITY_NONE ? 'N' : (m->parity == ASYNC_PARITY_EVEN ? 'E' : 'O'),
                  m->stop_bits, params->guard_tone ? params->guard_tone : "none", params->answer_tone_ms,
                  params->answer_wait_s,
@@ -2394,23 +3227,7 @@ void dm_modem_destroy(dm_modem_t *m)
         return;
 
     pthread_mutex_lock(&m->lock);
-    dm_v32_free(m->v32);
-    dm_v34_free(m->v34);
-    if (m->v22 != NULL)
-    {
-        v22bis_release(m->v22);
-        v22bis_free(m->v22);
-    }
-    if (m->fsk_tx != NULL)
-    {
-        fsk_tx_release(m->fsk_tx);
-        fsk_tx_free(m->fsk_tx);
-    }
-    if (m->fsk_rx != NULL)
-    {
-        fsk_rx_release(m->fsk_rx);
-        fsk_rx_free(m->fsk_rx);
-    }
+    free_pump(m);
     if (m->arx != NULL)
     {
         async_rx_release(m->arx);
@@ -2540,10 +3357,10 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
         pthread_mutex_unlock(&m->lock);
         return max_count;
     }
+    m->samples += max_count;
     if (m->drop_ceiling_to > 0)
         apply_rate_ceiling(m);
-    if (m->v32_fallback_due)
-        fall_back_to_v32bis(m);
+    hunt_tick(m, max_count);
     if (m->phase == DM_PHASE_ANSWER_TONE)
     {
         if (m->v32 != NULL && m->calling)
@@ -2582,7 +3399,7 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
         {
             m->answer_tone_samples -= max_count;
             if (m->answer_tone_samples <= 0)
-                start_pump(m, "answer tone sent");
+                answer_tone_done(m);
         }
         else
         {
@@ -2595,7 +3412,11 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
             if (m->ans_tail_running)
                 m->ans_tail_samples -= max_count;
 
-            if (m->wait_samples <= 0 && (!m->ans_tail_running || m->ans_tail_samples <= 0))
+            /* V.32 is the exception: AA cannot be fooled by the tone, and
+             * Annex A has it start once a second of ANS has been heard, so
+             * that an automode answerer hears it during its answer tone. */
+            if ((m->wait_samples <= 0 || (m->v32 != NULL && m->answer_tone_seen)) &&
+                (!m->ans_tail_running || m->ans_tail_samples <= 0))
             {
                 if (!m->answer_tone_seen)
                     DM_DEBUG("modem", "no answer tone heard; training anyway (tag=%s)", m->tag);
@@ -2634,8 +3455,15 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
         }
         else if (m->v22 != NULL)
             n = v22bis_tx(m->v22, samples, max_count);
+        else if (m->fsk_tx != NULL && m->calling && fsk_needs_tone(m->mod) && !m->fsk_confirmed)
+            ; /* a calling FSK modem is silent until it hears the answering carrier */
         else if (m->fsk_tx != NULL)
+        {
+            if (m->fsk_mark_from < 0)
+                m->fsk_mark_from = m->samples;
             n = fsk_tx(m->fsk_tx, samples, max_count);
+            fsk_maybe_connect(m);
+        }
     }
 
     /* RTP never stops, so silence has to be made explicit. */
@@ -2745,6 +3573,8 @@ void dm_modem_rx(dm_modem_t *m, const int16_t *samples, int count)
     {
         fsk_rx(m->fsk_rx, samples, count);
     }
+    if (listening(m))
+        listen_feed(m, samples, count);
     rx_flow_control(m);
     fire_wake_locked(m);
     pthread_mutex_unlock(&m->lock);
@@ -2779,7 +3609,9 @@ void dm_modem_rx_missing(dm_modem_t *m, int count)
 
 size_t dm_modem_send(dm_modem_t *m, const void *data, size_t len)
 {
-    return dm_ring_write(&m->tx, data, len);
+    size_t room = dm_modem_tx_space(m);
+
+    return dm_ring_write(&m->tx, data, len < room ? len : room);
 }
 
 size_t dm_modem_recv(dm_modem_t *m, void *out, size_t max)
@@ -2807,7 +3639,12 @@ bool dm_modem_drained(dm_modem_t *m)
 
 size_t dm_modem_tx_space(dm_modem_t *m)
 {
-    return dm_ring_space(&m->tx);
+    size_t limit = __atomic_load_n(&m->tx_limit, __ATOMIC_RELAXED);
+    size_t used = dm_ring_len(&m->tx);
+    size_t space = dm_ring_space(&m->tx);
+    size_t room = used >= limit ? 0 : limit - used;
+
+    return room < space ? room : space;
 }
 
 size_t dm_modem_rx_pending(dm_modem_t *m)
@@ -3309,6 +4146,42 @@ int dm_modem_selftest(const dm_config_t *cfg)
     }
     dm_modem_params_from_config(cfg, true, "selftest-call", &call_params);
     dm_modem_params_from_config(cfg, false, "selftest-answer", &ans_params);
+    /* DATAMODEM_SELFTEST_FAR, a test hook: "answer:v22bis" makes the
+     * answering end a modem that does V.22 bis and nothing else - an older
+     * one, that has never heard of stepping down - so that the other end's
+     * step down gets exercised; "call:bell103" the calling end. ":auto" on
+     * the end leaves it stepping down too, from there. */
+    {
+        const char *far = getenv("DATAMODEM_SELFTEST_FAR");
+        static char far_mod[16];
+        char role[16] = "";
+        char mode[16] = "";
+
+        if (far != NULL && *far != '\0')
+        {
+            dm_modem_params_t *fp;
+
+            if (sscanf(far, "%15[^:]:%15[^:]:%15s", role, far_mod, mode) < 2 ||
+                (strcmp(role, "answer") != 0 && strcmp(role, "call") != 0) ||
+                (mode[0] != '\0' && strcmp(mode, "auto") != 0))
+            {
+                DM_ERROR("selftest", "DATAMODEM_SELFTEST_FAR wants answer:<modulation> or "
+                                     "call:<modulation>, and :auto after it to let that end step down");
+                selftest_line_free(&line);
+                free(sent_out);
+                free(sent_in);
+                free(got_out);
+                free(got_in);
+                return DM_EXIT_CONFIG;
+            }
+            fp = strcmp(role, "answer") == 0 ? &ans_params : &call_params;
+            fp->modulation = far_mod;
+            fp->bit_rate = 0;
+            fp->step_down = mode[0] != '\0';
+            DM_INFO("selftest", "the %s end runs %s%s", role, far_mod,
+                    fp->step_down ? " and steps down from there" : " only");
+        }
+    }
 
     caller = dm_modem_create(&call_params);
     answerer = dm_modem_create(&ans_params);

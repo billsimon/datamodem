@@ -235,13 +235,13 @@ the call is cleared as soon as everything is sent.
 ## What it can actually do
 | `--modulation` | Standard | Rate | Calling end transmits | Answering end transmits |
 |---|---|---|---|---|
-| `v34` | ITU-T V.34 | 33600 down to 2400, in steps of 2400, each direction its own | 2400 to 3429 symbols/s, carrier chosen by probing | the same band |
+| `v34` (default) | ITU-T V.34 | 33600 down to 2400, in steps of 2400, each direction its own | 2400 to 3429 symbols/s, carrier chosen by probing | the same band |
 | `v32bis` | ITU-T V.32bis | 14400, 12000, 9600, 7200 or 4800 | 1800 Hz carrier | 1800 Hz carrier, the same band |
 | `v32` | ITU-T V.32 | 9600 or 4800 | 1800 Hz carrier | 1800 Hz carrier, the same band |
 | `v22bis` | ITU-T V.22bis | 2400 or 1200 | 1200 Hz carrier | 2400 Hz carrier |
 | `v22` | ITU-T V.22 | 1200 | 1200 Hz carrier | 2400 Hz carrier |
 | `v23` | ITU-T V.23 | 1200 down, 75 up | 390/450 Hz | 1300/2100 Hz |
-| `v21` (default) | ITU-T V.21 | 300 full duplex | 980/1180 Hz | 1650/1850 Hz |
+| `v21` | ITU-T V.21 | 300 full duplex | 980/1180 Hz | 1650/1850 Hz |
 | `bell103` | Bell 103 | 300 full duplex | 1270/1070 Hz | 2225/2025 Hz |
 
 All eight carry data, verified byte-for-byte in both directions by `selftest`
@@ -265,14 +265,73 @@ to ten, depending on the round trip - and QAM is far less tolerant of a poor
 audio path than FSK is. If a trunk is doing anything at all to the audio,
 the 300 bps modes will survive it and the QAM ones will not.
 
-The default is still `v21`, because 300 bps will get through an audio path
-that nothing else will, and thirty characters a second is a perfectly usable
-interactive terminal — it is how everyone did this in 1982. Reach for
-`--modulation v34`, `v32bis`, `v32` or `v22bis` when you want the speed and
-the line is good; V.34 drops to V.32bis for a far end that does not answer
-V.8, and V.32bis and V.32 need the far end to be a V.32 modem or anything
-later (all of which fall back to it - V.32bis itself drops to V.32 for a far
-end that is only V.32), V.22bis is what nearly everything speaks.
+The default is `v34`, stepping down to whatever the far end turns out to be
+— see below. What stepping down does not do is notice a bad line: it follows
+the far end's capabilities, and V.34 copes with a poor line by choosing a
+lower rate within V.34. A path so bad that nothing faster than 300 bps will
+cross it needs `--modulation v21` (or `bell103`) by hand, and thirty
+characters a second is a perfectly usable interactive terminal — it is how
+everyone did this in 1982.
+
+### Stepping down
+
+A modem with its factory settings connects to whatever answers — or calls —
+at the fastest modulation the two have in common, and so does datamodem:
+
+    v34 → v32bis → v32 → v22bis → v22 → v21 → bell103
+
+V.32bis already trains with a far end that is only V.32 (at 9600), and
+V.22bis with one that is only V.22 (at 1200), so `v32` and `v22` are only
+ever where a `--modulation` starts. `--modulation` sets the fastest to try,
+and stepping down carries on from there; `--no-step-down` runs that one
+modulation and nothing else. `v23` is on no ladder and never steps down.
+`--bit-rate` still caps the rate of whatever ends up running, and one below
+anything the starting modulation can do starts lower instead: `--bit-rate
+1200` on its own is V.22bis at 1200.
+
+**Calling**, datamodem listens for what the answering modem sends before it
+has heard anything it recognises, and answers in kind:
+
+| It hears | Which means | So it runs |
+|---|---|---|
+| ANSam (2100 Hz, amplitude modulated) | V.8 | V.34 |
+| a plain answer tone | no V.8: an older modem | V.32bis — AA once it has heard a second of the tone |
+| AC (600 + 3000 Hz) | V.32 | V.32bis |
+| USB1, V.22's unscrambled ones | V.22bis or V.22 | V.22bis, once it has sent AA long enough for a V.32 answerer to have heard it, or else after 3.1 s more of USB1 (V.32bis Annex A's Tc, in case AC follows) |
+| 1650 Hz | V.21 channel 2 | V.21 |
+| 2225 Hz | Bell 103's answering carrier | Bell 103 |
+
+**Answering**, it has to offer, because a V.22bis, V.21 or Bell 103 caller
+says nothing until it hears its own kind of answering signal. With V.34 at
+the top it sends ANSam and listens for V.8's CM; a caller that does not
+answer with one gets each of these for three seconds in turn, round and
+round until `--train-timeout`, and the first to be answered is kept:
+
+1. V.22bis's USB1, listening for S1 or SB1 (Annex A's Ta);
+2. V.32's AC, listening for AA (three seconds plus the round trip);
+3. V.21's channel 2 carrier, listening for channel 1;
+4. Bell 103's 2225 Hz, listening for 1270 Hz.
+
+A caller that sent V.32's AA during the answer tone — which an automode V.32
+caller does — goes straight to V.32bis, and so does one heard sending AA at
+any later point. At 300 bps it is the same: a V.21 or Bell 103 caller heard
+during any offer is answered in its own modulation at once.
+
+Telling these apart is done with Goertzel filters over 40 ms blocks, against
+the block's whole power less the echo of whatever this end is sending. The
+hard pair is Bell 103's 2225 Hz and USB1, which puts most of its power at
+2250 Hz: 40 ms makes those two bins orthogonal, and USB1's second line,
+600 Hz higher and a fourteenth of its power, settles it. V.21 and Bell 103
+carrying data — V.42's ODP, say — smear between their tones, and their
+calling bands interleave 90 Hz apart, so which one it is is decided over the
+whole run of blocks rather than one at a time.
+
+V.21 and Bell 103 now wait to hear the far end's tone before they connect, at
+either end, rather than taking any energy for a carrier — a V.32 caller's AA,
+or the far end's echo of our own, used to be enough. A calling FSK modem
+stays silent until it hears the answering carrier, as the real ones did, and
+then holds its own at mark for half a second plus the path before it passes
+data, so the answerer is listening when the first character arrives.
 
 ### The V.22bis situation, and why `third_party` exists
 
@@ -1187,7 +1246,7 @@ needs no network and no credentials, and it is the fastest way to tell a
 modulation problem from a SIP problem. Try it on each modulation:
 
 ```
-for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do ./build/datamodem selftest --modulation $m; done
+for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do ./build/datamodem selftest --modulation $m --no-step-down; done
 for v in "" "--v42 detect" "--v42 detect --v42bis"; do
     ./build/datamodem selftest $v
 done
@@ -1237,6 +1296,25 @@ DATAMODEM_V34_PRE_EMPHASIS=5       # 0 to 10
 DATAMODEM_V34_TRELLIS=64           # what our receiver asks for: 16, 32 or 64
 DATAMODEM_V34_SHAPING=1            # ask for expanded shaping
 DATAMODEM_V34_RENEGOTIATE=2:14400  # caller renegotiates down 2 s in; ":answer" for the answerer
+```
+
+Stepping down has a matrix too: a modem at its defaults calling and
+answering every older one, over three lines, with and without V.42, and
+pairs that both step down from different places — about ninety cases, a
+minute or so:
+
+```
+./scripts/step-down-test.sh
+```
+
+It is built on `DATAMODEM_SELFTEST_FAR`, which makes one end of the selftest
+an older modem — one modulation, no stepping down — or, with `:auto`, one
+that steps down from there too:
+
+```
+DATAMODEM_SELFTEST_FAR=answer:v22bis ./build/datamodem selftest          # V.34 calls a V.22bis modem
+DATAMODEM_SELFTEST_FAR=call:bell103 ./build/datamodem selftest           # a Bell 103 modem calls V.34
+DATAMODEM_SELFTEST_FAR=answer:v34:auto ./build/datamodem selftest --modulation v21
 ```
 
 A few more test hooks, none of them options:

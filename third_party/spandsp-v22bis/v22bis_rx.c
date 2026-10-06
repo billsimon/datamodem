@@ -505,6 +505,7 @@ static void process_half_baud(v22bis_state_t *s, const complexf_t *sample)
                error could be higher. */
             s->rx.gardner_step = 4;
             s->rx.pattern_repeats = 0;
+            s->rx.training_error = 0.0f;
             s->rx.training = (s->calling_party)  ?  V22BIS_RX_TRAINING_STAGE_UNSCRAMBLED_ONES  :  V22BIS_RX_TRAINING_STAGE_SCRAMBLED_ONES_AT_1200;
             /* Be pessimistic and see what the handshake brings */
             s->negotiated_bit_rate = 1200;
@@ -611,6 +612,27 @@ static void process_half_baud(v22bis_state_t *s, const complexf_t *sample)
                     }
                 }
                 s->rx.pattern_repeats = 0;
+            }
+            /* datamodem: count what does not descramble to ones. See below. */
+            if (!s->calling_party  &&  bitstream != 0x3)
+                s->rx.training_error += 1.0f;
+            if (s->rx.training_count >= ms_to_symbols(270)  &&  !s->calling_party
+                &&
+                s->rx.training_error > (float) (ms_to_symbols(270)/4))
+            {
+                /* datamodem: upstream takes any 270 ms of signal in the low
+                   channel for the caller's SB1, without looking at what it
+                   decodes to. A V.32 automode caller sends AA, 1800 Hz, all
+                   through the answer tone and after it (V.32 bis Annex A),
+                   and enough of it leaks through the receive filter to pass
+                   for a carrier - whereupon this answerer stopped sending
+                   USB1 for good, and the caller, which was waiting to hear
+                   USB1 before it would say anything in V.22 bis terms, never
+                   did. Scrambled ones descramble to ones; a tone does not.
+                   Start the receiver again and keep offering USB1. */
+                span_log(&s->logging, SPAN_LOG_FLOW, "+++ not SB1 (%d of %d symbols not ones)\n", (int) s->rx.training_error, s->rx.training_count);
+                v22bis_rx_restart(s);
+                break;
             }
             if (s->rx.training_count >= ms_to_symbols(270))
             {
@@ -763,10 +785,29 @@ SPAN_DECLARE_NONSTD(int) v22bis_rx(v22bis_state_t *s, const int16_t amp[], int l
                    somebody clears the call. Only lock the rate in once a
                    connection was actually established at it - a dropout
                    during training must not silently demote us to 1200. */
-                v22bis_restart(s,
-                               (s->rx.training == V22BIS_RX_TRAINING_STAGE_NORMAL_OPERATION)
-                               ? s->negotiated_bit_rate
-                               : s->bit_rate);
+                /* datamodem: and a carrier that comes and goes before the
+                   handshake has begun - the answerer still sending USB1,
+                   the caller still silent - restarts the receiver only.
+                   Upstream restarts the transmitter too, which puts an
+                   answerer back to its 75 ms of silence; a far end's
+                   signal hovering at the threshold, like a V.32 caller's
+                   AA leaking into the low channel, then kept it there,
+                   and USB1 never went out at all. */
+                if (s->tx.training == V22BIS_TX_TRAINING_STAGE_INITIAL_TIMED_SILENCE
+                    ||
+                    s->tx.training == V22BIS_TX_TRAINING_STAGE_INITIAL_SILENCE
+                    ||
+                    s->tx.training == V22BIS_TX_TRAINING_STAGE_U11)
+                {
+                    v22bis_rx_restart(s);
+                }
+                else
+                {
+                    v22bis_restart(s,
+                                   (s->rx.training == V22BIS_RX_TRAINING_STAGE_NORMAL_OPERATION)
+                                   ? s->negotiated_bit_rate
+                                   : s->bit_rate);
+                }
                 v22bis_report_status_change(s, SIG_STATUS_CARRIER_DOWN);
                 continue;
             }

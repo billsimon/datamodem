@@ -3068,6 +3068,12 @@ bool dm_v32_started(const dm_v32_t *v)
     return v->stage != STG_C_LISTEN;
 }
 
+bool dm_v32_engaged(const dm_v32_t *v)
+{
+    return v->trained_once ||
+           (v->stage != STG_C_LISTEN && v->stage != STG_C_AA && v->stage != STG_A_AC && v->stage != STG_DEAD);
+}
+
 int dm_v32_bit_rate(const dm_v32_t *v)
 {
     return v->rate;
