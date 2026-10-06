@@ -38,6 +38,7 @@ typedef struct
     int last_status;
     char last_reason[128];
     char remote_uri[256];
+    dm_call_party_t party;    /* who is on the other end, see dm_sip_call_party() */
     int64_t started_ms;
     int64_t answered_ms;
 
@@ -388,6 +389,44 @@ static void on_call_media_state(pjsua_call_id call_id)
     }
 }
 
+/* Caller ID. The From header is whatever the caller says it is; a trunk
+ * that knows better says so in P-Asserted-Identity (RFC 3325), which is
+ * preferred when present. The number called is the user part of To. */
+static void read_party(const pjsua_call_info *ci, pjsip_rx_data *rdata, dm_call_party_t *party)
+{
+    char buf[256];
+    char name[sizeof(party->remote_name)];
+    char number[sizeof(party->remote_number)];
+
+    memset(party, 0, sizeof(*party));
+    snprintf(buf, sizeof(buf), "%.*s", (int) ci->remote_info.slen, ci->remote_info.ptr);
+    snprintf(party->remote_uri, sizeof(party->remote_uri), "%s", buf);
+    dm_parse_sip_party(buf, party->remote_name, sizeof(party->remote_name), party->remote_number,
+                       sizeof(party->remote_number));
+
+    if (rdata != NULL && rdata->msg_info.msg != NULL)
+    {
+        const pj_str_t pai_name = {"P-Asserted-Identity", 19};
+        const pjsip_generic_string_hdr *pai = (const pjsip_generic_string_hdr *) pjsip_msg_find_hdr_by_name(
+            rdata->msg_info.msg, &pai_name, NULL);
+
+        if (pai != NULL)
+        {
+            snprintf(buf, sizeof(buf), "%.*s", (int) pai->hvalue.slen, pai->hvalue.ptr);
+            dm_parse_sip_party(buf, name, sizeof(name), number, sizeof(number));
+            if (number[0] != '\0')
+            {
+                snprintf(party->remote_number, sizeof(party->remote_number), "%s", number);
+                if (name[0] != '\0')
+                    snprintf(party->remote_name, sizeof(party->remote_name), "%s", name);
+            }
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "%.*s", (int) ci->local_info.slen, ci->local_info.ptr);
+    dm_parse_sip_party(buf, name, sizeof(name), party->local_number, sizeof(party->local_number));
+}
+
 static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_rx_data *rdata)
 {
     pjsua_call_info ci;
@@ -397,7 +436,6 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     char from[200];
 
     (void) acc_id;
-    (void) rdata;
 
     if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS)
     {
@@ -411,9 +449,15 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     pthread_mutex_lock(&g.lock);
     if (!g.inbound_enabled || g.pending_modem == NULL)
     {
+        /* An answering modem between calls - finishing one, about to wait
+         * for the next - is busy, as a modem still off hook would be. */
+        bool answering = (g.cfg.command == DM_CMD_ANSWER);
+
         pthread_mutex_unlock(&g.lock);
-        DM_INFO("sip", "rejecting inbound call from %s: not accepting calls", from);
-        pjsua_call_hangup(call_id, PJSIP_SC_NOT_ACCEPTABLE_HERE, NULL, NULL);
+        DM_INFO("sip", "rejecting inbound call from %s: %s", from,
+                answering ? "busy between calls" : "not accepting calls");
+        pjsua_call_hangup(call_id, answering ? PJSIP_SC_BUSY_HERE : PJSIP_SC_NOT_ACCEPTABLE_HERE, NULL,
+                          NULL);
         return;
     }
     if (g.active != NULL)
@@ -444,6 +488,9 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     }
     c->call_id = call_id;
     snprintf(c->remote_uri, sizeof(c->remote_uri), "%s", from);
+    read_party(&ci, rdata, &c->party);
+    DM_INFO("sip", "caller id: number=\"%s\" name=\"%s\" called=\"%s\"", c->party.remote_number,
+            c->party.remote_name, c->party.local_number);
     /* Before it is active, so no callback can find it half set up. */
     pjsua_call_set_user_data(call_id, c);
     pthread_mutex_lock(&g.lock);
@@ -932,6 +979,9 @@ int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem, volat
     if (c == NULL)
         return DM_EXIT_INTERNAL;
     snprintf(c->remote_uri, sizeof(c->remote_uri), "%s", uri);
+    snprintf(c->party.remote_uri, sizeof(c->party.remote_uri), "%s", uri);
+    dm_parse_sip_party(uri, c->party.remote_name, sizeof(c->party.remote_name), c->party.remote_number,
+                       sizeof(c->party.remote_number));
     pthread_mutex_lock(&g.lock);
     g.active = c;
     pthread_mutex_unlock(&g.lock);
@@ -1129,6 +1179,21 @@ int64_t dm_sip_since_rtp_ms(void)
     }
     pthread_mutex_unlock(&g.lock);
     return since;
+}
+
+bool dm_sip_call_party(dm_call_party_t *party)
+{
+    bool found = false;
+
+    memset(party, 0, sizeof(*party));
+    pthread_mutex_lock(&g.lock);
+    if (g.active != NULL)
+    {
+        *party = g.active->party;
+        found = true;
+    }
+    pthread_mutex_unlock(&g.lock);
+    return found;
 }
 
 bool dm_sip_link_quality(dm_link_quality_t *q)

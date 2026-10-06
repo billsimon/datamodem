@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -146,4 +147,105 @@ bool dm_parse_key_spec(const char *s, int *out)
         return false;
     *out = (int) n;
     return true;
+}
+
+/* Appends c to out, which has room for out_len bytes including the NUL,
+ * unless it is a control character or there is no room left. */
+static void party_put(char *out, size_t out_len, size_t *n, unsigned char c)
+{
+    if (c < 0x20 || c == 0x7f || *n + 1 >= out_len)
+        return;
+    out[(*n)++] = (char) c;
+    out[*n] = '\0';
+}
+
+static int hex_value(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    c = tolower(c);
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+void dm_parse_sip_party(const char *s, char *name, size_t name_len, char *user, size_t user_len)
+{
+    const char *uri;
+    const char *lt;
+    size_t n = 0;
+
+    if (name_len > 0)
+        name[0] = '\0';
+    if (user_len > 0)
+        user[0] = '\0';
+    if (s == NULL || name_len == 0 || user_len == 0)
+        return;
+
+    while (*s == ' ' || *s == '\t')
+        s++;
+
+    /* The display name: quoted, with backslash escapes, or a run of tokens
+     * up to the '<' that opens the URI. */
+    lt = strchr(s, '<');
+    if (*s == '"')
+    {
+        for (s++; *s != '\0' && *s != '"'; s++)
+        {
+            if (*s == '\\' && s[1] != '\0')
+                s++;
+            party_put(name, name_len, &n, (unsigned char) *s);
+        }
+        lt = strchr(s, '<');
+    }
+    else if (lt != NULL)
+    {
+        const char *end = lt;
+
+        while (end > s && (end[-1] == ' ' || end[-1] == '\t'))
+            end--;
+        for (; s < end; s++)
+            party_put(name, name_len, &n, (unsigned char) *s);
+    }
+    uri = (lt != NULL) ? lt + 1 : s;
+
+    /* The user part: after the scheme, up to the host (sip, sips) or the
+     * first parameter (tel, which has no host). sip:host alone has no user
+     * part at all. */
+    {
+        bool is_tel = false;
+        const char *at;
+        const char *end;
+
+        n = 0;
+        if (strncasecmp(uri, "sip:", 4) == 0)
+            uri += 4;
+        else if (strncasecmp(uri, "sips:", 5) == 0)
+            uri += 5;
+        else if (strncasecmp(uri, "tel:", 4) == 0)
+        {
+            uri += 4;
+            is_tel = true;
+        }
+        else
+            return;
+
+        at = strpbrk(uri, is_tel ? ">;?" : "@>;?");
+        if (!is_tel && (at == NULL || *at != '@'))
+            return;
+        end = (at != NULL) ? at : uri + strlen(uri);
+        for (; uri < end; uri++)
+        {
+            if (*uri == '%' && hex_value(uri[1]) >= 0 && hex_value(uri[2]) >= 0)
+            {
+                party_put(user, user_len, &n,
+                          (unsigned char) (hex_value(uri[1]) * 16 + hex_value(uri[2])));
+                uri += 2;
+            }
+            else
+            {
+                party_put(user, user_len, &n, (unsigned char) *uri);
+            }
+        }
+    }
 }
