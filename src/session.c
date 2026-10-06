@@ -709,7 +709,7 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
     char *argv[4];
     pid_t pid;
     bool answering = (s->cfg->command == DM_CMD_ANSWER);
-
+    long max_fd = sysconf(_SC_OPEN_MAX);
     for (char **e = environ; *e != NULL && n < ENV_MAX - 16; e++)
         if (strncmp(*e, "DATAMODEM_", 10) != 0)
             env[n++] = *e;
@@ -757,6 +757,8 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
         setsockopt(from_child[0], SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
     }
 
+    if (max_fd < 0 || max_fd > 65536)
+        max_fd = 65536;
     argv[0] = "sh";
     argv[1] = "-c";
     argv[2] = (char *) s->cfg->exec;
@@ -778,8 +780,6 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
     {
         struct sigaction sa;
         sigset_t none;
-        long max_fd = sysconf(_SC_OPEN_MAX);
-
         /* Its own process group, so that SIGHUP reaches everything the
          * command starts, as a real hangup would. */
         setpgid(0, 0);
@@ -794,14 +794,15 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
 
         dup2(to_child[0], STDIN_FILENO);
         dup2(from_child[1], STDOUT_FILENO);
-        if (max_fd < 0 || max_fd > 65536)
-            max_fd = 65536;
         for (long fd = 3; fd < max_fd; fd++)
             close((int) fd);
         execve("/bin/sh", argv, env);
         _exit(127);
     }
 
+    /* As well as in the child, so that the group exists however soon the
+     * call ends and exec_stop() signals it. */
+    setpgid(pid, pid);
     close(to_child[0]);
     close(from_child[1]);
     s->child_pid = pid;
