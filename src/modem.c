@@ -346,9 +346,10 @@ struct dm_modem
     bool v8_stalled;           /* or V.8 started and went unanswered */
     bool switch_listen;        /* calling V.32: listen for AC, send no AA of our own */
     bool aa_heard;             /* answering: a V.32 caller's AA, at any point */
-    long long aa_from;         /* calling: when our V.32 pump started sending AA, -1 if not */
     int window;                /* answering: which of ANSWER_CYCLE is on offer, -1 = V.8 */
     long window_left;          /* samples before offering the next */
+    bool offered_v21;          /* answering: V.21's channel 2 has been on the line */
+    bool offered_bell;         /* and Bell 103's 2225 Hz */
     bool fsk_carrier;
     bool fsk_confirmed;        /* the far end's FSK tone has been heard, not just energy */
     long long fsk_mark_from;   /* calling: when our own carrier went out, -1 = not yet */
@@ -1905,7 +1906,9 @@ static void rx_status(void *user, int status)
         if (is_fsk(m->mod))
         {
             m->fsk_carrier = true;
-            if (fsk_needs_tone(m->mod))
+            /* Once connected the far end's tone is known; a carrier coming
+             * back is a recovery, as it always was. */
+            if (fsk_needs_tone(m->mod) && !m->connected)
                 fsk_maybe_connect(m);
             else
                 note_connected(m);
@@ -2340,11 +2343,11 @@ static void start_pump(dm_modem_t *m, const char *why)
         return;
     m->pump_started = true;
     if (m->v32 != NULL)
-    {
         dm_v32_start(m->v32);
-        if (m->calling)
-            m->aa_from = m->samples;
-    }
+    if (!m->calling && m->mod == DM_MOD_V21)
+        m->offered_v21 = true;
+    if (!m->calling && m->mod == DM_MOD_BELL103)
+        m->offered_bell = true;
     m->phase = DM_PHASE_TRAINING;
     dm_log_event(DM_LOG_INFO, "modem", "training", "tag=%s modulation=%s role=%s offered_rate=%d why=\"%s\"",
                  m->tag, m->mod_name, m->calling ? "originate" : "answer", m->offered_rate, why);
@@ -2679,7 +2682,6 @@ static void step_now(dm_modem_t *m)
     m->fsk_carrier = false;
     m->fsk_confirmed = m->switch_confirmed;
     m->fsk_mark_from = -1;
-    m->aa_from = -1;
     listen_reset(&m->listen);
     if (!create_pump(m, m->calling && is_v32(to)))
     {
@@ -2923,25 +2925,23 @@ static void hunt_heard(dm_modem_t *m, heard_t h, int run)
                 start_pump(m, heard_name(h));
             break;
         }
-        /* No V.8 answerer sends these, so what was heard was not ANSam. Stop
-         * the CM at once - it is FSK in the very band a V.22 bis answerer
-         * listens to its caller in - and listen, Tc and all, in silence. */
-        if (m->v34 != NULL)
-        {
-            request_step(m, pick_v32(m), "V.22's unscrambled ones in answer to V.8: no V.8 there");
-            m->switch_listen = true;
-            break;
-        }
-        /* Annex A A.2.1.3: a V.32 caller that has been sending AA long enough
-         * for the far end to have heard it takes unscrambled ones as the
-         * answer - that far end is no V.32 modem. Otherwise A.2.1.2: they may
-         * be an automode answerer's first offer, with AC to follow, so wait
-         * Tc > 3.1 s to be sure. */
-        if (run < ((m->aa_from >= 0 && m->samples - m->aa_from >= DM_SAMPLE_RATE * 3 / 2) ? 4 : 78))
-            break;
+        /* Answered at once, as a V.22 bis caller would, whatever was going
+         * on - V.8's CM included, which no V.8 answerer would have met with
+         * these.
+         *
+         * Annex A has a caller that has not sent AA wait Tc > 3.1 s first
+         * (A.2.1.2), in case the answerer is an automode one that will offer
+         * AC next. Its own Note 1 says what that costs: V.22 bis does not
+         * say how long USB1 lasts, and modems that stop sooner will not
+         * interwork. A real 2400 bps modem did exactly that - three seconds
+         * of USB1 and on to V.21 - and was missed. An automode V.32 answerer
+         * that hears S1 instead connects in V.22 bis, which is the lesser
+         * loss; and it only gets as far as USB1 when it heard no AA during
+         * its answer tone, which this end does send after a plain one. */
         if (pick_v22(m) >= 0)
         {
-            request_step(m, pick_v22(m), heard_name(h));
+            request_step(m, pick_v22(m), m->v34 != NULL ? "V.22's unscrambled ones in answer to V.8: no V.8 there"
+                                                        : heard_name(h));
             settle(m, heard_name(h));
         }
         break;
@@ -2972,14 +2972,16 @@ static void hunt_heard(dm_modem_t *m, heard_t h, int run)
             request_step(m, pick_v32(m), heard_name(h));
         break;
     case HEARD_V21_ORIG:
-        /* V.8's CM is V.21 channel 1 too. A V.21 caller says nothing until
-         * it hears our channel 2, so while V.8 is still listening this is
-         * a V.8 caller. */
-        if (!m->calling && m->v34 == NULL)
+        /* A V.21 caller says nothing until it hears our channel 2, so before
+         * that has been offered this is something else in its band - V.8's
+         * CM, from a V.34 caller that took our answer tone for ANSam, is
+         * V.21 channel 1 too. Once offered, a caller that answers late, after
+         * we have moved on, is still taken. */
+        if (!m->calling && m->offered_v21 && m->v34 == NULL)
             fsk_heard(m, DM_MOD_V21, h);
         break;
     case HEARD_BELL_ORIG:
-        if (!m->calling)
+        if (!m->calling && m->offered_bell)
             fsk_heard(m, DM_MOD_BELL103, h);
         break;
     default:
@@ -3071,7 +3073,6 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     m->rate_cap = params->bit_rate;
     set_modulation(m, m->mod);
     m->hunting = can_step_down(m);
-    m->aa_from = -1;
     m->fsk_mark_from = -1;
     m->window = (m->mod == DM_MOD_V34) ? -1 : cycle_index(m->mod);
     m->window_left = window_samples(m, m->mod);

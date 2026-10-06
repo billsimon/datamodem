@@ -297,7 +297,7 @@ has heard anything it recognises, and answers in kind:
 | a plain answer tone | no V.8: an older modem | V.32bis — AA once it has heard a second of the tone |
 | what sounded like ANSam, and then no JM | an older modem whose answer tone had some amplitude modulation on it by the time it arrived | V.32bis, silent until it hears AC — and on hearing USB1 or a V.21 carrier during V.8, stop CM and go to it |
 | AC (600 + 3000 Hz) | V.32 | V.32bis |
-| USB1, V.22's unscrambled ones | V.22bis or V.22 | V.22bis, once it has sent AA long enough for a V.32 answerer to have heard it, or else after 3.1 s more of USB1 (V.32bis Annex A's Tc, in case AC follows) |
+| USB1, V.22's unscrambled ones | V.22bis or V.22 | V.22bis, at once — not after Annex A's Tc > 3.1 s, which a real 2400 bps modem, offering USB1 for three seconds and then V.21, outlasted (as Annex A's own Note 1 warns) |
 | 1650 Hz | V.21 channel 2 | V.21 |
 | 2225 Hz | Bell 103's answering carrier | Bell 103 |
 
@@ -311,6 +311,10 @@ round until `--train-timeout`, and the first to be answered is kept:
 2. V.32's AC, listening for AA (three seconds plus the round trip);
 3. V.21's channel 2 carrier, listening for channel 1;
 4. Bell 103's 2225 Hz, listening for 1270 Hz.
+
+A V.21 or Bell 103 caller is only taken once its carrier has been offered:
+a real one says nothing until then, and what is in its band before that is
+something else - V.8's CM, which is V.21 channel 1 too.
 
 A caller that sent V.32's AA during the answer tone — which an automode V.32
 caller does — goes straight to V.32bis, and so does one heard sending AA at

@@ -84,6 +84,10 @@ for line in "" "ulaw,delay=150,echo=-12" "ulaw,delay=350,noise=-40"; do
         want=$mod; case $mod in v32) want=v32bis ;; v22) want=v22bis ;; esac
         ANSAM=1 case_ "${line:-perfect}: calls a $mod modem" "$want" "answer:$mod" "$line"
     done
+    # A 2400 bps modem met on a real call: answer tone (heard as ANSam),
+    # USB1 for three seconds, then on to V.21 - which is what our own
+    # answerer does when it starts at v22bis.
+    ANSAM=1 case_ "${line:-perfect}: 2400 modem, USB1 then V.21" v22bis "answer:v22bis:auto" "$line"
 done
 
 echo "== V.42 and V.42bis by default, and what each falls back to"
