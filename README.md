@@ -1361,6 +1361,10 @@ have, with the time into the recording at which each happened:
 DATAMODEM_REPLAY=/tmp/call.out.wav ./build/datamodem selftest
 ```
 
+`scripts/replay-test.sh` replays every recording in `recordings/` (kept out
+of git) and checks each still links up - in the modulation its name starts
+with, as in `v22bis-2400-synchronet.wav`.
+
 A real 2400 bps modem's call, replayed like that, is how the ANSam decision
 came to be made after one second of tone rather than spandsp's two and a
 half: CM then starts at 3.5 s into the call instead of 5.0, with 2.6 s of
