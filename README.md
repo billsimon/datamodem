@@ -295,6 +295,7 @@ has heard anything it recognises, and answers in kind:
 |---|---|---|
 | ANSam (2100 Hz, amplitude modulated) | V.8 | V.34, once the far end answers CM with JM |
 | a plain answer tone | no V.8: an older modem | V.32bis — AA once it has heard a second of the tone |
+| what spandsp calls ANSam, but without a clean 15 Hz sine about 20% deep on its envelope | a plain answer tone, misheard | as a plain answer tone |
 | what sounded like ANSam, and then no JM | an older modem whose answer tone had some amplitude modulation on it by the time it arrived | V.32bis, silent until it hears AC — and on hearing USB1 or a V.21 carrier during V.8, stop CM and go to it |
 | AC (600 + 3000 Hz) | V.32 | V.32bis |
 | USB1, V.22's unscrambled ones | V.22bis or V.22 | V.22bis, at once — not after Annex A's Tc > 3.1 s, which a real 2400 bps modem, offering USB1 for three seconds and then V.21, outlasted (as Annex A's own Note 1 warns) |
@@ -1341,7 +1342,16 @@ DATAMODEM_SELFTEST_FAR=call:bell103 ./build/datamodem selftest           # a Bel
 DATAMODEM_SELFTEST_FAR=answer:v34:auto ./build/datamodem selftest --modulation v21
 ```
 
-and `DATAMODEM_SELFTEST_V42`, which changes one end's link layer:
+`DATAMODEM_RECORD=path` records a real call's audio from the moment it is
+answered, to `path.<tag>.wav`: stereo at 8 kHz, what we heard on the left and
+what we sent on the right. A log says what datamodem concluded; the
+recording says what the far end actually sent.
+
+```
+DATAMODEM_RECORD=/tmp/call ./build/datamodem 5551234 --log-level debug --log-file call.log
+```
+
+And `DATAMODEM_SELFTEST_V42`, which changes one end's link layer:
 
 ```
 DATAMODEM_SELFTEST_V42=answer:off ./build/datamodem selftest            # no V.42 there: async

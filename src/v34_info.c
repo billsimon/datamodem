@@ -291,7 +291,8 @@ int v8_build(const v8_msg_t *m, uint8_t *oct, int max)
 bool v8_parse(const uint8_t *oct, int n, v8_msg_t *m)
 {
     int i = 0;
-    bool any = false;
+    bool call = false;
+    bool mod = false;
 
     memset(m, 0, sizeof(*m));
     while (i < n)
@@ -302,7 +303,7 @@ bool v8_parse(const uint8_t *oct, int n, v8_msg_t *m)
         {
         case V8_TAG_CALL:
             m->call_function = (o >> 5) & 7;
-            any = true;
+            call = true;
             break;
         case V8_TAG_MOD:
             m->v34 = (o & 0x40) != 0;
@@ -318,7 +319,7 @@ bool v8_parse(const uint8_t *oct, int n, v8_msg_t *m)
                     i++;
                 }
             }
-            any = true;
+            mod = true;
             break;
         case V8_TAG_PROT:
             m->lapm = ((o >> 5) & 7) == 1;
@@ -333,5 +334,8 @@ bool v8_parse(const uint8_t *oct, int n, v8_msg_t *m)
         while (i < n && V8_EXT(oct[i]))
             i++;
     }
-    return any;
+    /* CM and JM both carry a call function and modulation modes (V.8
+     * 7.3, 7.4). Anything less is noise that happened to frame - the far
+     * end's FSK, read by a V.8 receiver it was never meant for. */
+    return call && mod;
 }

@@ -368,6 +368,12 @@ struct dm_modem
     uint64_t bytes_rx;
     bool wake_pending;
 
+    /* DATAMODEM_RECORD: the call's audio, both ways. See record_open(). */
+    FILE *rec;
+    uint32_t rec_frames;
+    int16_t rec_tx[1024];
+    int rec_tx_n;
+
     dm_ring_t tx;
     dm_ring_t rx;
     void (*wake)(void *user);
@@ -2335,6 +2341,94 @@ static void check_v42_deadline(dm_modem_t *m)
     }
 }
 
+/* ---------------------------------------------------------------- recording
+ *
+ * DATAMODEM_RECORD=path, a test hook rather than an option: the call's audio
+ * from the moment it is answered, in path.<tag>.wav - stereo at 8 kHz, what
+ * we heard on the left and what we sent on the right. A log says what the
+ * modem concluded; this says what the far end actually sent, and can be
+ * played back through the detectors afterwards. */
+
+static void rec_u32(FILE *f, uint32_t v)
+{
+    unsigned char b[4] = { (unsigned char) v, (unsigned char) (v >> 8), (unsigned char) (v >> 16),
+                           (unsigned char) (v >> 24) };
+
+    fwrite(b, 1, 4, f);
+}
+
+static void rec_header(FILE *f, uint32_t frames)
+{
+    static const unsigned char fmt[] = { 1, 0, 2, 0, 0x40, 0x1f, 0, 0, 0x00, 0x7d, 0, 0, 4, 0, 16, 0 };
+
+    fseek(f, 0, SEEK_SET);
+    fwrite("RIFF", 1, 4, f);
+    rec_u32(f, 36 + frames * 4);
+    fwrite("WAVEfmt ", 1, 8, f);
+    rec_u32(f, 16);
+    fwrite(fmt, 1, sizeof(fmt), f);
+    fwrite("data", 1, 4, f);
+    rec_u32(f, frames * 4);
+    fseek(f, 0, SEEK_END);
+}
+
+static void record_open(dm_modem_t *m)
+{
+    const char *path = getenv("DATAMODEM_RECORD");
+    char name[1024];
+
+    if (path == NULL || *path == '\0')
+        return;
+    snprintf(name, sizeof(name), "%s.%s.wav", path, m->tag);
+    m->rec = fopen(name, "wb");
+    if (m->rec == NULL)
+    {
+        DM_WARN("modem", "DATAMODEM_RECORD: cannot write %s", name);
+        return;
+    }
+    rec_header(m->rec, 0);
+    DM_WARN("modem", "DATAMODEM_RECORD: recording the call's audio to %s. This is a test hook.", name);
+}
+
+/* What we sent, held until the received samples of the same frame arrive. */
+static void record_tx(dm_modem_t *m, const int16_t *x, int n)
+{
+    if (m->rec == NULL)
+        return;
+    for (int i = 0; i < n && m->rec_tx_n < (int) (sizeof(m->rec_tx) / sizeof(m->rec_tx[0])); i++)
+        m->rec_tx[m->rec_tx_n++] = x[i];
+}
+
+/* x NULL: audio that never arrived. */
+static void record_rx(dm_modem_t *m, const int16_t *x, int n)
+{
+    int used = n < m->rec_tx_n ? n : m->rec_tx_n;
+
+    if (m->rec == NULL)
+        return;
+    for (int i = 0; i < n; i++)
+    {
+        uint16_t l = (uint16_t) (x != NULL ? x[i] : 0);
+        uint16_t r = (uint16_t) (i < m->rec_tx_n ? m->rec_tx[i] : 0);
+        unsigned char b[4] = { (unsigned char) l, (unsigned char) (l >> 8), (unsigned char) r,
+                               (unsigned char) (r >> 8) };
+
+        fwrite(b, 1, 4, m->rec);
+    }
+    m->rec_frames += (uint32_t) n;
+    memmove(m->rec_tx, m->rec_tx + used, (size_t) (m->rec_tx_n - used) * sizeof(int16_t));
+    m->rec_tx_n -= used;
+}
+
+static void record_close(dm_modem_t *m)
+{
+    if (m->rec == NULL)
+        return;
+    rec_header(m->rec, m->rec_frames);
+    fclose(m->rec);
+    m->rec = NULL;
+}
+
 /* ------------------------------------------------------ create / destroy */
 
 static void start_pump(dm_modem_t *m, const char *why)
@@ -3305,6 +3399,7 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
 
     if (m->phase != DM_PHASE_ANSWER_TONE)
         start_pump(m, "no answer-tone phase");
+    record_open(m);
 
     dm_log_event(DM_LOG_INFO, "modem", "engine started",
                  "tag=%s modulation=%s step_down=%s role=%s rate=%d format=%d%c%d guard=%s answer_tone_ms=%d "
@@ -3326,6 +3421,7 @@ void dm_modem_destroy(dm_modem_t *m)
         return;
 
     pthread_mutex_lock(&m->lock);
+    record_close(m);
     free_pump(m);
     if (m->arx != NULL)
     {
@@ -3571,6 +3667,7 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
         memset(samples + n, 0, (size_t) (max_count - n) * sizeof(int16_t));
         n = max_count;
     }
+    record_tx(m, samples, n);
     pthread_mutex_unlock(&m->lock);
     return n;
 }
@@ -3633,6 +3730,7 @@ void dm_modem_rx(dm_modem_t *m, const int16_t *samples, int count)
         pthread_mutex_unlock(&m->lock);
         return;
     }
+    record_rx(m, samples, count);
     if (m->phase == DM_PHASE_ANSWER_TONE && m->calling)
     {
         if (m->v32 != NULL)
@@ -3690,6 +3788,7 @@ void dm_modem_rx_missing(dm_modem_t *m, int count)
         pthread_mutex_unlock(&m->lock);
         return;
     }
+    record_rx(m, NULL, count);
     if (m->v32 != NULL)
         dm_v32_rx_fillin(m->v32, count); /* its clock runs through the answer tone too */
     else if (m->v34 != NULL)
