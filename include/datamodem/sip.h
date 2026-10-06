@@ -58,6 +58,22 @@ typedef struct
 
 bool dm_sip_link_quality(dm_link_quality_t *q);
 
+/* Who the call is with. On an answered call, remote_number and remote_name
+ * are the caller ID - from P-Asserted-Identity when the trunk sends it,
+ * otherwise From - and local_number is the number that was called. On a
+ * placed call, remote_number is the number dialled. */
+typedef struct
+{
+    char remote_uri[256];
+    char remote_name[128];
+    char remote_number[128];
+    char local_number[128];
+} dm_call_party_t;
+
+/* Fills party for the call in progress. Returns false, with party empty,
+ * when there is none. */
+bool dm_sip_call_party(dm_call_party_t *party);
+
 /* Clears the call and waits briefly for the BYE to be acknowledged. */
 void dm_sip_hangup(dm_call_result_t *result);
 

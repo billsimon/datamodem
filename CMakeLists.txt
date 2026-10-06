@@ -219,7 +219,12 @@ if(NOT APPLE)
 endif()
 add_test(NAME v34 COMMAND v34test)
 
+# Caller ID parsing and the other small shared pieces of util.c.
+add_executable(utiltest tests/util_test.c src/util.c)
+target_include_directories(utiltest PRIVATE src include)
+target_compile_options(utiltest PRIVATE -Wall -Wextra -Wno-unused-parameter -Wshadow)
+add_test(NAME util COMMAND utiltest)
 install(TARGETS datamodem RUNTIME DESTINATION bin)
 install(FILES examples/datamodem.conf DESTINATION share/datamodem/examples)
-install(PROGRAMS scripts/loopback-test.sh scripts/escape-test.sh scripts/pty-test.py
+install(PROGRAMS scripts/loopback-test.sh scripts/escape-test.sh scripts/pty-test.py scripts/exec-test.sh
         DESTINATION share/datamodem/scripts)

@@ -135,7 +135,14 @@ static const opt_def_t OPTS[] = {
     INT_OPT("media-timeout", media_timeout_s, 0, 600,
             "hang up after this many seconds with no inbound RTP (default 20, 0 disables)"),
     INT_OPT("max-call", max_call_s, 0, 86400, "hard ceiling on one call, seconds (default 0 = none)"),
-
+    STR_OPT("exec", exec,
+            "once connected, run this shell command with the line as its stdin and stdout, "
+            "and clear the call when it exits - e.g. a BBS"),
+    INT_OPT("calls", calls, 0, 1000000,
+            "answer: calls to take before exiting (default 1, 0 = keep answering)"),
+    BOOL_OPT("hangup-on-eof", hangup_on_eof,
+             "clear the call as soon as input ends and has been sent, rather than waiting "
+             "for a reply (always so with --exec)"),
     /* Logging */
     {"log-level", OPT_LOGLEVEL, offsetof(dm_config_t, log_level), 0, 0, 0,
      "error | warn | info | debug | trace (default info)"},
@@ -207,6 +214,7 @@ void dm_config_defaults(dm_config_t *cfg)
     cfg->idle_timeout_s = 0;
     cfg->media_timeout_s = 20;
     cfg->max_call_s = 0;
+    cfg->calls = 1;
 
     cfg->log_level = DM_LOG_INFO;
     cfg->pjsip_log_level = -1;
@@ -646,6 +654,11 @@ int dm_config_parse_args(dm_config_t *cfg, int argc, char *const argv[])
     if (!cfg->register_explicit)
         cfg->do_register = (cfg->command == DM_CMD_ANSWER);
 
+    /* With --exec the line belongs to the command, and an answering modem
+     * that takes call after call has no one screen to draw: either way the
+     * terminal is ours only for the log. */
+    if (cfg->exec[0] != '\0' || (cfg->command == DM_CMD_ANSWER && cfg->calls != 1))
+        cfg->tui = false;
     free(longopts);
     return DM_EXIT_OK;
 }
@@ -712,6 +725,12 @@ bool dm_config_validate(const dm_config_t *cfg, char *err, size_t err_len)
     if (cfg->escape_char >= 0 && cfg->escape_char == cfg->escape_key)
     {
         snprintf(err, err_len, "--escape-key and --escape-char cannot be the same character");
+        return false;
+    }
+
+    if (cfg->calls != 1 && cfg->command != DM_CMD_ANSWER)
+    {
+        snprintf(err, err_len, "--calls only applies to 'datamodem answer'");
         return false;
     }
     return true;
