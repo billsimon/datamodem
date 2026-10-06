@@ -343,6 +343,8 @@ struct dm_modem
     char switch_why[96];
     bool switch_confirmed;     /* switch_to is FSK, and its far end has been heard already */
     bool no_v8;                /* V.34 found no V.8 at the far end */
+    bool v8_stalled;           /* or V.8 started and went unanswered */
+    bool switch_listen;        /* calling V.32: listen for AC, send no AA of our own */
     bool aa_heard;             /* answering: a V.32 caller's AA, at any point */
     long long aa_from;         /* calling: when our V.32 pump started sending AA, -1 if not */
     int window;                /* answering: which of ANSWER_CYCLE is on offer, -1 = V.8 */
@@ -2097,16 +2099,22 @@ static void v34_event(void *user, dm_v34_event_t ev)
         if (!m->carrier_lost)
             m->no_v8 = true;
         break;
-    case DM_V34_CLEARDOWN:
     case DM_V34_NOT_V34:
+        /* V.8 began and went nowhere - it stalled, or the far end's V.8
+         * offered no V.34. Most often an older modem whose answer tone was
+         * taken for ANSam, and is now waiting for us in its own terms. */
+        if (!m->carrier_lost)
+        {
+            m->no_v8 = true;
+            m->v8_stalled = true;
+        }
+        break;
+    case DM_V34_CLEARDOWN:
         if (!m->carrier_lost)
         {
             m->carrier_lost = true;
             m->phase = DM_PHASE_DOWN;
-            DM_ERROR("modem", "%s (tag=%s)",
-                     ev == DM_V34_NOT_V34 ? "the far end does not do V.34 (no V.8 exchange)"
-                                          : "the V.34 connection was cleared down",
-                     m->tag);
+            DM_ERROR("modem", "the V.34 connection was cleared down (tag=%s)", m->tag);
         }
         break;
     }
@@ -2594,6 +2602,8 @@ static void listen_own(dm_modem_t *m)
     {
         if (is_v32(m->mod))
             listen_set_own(l, 1800.0f, 0.0f);
+        else if (m->mod == DM_MOD_V34)
+            listen_set_own(l, 980.0f, 1180.0f); /* V.8's CM, when it is being sent */
         else if (m->mod == DM_MOD_V21)
             listen_set_own(l, 980.0f, 1180.0f);
         else if (m->mod == DM_MOD_BELL103)
@@ -2642,6 +2652,7 @@ static void request_step(dm_modem_t *m, int mod, const char *why)
     m->switch_due = true;
     m->switch_to = (dm_mod_t) mod;
     m->switch_confirmed = false;
+    m->switch_listen = false;
     snprintf(m->switch_why, sizeof(m->switch_why), "%s", why);
 }
 
@@ -2685,7 +2696,16 @@ static void step_now(dm_modem_t *m)
         m->window = cycle_index(to);
         m->window_left = window_samples(m, to);
     }
-    if (m->calling && is_v32(to))
+    if (m->calling && is_v32(to) && m->switch_listen)
+    {
+        /* Silent until AC - the V.32 pump starts itself on hearing it - or
+         * until listening hears something else to step to. */
+        m->phase = DM_PHASE_ANSWER_TONE;
+        m->answer_tone_seen = false;
+        m->wait_samples = INT32_MAX;
+        m->ans_tail_running = false;
+    }
+    else if (m->calling && is_v32(to))
     {
         /* V.32 bis Annex A's calling modem: AA once it has heard a second of
          * answer tone, and on with the handshake whenever AC comes. */
@@ -2738,12 +2758,23 @@ static void after_v8(dm_modem_t *m)
     {
         m->carrier_lost = true;
         m->phase = DM_PHASE_DOWN;
-        DM_ERROR("modem", "the far end does not do V.8, so it is no V.34 modem, and --no-step-down "
-                          "rules out anything slower (tag=%s)",
-                 m->tag);
+        DM_ERROR("modem", "the far end %s, so it is no V.34 modem, and --no-step-down rules out "
+                          "anything slower (tag=%s)",
+                 m->v8_stalled ? "did not complete V.8" : "does not do V.8", m->tag);
         return;
     }
-    if (m->calling)
+    /* Whatever had been settled on was V.8, and it is off. */
+    m->hunting = true;
+    if (m->calling && m->v8_stalled)
+    {
+        /* Its answer tone is long over, and it is offering whatever it does
+         * next - AC, USB1, a 300 bps carrier - and waiting to be answered:
+         * Annex A's late caller, which listens and says nothing until it
+         * has heard one. */
+        request_step(m, v32, "V.8 went unanswered: an older modem, its answer tone taken for ANSam");
+        m->switch_listen = true;
+    }
+    else if (m->calling)
         request_step(m, v32, "a plain answer tone, without V.8");
     else if (m->aa_heard)
         request_step(m, v32, "no CM in answer to ANSam, but AA: a V.32 caller");
@@ -2769,7 +2800,7 @@ static void answer_tone_done(dm_modem_t *m)
 static const char *hunt_engaged(const dm_modem_t *m)
 {
     if (m->v34 != NULL && dm_v34_engaged(m->v34))
-        return m->calling ? "ANSam heard" : "CM heard";
+        return m->calling ? "JM heard" : "CM heard";
     if (m->v32 != NULL && dm_v32_engaged(m->v32))
         return m->calling ? "AC heard" : "AA heard";
     /* The V.22 bis receiver has heard S1, or 270 ms of what really are
@@ -2892,6 +2923,15 @@ static void hunt_heard(dm_modem_t *m, heard_t h, int run)
                 start_pump(m, heard_name(h));
             break;
         }
+        /* No V.8 answerer sends these, so what was heard was not ANSam. Stop
+         * the CM at once - it is FSK in the very band a V.22 bis answerer
+         * listens to its caller in - and listen, Tc and all, in silence. */
+        if (m->v34 != NULL)
+        {
+            request_step(m, pick_v32(m), "V.22's unscrambled ones in answer to V.8: no V.8 there");
+            m->switch_listen = true;
+            break;
+        }
         /* Annex A A.2.1.3: a V.32 caller that has been sending AA long enough
          * for the far end to have heard it takes unscrambled ones as the
          * answer - that far end is no V.32 modem. Otherwise A.2.1.2: they may
@@ -2906,7 +2946,12 @@ static void hunt_heard(dm_modem_t *m, heard_t h, int run)
         }
         break;
     case HEARD_V21_ANS:
-        if (m->calling)
+        /* V.8's JM is V.21 channel 2 too, and V.8 decodes one in a few
+         * hundred milliseconds. A second of channel 2 with no JM in it is a
+         * V.21 answerer - which, if our CM is going out, has taken that for
+         * a calling carrier and connected to it, so go to V.21 before the
+         * CM stops and it gives up on us. */
+        if (m->calling && (m->v34 == NULL || run >= 25))
             fsk_heard(m, DM_MOD_V21, h);
         break;
     case HEARD_BELL_ANS:
@@ -3236,8 +3281,18 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
         /* V.32 has an echo canceller of its own, and the network's would
          * fight it: the phase reversals every 450 ms are V.25's signal for
          * echo cancellers along the path to stand aside. */
-        m->tone_tx = modem_connect_tones_tx_init(NULL, is_v32(m->mod) ? MODEM_CONNECT_TONES_ANS_PR
-                                                                              : MODEM_CONNECT_TONES_ANS);
+        int tone = is_v32(m->mod) ? MODEM_CONNECT_TONES_ANS_PR : MODEM_CONNECT_TONES_ANS;
+
+        /* Test hook, not an option: an answer tone that a V.34 caller will
+         * take for ANSam, as one from a real older modem has been - so that
+         * the caller's V.8 goes unanswered and its fall back gets run. */
+        if (getenv("DATAMODEM_ANSWER_ANSAM") != NULL)
+        {
+            tone = MODEM_CONNECT_TONES_ANSAM_PR;
+            DM_WARN("modem", "DATAMODEM_ANSWER_ANSAM: sending ANSam as a %s answerer, which has no V.8. "
+                             "This is a test hook.", m->mod_name);
+        }
+        m->tone_tx = modem_connect_tones_tx_init(NULL, tone);
         if (m->tone_tx == NULL)
         {
             DM_ERROR("modem", "could not start the answer tone generator");

@@ -3118,7 +3118,13 @@ int dm_v34_tx_rate(const dm_v34_t *v)
 
 bool dm_v34_engaged(const dm_v34_t *v)
 {
-    return v->stage != ST_V8_C_LISTEN && v->stage != ST_V8_A_ANSAM && v->stage != ST_DEAD;
+    /* Calling, ANSam alone is not enough: an older modem's answer tone can
+     * be taken for it, and the CM that follows then goes unanswered. JM is
+     * the far end saying V.8. */
+    if (v->calling)
+        return v->stage != ST_V8_C_LISTEN && v->stage != ST_V8_C_TE && v->stage != ST_V8_C_CM &&
+               v->stage != ST_DEAD;
+    return v->stage != ST_V8_A_ANSAM && v->stage != ST_DEAD;
 }
 
 int dm_v34_rx_rate(const dm_v34_t *v)

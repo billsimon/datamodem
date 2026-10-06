@@ -26,7 +26,8 @@ fail=0
 case_() {
     local name=$1 expect=$2 far=$3 line=$4; shift 4
     local out rc got proto result
-    out=$(DATAMODEM_SELFTEST_FAR=$far DATAMODEM_SELFTEST_V42=${V42:-} DATAMODEM_SELFTEST_LINE=$line \
+    out=$(env DATAMODEM_SELFTEST_FAR=$far DATAMODEM_SELFTEST_V42=${V42:-} DATAMODEM_SELFTEST_LINE=$line \
+          ${ANSAM:+DATAMODEM_ANSWER_ANSAM=1} \
           "$BIN" selftest "$@" 2>&1)
     rc=$?
     got=$(printf '%s\n' "$out" | grep -oE "result modulation=[^ ]+" | head -1)
@@ -76,6 +77,14 @@ case_ "v34 caller, v21 answerer"            v21     answer:v21:auto    ""  --mod
 case_ "bell103 caller, v34 answerer"        bell103 answer:v34:auto    ""  --modulation bell103
 case_ "v34 caller, v22 answerer"            v22bis  call:v34:auto      ""  --modulation v22
 case_ "--bit-rate 9600, a V.22 bis answerer" v22bis answer:v22bis      ""  --bit-rate 9600
+
+echo "== an older answerer whose answer tone is taken for ANSam: V.8 goes unanswered"
+for line in "" "ulaw,delay=150,echo=-12" "ulaw,delay=350,noise=-40"; do
+    for mod in v32bis v32 v22bis v22 v21; do
+        want=$mod; case $mod in v32) want=v32bis ;; v22) want=v22bis ;; esac
+        ANSAM=1 case_ "${line:-perfect}: calls a $mod modem" "$want" "answer:$mod" "$line"
+    done
+done
 
 echo "== V.42 and V.42bis by default, and what each falls back to"
 for line in "" "ulaw,delay=150,echo=-12"; do

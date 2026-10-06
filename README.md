@@ -293,8 +293,9 @@ has heard anything it recognises, and answers in kind:
 
 | It hears | Which means | So it runs |
 |---|---|---|
-| ANSam (2100 Hz, amplitude modulated) | V.8 | V.34 |
+| ANSam (2100 Hz, amplitude modulated) | V.8 | V.34, once the far end answers CM with JM |
 | a plain answer tone | no V.8: an older modem | V.32bis — AA once it has heard a second of the tone |
+| what sounded like ANSam, and then no JM | an older modem whose answer tone had some amplitude modulation on it by the time it arrived | V.32bis, silent until it hears AC — and on hearing USB1 or a V.21 carrier during V.8, stop CM and go to it |
 | AC (600 + 3000 Hz) | V.32 | V.32bis |
 | USB1, V.22's unscrambled ones | V.22bis or V.22 | V.22bis, once it has sent AA long enough for a V.32 answerer to have heard it, or else after 3.1 s more of USB1 (V.32bis Annex A's Tc, in case AC follows) |
 | 1650 Hz | V.21 channel 2 | V.21 |
