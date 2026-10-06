@@ -181,8 +181,58 @@ you: it needs a second of silence, and the queue keeps feeding the line.
 `--escape-key '^]'` adds a single keystroke that escapes immediately. It is
 off by default, because a real modem has no such thing.
 
-## What it can actually do
+### Answering for a BBS, or any other program
 
+`--exec` hands each call to a program, the way getty hands a serial line to
+login. Once the link is up, the command (run by `/bin/sh -c`) gets the line
+as its stdin and stdout: what the caller sends, it reads; what it writes, the
+caller receives. When it exits, the call is cleared as soon as everything it
+said is on the wire. When the caller hangs up first, its stdin ends and it is
+sent `SIGHUP` - to its whole process group, as a dropped carrier would - and
+`SIGKILL` five seconds later if it is still there.
+
+```
+datamodem answer --calls 0 --modulation v32bis --v42 detect --v42bis \
+    --exec 'x84-modem-bridge --port 6510'
+```
+
+The command's environment says what is known about the call, under the
+names mgetty gave them, so scripts written for it read them unchanged:
+
+| | |
+|---|---|
+| `CONNECT` | the result code, `14400` or `14400 V.42/V.42bis` |
+| `MODEM_RATE` | the bit rate, `14400` |
+| `MODEM_MODULATION` | `v32bis`, as `--modulation` names it |
+| `MODEM_PROTOCOL` | `async`, `V.42` or `V.42/V.42bis` |
+| `MODEM_DIRECTION` | `answer`, or `originate` for `datamodem dial --exec` |
+| `CALLER_ID` | the caller's number |
+| `CALLER_NAME` | the caller's name, when the trunk sends one |
+| `CALLED_ID` | the number that was called (dialled, for `originate`) |
+
+Caller ID comes from `P-Asserted-Identity` when the trunk sends one, and
+otherwise from `From`, which is whatever the caller says it is. datamodem's
+own `DATAMODEM_*` settings - the SIP password among them - are not passed
+on. The program sees nothing of `+++`: the escape sequence is off with
+`--exec`, since there is nobody to escape and a `+++` the program sends
+belongs on the line. Flow control works the same way it does for a
+terminal: datamodem reads the program's output only as fast as the line
+takes it, and stops taking the caller's bytes from the modem when the
+program falls behind, which V.42 then passes back to the caller.
+
+`--calls` is how many calls `answer` takes before it exits: 1 by default,
+`0` for as many as come. All of them share the one registration, so there
+is no gap between calls while it registers again, as there would be
+running datamodem once per call. One call is answered at a time; a call
+that arrives during another gets `486 Busy Here`. More lines means more
+datamodems, each with its own SIP account, `--local-port` and RTP range.
+
+`--hangup-on-eof` is the same prompt clearing for a plain pipe: by default,
+when stdin ends datamodem waits up to 30 s for a reply before it hangs up,
+which suits a script that sends a command and wants the answer; with it,
+the call is cleared as soon as everything is sent.
+
+## What it can actually do
 | `--modulation` | Standard | Rate | Calling end transmits | Answering end transmits |
 |---|---|---|---|---|
 | `v34` | ITU-T V.34 | 33600 down to 2400, in steps of 2400, each direction its own | 2400 to 3429 symbols/s, carrier chosen by probing | the same band |
@@ -1112,6 +1162,7 @@ on.
 ./build/datamodem selftest                    # two modems in memory, no SIP
 ./scripts/loopback-test.sh                    # a real call over real RTP
 ./scripts/escape-test.sh                      # +++ over a real call
+./scripts/exec-test.sh                        # answering for a program, three calls
 ./scripts/pty-test.py                         # the same, on a real terminal
 ```
 

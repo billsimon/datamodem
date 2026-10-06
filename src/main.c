@@ -98,11 +98,18 @@ static int cmd_dial(const dm_config_t *cfg)
     return rc;
 }
 
+/* Answers --calls calls (0: until stopped), each with a fresh modem, all on
+ * the one registration - so that there is no gap between calls while it
+ * re-registers, as there would be restarting datamodem for each. With more
+ * than one call, the exit code is that of the last call, or 0 when stopped
+ * by a signal between calls; a call that fails does not stop the next. */
 static int cmd_answer(const dm_config_t *cfg)
 {
     dm_modem_params_t params;
     dm_modem_t *modem;
     int rc;
+    int answered = 0;
+    bool forever = (cfg->calls == 0);
 
     dm_modem_params_from_config(cfg, false, "in", &params);
     modem = dm_modem_create(&params);
@@ -116,14 +123,50 @@ static int cmd_answer(const dm_config_t *cfg)
         return rc;
     }
 
-    rc = dm_sip_answer(cfg, modem, &g_stop);
-    if (rc == DM_EXIT_OK)
-        rc = run_session(cfg, modem);
-    else
-        dm_sip_hangup(NULL);
+    for (;;)
+    {
+        bool got_call;
+
+        rc = dm_sip_answer(cfg, modem, &g_stop);
+        got_call = (rc == DM_EXIT_OK);
+        if (got_call)
+        {
+            answered++;
+            rc = run_session(cfg, modem);
+        }
+        else
+        {
+            dm_sip_hangup(NULL);
+        }
+        dm_modem_destroy(modem);
+        modem = NULL;
+
+        if (g_stop != 0)
+        {
+            /* Stopped while waiting for a call is the ordinary way for a
+             * long-running answerer to end. */
+            if (!got_call && answered > 0)
+                rc = DM_EXIT_OK;
+            break;
+        }
+        if (!forever && answered >= cfg->calls)
+            break;
+        /* No call within --answer-timeout, or a failure to wait for one at
+         * all, ends the run; a call that went wrong does not. */
+        if (!got_call)
+            break;
+        modem = dm_modem_create(&params);
+        if (modem == NULL)
+        {
+            rc = DM_EXIT_INTERNAL;
+            break;
+        }
+        DM_INFO("answer", "ready for the next call (%d answered so far)", answered);
+    }
 
     dm_sip_stop();
-    dm_modem_destroy(modem);
+    if (modem != NULL)
+        dm_modem_destroy(modem);
     return rc;
 }
 

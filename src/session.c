@@ -13,7 +13,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 /* Fine enough for the escape guard timer and for the watchdogs, coarse
  * enough that an idle call costs nothing. */
@@ -27,6 +31,9 @@
 
 #define DM_READ_CHUNK 1024
 
+/* --exec: how long the command has to exit after the call ends and it is
+ * sent SIGHUP, before SIGKILL. */
+#define DM_EXEC_EXIT_GRACE_MS 5000
 /* ------------------------------------------------------- escape detector */
 
 void dm_escape_init(dm_escape_t *e, int escape_char, int guard_ms)
@@ -179,6 +186,20 @@ typedef struct
     unsigned hist[256];
     unsigned hist_n;
     bool repeat_warned;
+
+    /* --exec: the command the line is handed to once connected. What the
+     * far end sends goes to its stdin (child_in), what it writes to its
+     * stdout (child_out) goes to the far end. Bytes from the far end the
+     * command has not yet taken wait in pend; while they do, nothing more
+     * is taken from the modem, whose receive queue - and V.42 behind it -
+     * then holds the far end off. */
+    bool exec;
+    pid_t child_pid;
+    int child_in;
+    int child_out;
+    unsigned char pend[4096];
+    size_t pend_off;
+    size_t pend_len;
 } dm_session_t;
 
 static void wake_cb(void *user)
@@ -635,6 +656,241 @@ static bool command_mode_byte(dm_session_t *s, unsigned char c)
     return true;
 }
 
+/* ----------------------------------------------------------------- --exec */
+
+/* Adds NAME=value to env, which has room for env_max entries plus the NULL,
+ * copying into storage. Values are made safe for an environment: the caller
+ * ID came from the far end. */
+static void env_add(char **env, size_t *n, size_t env_max, char *storage, size_t storage_len,
+                    size_t *used, const char *name, const char *value)
+{
+    int len;
+
+    if (*n >= env_max || *used >= storage_len)
+        return;
+    len = snprintf(storage + *used, storage_len - *used, "%s=%s", name, value ? value : "");
+    if (len < 0 || (size_t) len >= storage_len - *used)
+        return;
+    env[(*n)++] = storage + *used;
+    *used += (size_t) len + 1;
+}
+
+/* Starts --exec, with the line as its stdin and stdout and what is known of
+ * the call in its environment:
+ *
+ *   CONNECT           the result code, e.g. "14400" or "14400 V.42/V.42bis"
+ *   MODEM_RATE        bit rate, e.g. 14400
+ *   MODEM_MODULATION  v34, v32bis, ... as --modulation names them
+ *   MODEM_PROTOCOL    async, V.42 or V.42/V.42bis
+ *   MODEM_DIRECTION   answer or originate
+ *   CALLER_ID         the caller's number, when answering
+ *   CALLER_NAME       the caller's name, when the trunk sends one
+ *   CALLED_ID         the number that was called (or dialled)
+ *
+ * CALLER_ID, CALLER_NAME and CONNECT are the names mgetty gave them, so
+ * scripts written for it read them unchanged. Our own DATAMODEM_* settings,
+ * the SIP password among them, are not passed on. */
+static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
+{
+    enum { ENV_MAX = 512 };
+    static char *env[ENV_MAX + 1];
+    static char storage[4096];
+    char rate[16], connect[64];
+    size_t n = 0, used = 0;
+    dm_call_party_t party;
+    int to_child[2], from_child[2];
+    char *argv[4];
+    pid_t pid;
+    bool answering = (s->cfg->command == DM_CMD_ANSWER);
+
+    for (char **e = environ; *e != NULL && n < ENV_MAX - 16; e++)
+        if (strncmp(*e, "DATAMODEM_", 10) != 0)
+            env[n++] = *e;
+
+    dm_sip_call_party(&party);
+    snprintf(rate, sizeof(rate), "%d", st->bit_rate);
+    if (strcmp(st->protocol, "async") == 0)
+        snprintf(connect, sizeof(connect), "%d", st->bit_rate);
+    else
+        snprintf(connect, sizeof(connect), "%d %s", st->bit_rate, st->protocol);
+    env_add(env, &n, ENV_MAX, storage, sizeof(storage), &used, "CONNECT", connect);
+    env_add(env, &n, ENV_MAX, storage, sizeof(storage), &used, "MODEM_RATE", rate);
+    env_add(env, &n, ENV_MAX, storage, sizeof(storage), &used, "MODEM_MODULATION", st->modulation);
+    env_add(env, &n, ENV_MAX, storage, sizeof(storage), &used, "MODEM_PROTOCOL", st->protocol);
+    env_add(env, &n, ENV_MAX, storage, sizeof(storage), &used, "MODEM_DIRECTION",
+            answering ? "answer" : "originate");
+    if (answering)
+    {
+        env_add(env, &n, ENV_MAX, storage, sizeof(storage), &used, "CALLER_ID", party.remote_number);
+        env_add(env, &n, ENV_MAX, storage, sizeof(storage), &used, "CALLER_NAME", party.remote_name);
+        env_add(env, &n, ENV_MAX, storage, sizeof(storage), &used, "CALLED_ID", party.local_number);
+    }
+    else
+    {
+        env_add(env, &n, ENV_MAX, storage, sizeof(storage), &used, "CALLED_ID", party.remote_number);
+    }
+    env[n] = NULL;
+
+    if (pipe(to_child) != 0)
+    {
+        DM_ERROR("exec", "pipe: %s", strerror(errno));
+        return false;
+    }
+    if (pipe(from_child) != 0)
+    {
+        DM_ERROR("exec", "pipe: %s", strerror(errno));
+        close(to_child[0]);
+        close(to_child[1]);
+        return false;
+    }
+
+    argv[0] = "sh";
+    argv[1] = "-c";
+    argv[2] = (char *) s->cfg->exec;
+    argv[3] = NULL;
+
+    /* Between fork and exec, only async-signal-safe calls: pjsip and the
+     * logger have threads of their own, holding locks we would inherit. */
+    pid = fork();
+    if (pid < 0)
+    {
+        DM_ERROR("exec", "fork: %s", strerror(errno));
+        close(to_child[0]);
+        close(to_child[1]);
+        close(from_child[0]);
+        close(from_child[1]);
+        return false;
+    }
+    if (pid == 0)
+    {
+        struct sigaction sa;
+        sigset_t none;
+        long max_fd = sysconf(_SC_OPEN_MAX);
+
+        /* Its own process group, so that SIGHUP reaches everything the
+         * command starts, as a real hangup would. */
+        setpgid(0, 0);
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SIG_DFL;
+        sigaction(SIGPIPE, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL);
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+
+        dup2(to_child[0], STDIN_FILENO);
+        dup2(from_child[1], STDOUT_FILENO);
+        if (max_fd < 0 || max_fd > 65536)
+            max_fd = 65536;
+        for (long fd = 3; fd < max_fd; fd++)
+            close((int) fd);
+        execve("/bin/sh", argv, env);
+        _exit(127);
+    }
+
+    close(to_child[0]);
+    close(from_child[1]);
+    s->child_pid = pid;
+    s->child_in = to_child[1];
+    s->child_out = from_child[0];
+    fcntl(s->child_in, F_SETFL, O_NONBLOCK);
+    fcntl(s->child_out, F_SETFL, O_NONBLOCK);
+    fcntl(s->child_in, F_SETFD, FD_CLOEXEC);
+    fcntl(s->child_out, F_SETFD, FD_CLOEXEC);
+    dm_log_event(DM_LOG_INFO, "exec", "started", "pid=%d command=\"%s\" caller_id=\"%s\"", (int) pid,
+                 s->cfg->exec, party.remote_number);
+    return true;
+}
+
+/* Hands what is waiting in pend to the command. Returns false while some is
+ * still waiting. A command that has stopped reading its stdin - exited, or
+ * closed it - loses whatever the far end sends from then on. */
+static bool exec_flush(dm_session_t *s)
+{
+    while (s->pend_len > 0)
+    {
+        ssize_t n;
+
+        if (s->child_in < 0)
+        {
+            s->pend_len = 0;
+            break;
+        }
+        n = write(s->child_in, s->pend + s->pend_off, s->pend_len);
+        if (n > 0)
+        {
+            s->pend_off += (size_t) n;
+            s->pend_len -= (size_t) n;
+        }
+        else if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        else if (n < 0 && errno == EAGAIN)
+        {
+            return false;
+        }
+        else
+        {
+            DM_INFO("exec", "the command is no longer reading what the far end sends");
+            close(s->child_in);
+            s->child_in = -1;
+            s->pend_len = 0;
+        }
+    }
+    s->pend_off = 0;
+    return true;
+}
+
+static const char *describe_status(int status, char *buf, size_t len)
+{
+    if (WIFEXITED(status))
+        snprintf(buf, len, "exited with status %d", WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        snprintf(buf, len, "killed by signal %d", WTERMSIG(status));
+    else
+        snprintf(buf, len, "ended (status 0x%x)", status);
+    return buf;
+}
+
+/* The call is over: tell the command so, as a modem dropping DCD would - its
+ * stdin ends and it is sent SIGHUP - and wait for it to go. */
+static void exec_stop(dm_session_t *s)
+{
+    int status = 0;
+    pid_t got = 0;
+    int64_t deadline;
+    char how[64];
+
+    if (s->child_in >= 0)
+        close(s->child_in);
+    if (s->child_out >= 0)
+        close(s->child_out);
+    s->child_in = s->child_out = -1;
+    if (s->child_pid <= 0)
+        return;
+
+    got = waitpid(s->child_pid, &status, WNOHANG);
+    if (got == 0)
+    {
+        kill(-s->child_pid, SIGHUP);
+        deadline = dm_now_ms() + DM_EXEC_EXIT_GRACE_MS;
+        while ((got = waitpid(s->child_pid, &status, WNOHANG)) == 0 && dm_now_ms() < deadline)
+            usleep(50 * 1000);
+        if (got == 0)
+        {
+            DM_WARN("exec", "the command did not exit after SIGHUP, killing it");
+            kill(-s->child_pid, SIGKILL);
+            got = waitpid(s->child_pid, &status, 0);
+        }
+    }
+    if (got == s->child_pid)
+        dm_log_event(DM_LOG_INFO, "exec", "finished", "pid=%d %s", (int) s->child_pid,
+                     describe_status(status, how, sizeof(how)));
+    s->child_pid = 0;
+}
+
 /* ------------------------------------------------------------- the loop */
 
 static void handle_input(dm_session_t *s, const unsigned char *buf, size_t len)
@@ -654,7 +910,7 @@ static void handle_input(dm_session_t *s, const unsigned char *buf, size_t len)
             continue;
         }
 
-        if (s->cfg->escape_key >= 0 && (int) c == s->cfg->escape_key)
+        if (!s->exec && s->cfg->escape_key >= 0 && (int) c == s->cfg->escape_key)
         {
             enter_command_mode(s);
             continue;
@@ -722,7 +978,12 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
     s.interactive = dm_tty_is_interactive();
     s.local_echo = cfg->local_echo;
     s.reason = DM_END_ERROR;
-    dm_escape_init(&s.esc, cfg->escape_char, cfg->escape_guard_ms);
+    /* With --exec, what goes out is the command's, not a person's: there is
+     * nobody to escape to command mode, and a "+++" the command happens to
+     * send must reach the line rather than hold it up. */
+    s.exec = (cfg->exec[0] != '\0');
+    s.child_in = s.child_out = -1;
+    dm_escape_init(&s.esc, s.exec ? -1 : cfg->escape_char, cfg->escape_guard_ms);
 
     if (pipe(pipefd) != 0)
     {
@@ -740,9 +1001,10 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
 
     for (;;)
     {
-        struct pollfd fds[2];
+        struct pollfd fds[3];
         int nfds = 0;
         int stdin_slot = -1;
+        int in_fd = s.exec ? s.child_out : STDIN_FILENO;
         int64_t now;
         unsigned char rxbuf[4096];
         size_t got;
@@ -762,12 +1024,21 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
          * The queue holds a few seconds of line time, which at 300 bps is
          * a couple of hundred bytes - so the test has to be against what is
          * actually free, not against a fixed read size. */
-        if (s.connected_ms != 0 && !s.input_eof && tx_space > 0)
+        if (s.connected_ms != 0 && !s.input_eof && tx_space > 0 && in_fd >= 0)
         {
-            fds[nfds].fd = STDIN_FILENO;
+            fds[nfds].fd = in_fd;
             fds[nfds].events = POLLIN;
             fds[nfds].revents = 0;
             stdin_slot = nfds++;
+        }
+        /* The command has fallen behind what the far end sends: wake when it
+         * can take more. */
+        if (s.exec && s.pend_len > 0 && s.child_in >= 0)
+        {
+            fds[nfds].fd = s.child_in;
+            fds[nfds].events = POLLOUT;
+            fds[nfds].revents = 0;
+            nfds++;
         }
         fds[nfds].fd = s.wake_rd;
         fds[nfds].events = POLLIN;
@@ -783,11 +1054,14 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
 
         now = dm_now_ms();
 
-        if (stdin_slot >= 0 && (fds[stdin_slot].revents & (POLLIN | POLLHUP)))
+        /* POLLNVAL too: macOS cannot poll a character device, so input
+         * from /dev/null reports that rather than POLLIN, and the read it
+         * provokes is what finds the end of the input. */
+        if (stdin_slot >= 0 && (fds[stdin_slot].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)))
         {
             unsigned char in[DM_READ_CHUNK];
             size_t want = (tx_space < sizeof(in)) ? tx_space : sizeof(in);
-            ssize_t n = read(STDIN_FILENO, in, want);
+            ssize_t n = read(in_fd, in, want);
 
             if (n > 0)
             {
@@ -796,11 +1070,12 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
             else if (n == 0)
             {
                 s.input_eof = true;
-                DM_DEBUG("session", "local input ended");
+                DM_DEBUG("session", s.exec ? "the command closed its output" : "local input ended");
             }
             else if (errno != EINTR && errno != EAGAIN)
             {
-                DM_WARN("session", "read from the terminal failed: %s", strerror(errno));
+                DM_WARN("session", "read from %s failed: %s", s.exec ? "the command" : "the terminal",
+                        strerror(errno));
                 s.input_eof = true;
             }
         }
@@ -845,7 +1120,12 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
             if (st.v42_fell_back)
                 DM_WARN("session", "the far end did not answer V.42; this link has no error "
                                    "correction");
-            if (s.interactive)
+            if (s.exec && !exec_start(&s, &st))
+            {
+                finish(&s, DM_END_ERROR);
+                break;
+            }
+            if (s.interactive && !s.exec)
             {
                 char esc[8];
                 dm_format_byte(cfg->escape_char, esc, sizeof(esc));
@@ -862,7 +1142,17 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
          * it: the far end can have bytes waiting in the same pass that the
          * link comes up, and printing them first produces a CONNECT line
          * with data already run into the front of it. */
-        if (!s.command_mode)
+        if (s.exec)
+        {
+            /* Into the command, at the pace it reads. */
+            while (exec_flush(&s) && (got = dm_modem_recv(modem, s.pend, sizeof(s.pend))) > 0)
+            {
+                count_repeats(&s, s.pend, got);
+                s.pend_off = 0;
+                s.pend_len = got;
+            }
+        }
+        else if (!s.command_mode)
         {
             while ((got = dm_modem_recv(modem, rxbuf, sizeof(rxbuf))) > 0)
             {
@@ -978,6 +1268,15 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
         {
             int idle_s = cfg->idle_timeout_s > 0 ? cfg->idle_timeout_s : DM_EOF_IDLE_S;
 
+            /* A BBS that has said goodbye, or a script that has nothing more
+             * to say and is not waiting for a reply: clear the call now. */
+            if (s.exec || cfg->hangup_on_eof)
+            {
+                DM_INFO("session", "%s and everything is sent; hanging up",
+                        s.exec ? "the command has finished" : "input finished");
+                finish(&s, DM_END_HANGUP);
+                break;
+            }
             if (s.eof_ms == 0)
             {
                 s.eof_ms = now;
@@ -995,12 +1294,24 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
     }
 
     /* Anything the far end managed to say before the end still belongs on
-     * the screen. */
+     * the screen - or, as best it can, with the command, which is told the
+     * call has ended once it has. */
+    if (s.exec)
+    {
+        size_t got;
+
+        while (exec_flush(&s) && (got = dm_modem_recv(modem, s.pend, sizeof(s.pend))) > 0)
+        {
+            s.pend_off = 0;
+            s.pend_len = got;
+        }
+        exec_stop(&s);
+    }
     for (;;)
     {
         unsigned char rxbuf[4096];
         size_t got = dm_modem_recv(modem, rxbuf, sizeof(rxbuf));
-        if (got == 0)
+        if (got == 0 || s.exec)
             break;
         dm_tty_write(rxbuf, got);
     }
