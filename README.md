@@ -61,9 +61,9 @@ of them; `examples/datamodem.conf` is a commented starting point.
 export DATAMODEM_PASSWORD=...
 datamodem +15551234567 --server sip.example.com --username 1001
 
-# up to 33600 bps, where the far end is a V.34 (or V.90...) modem; the two
-# probe the line and settle the rate in each direction between them
-datamodem 5551234 --server sip.example.com --username 1001 --modulation v34 --v42 detect
+# the defaults: V.34 up to 33600 bps, stepping down to whatever the far end
+# is, with V.42 and V.42bis if the far end does them and plain async if not
+datamodem 5551234 --server sip.example.com --username 1001
 
 # 14400 bps, where the far end is a V.32bis (or V.34, V.90...) modem; a far
 # end that only does V.32 gets 9600
@@ -192,8 +192,7 @@ sent `SIGHUP` - to its whole process group, as a dropped carrier would - and
 `SIGKILL` five seconds later if it is still there.
 
 ```
-datamodem answer --calls 0 --modulation v32bis --v42 detect --v42bis \
-    --exec 'x84-modem-bridge --port 6510'
+datamodem answer --calls 0 --exec 'x84-modem-bridge --port 6510'
 ```
 
 The command's environment says what is known about the call, under the
@@ -564,7 +563,7 @@ precoding, the Viterbi decoder), `src/v34_info.c` (INFO sequences, MP, V.8's
 CM/JM/CJ) and `src/v34_dsp.c` (the Phase 2 DPSK, probing and its analysis).
 
 ```
-datamodem 5551234 --server sip.example.com --username 1001 --modulation v34 --v42 detect
+datamodem 5551234 --server sip.example.com --username 1001 --modulation v34
 ```
 
 The start-up is four phases, each logged as it goes:
@@ -624,18 +623,26 @@ V.90 is a different machine again, and nothing here implements it.
 ## Error correction and compression
 
 V.42 (LAPM) and V.42bis are both implemented, on top of any modulation, and
-both are **off by default**:
+both are **on by default**, calling and answering, the way a modem with its
+factory settings had them (`&Q5`, `%C1`). Each falls back gracefully:
+
+- both ends do V.42 and V.42bis: `CONNECT ... V.42/V.42bis`;
+- the far end does V.42 but will not compress, or takes less of the
+  dictionary than offered: `CONNECT ... V.42`, or V.42bis on its terms;
+- the far end does not do V.42 at all: a direct async link, `CONNECT ...`.
 
 ```
-datamodem 5551234 --v42 detect             # error correction
-datamodem 5551234 --v42 detect --v42bis    # and compression
+datamodem 5551234                          # all of the above
+datamodem 5551234 --no-v42bis              # error correction, no compression
+datamodem 5551234 --v42 off                # direct async only, no handshake
+datamodem 5551234 --v42 require            # V.42 or nothing
 ```
 
 | `--v42` | |
 |---|---|
-| `off` (default) | direct async: start and stop bits, no error correction |
-| `detect` | run the V.42 handshake; fall back to direct async if the far end does not answer |
+| `detect` (default) | run the V.42 handshake; fall back to direct async if the far end does not answer |
 | `require` | run the handshake; give up on the call if the far end does not answer |
+| `off` | direct async: start and stop bits, no error correction |
 
 With V.42 running there are no start and stop bits on the line at all — the
 bit stream is HDLC frames, retransmitted until they arrive intact. `--data-bits`,
@@ -648,11 +655,14 @@ CONNECT 300 V.42             # error corrected
 CONNECT 300 V.42/V.42bis     # error corrected and compressed
 ```
 
-`--v42bis` requires `--v42`, and is refused without it. It is an offer: the
-far end may take less of it, or none - see below. Compression on an
-uncorrected link is worse than no compression: both ends build a shared
-dictionary as they go, so a single corrupted byte desynchronises them and
-everything after it is garbage rather than one bad character.
+`--v42bis` is an offer made inside V.42's XID exchange: the far end may take
+less of it, or none - see below. With `--v42 off`, or after a fall back to
+async, there is nothing to make it in and it does not run. That is as it
+should be: compression on an uncorrected link is worse than none, because
+both ends build a shared dictionary as they go, so a single corrupted byte
+desynchronises them and everything after it is garbage rather than one bad
+character. V.23 never runs V.42 (its 75 bps back channel cannot carry LAPM):
+`detect` runs it without, and `require` is refused.
 
 `ATI` reports what compression actually bought, per direction:
 
@@ -1110,9 +1120,18 @@ there is no way to ask, and the oldest data still goes, as it would on a
 real modem.
 
 **Detection traffic is real junk to a far end that is not listening for it.**
-The ODP pattern will show up as perhaps a hundred garbage characters before
-the fallback happens. Real modems had the same problem, and it is the reason
-`--v42` is off by default here rather than on.
+A calling modem's ODP pattern is DC1 characters - 0x11, and 0x91 with the
+parity bit - chosen so that an async host would take them for XON, and one
+that has never heard of V.42 sees a second or so of them (several seconds at
+300 bps, where the window is longest) before the fallback. Real modems did
+the same, which is why it is on by default anyway; `--v42 off` spares a host
+that chokes on it. An answering modem sends nothing during detection, so an
+async caller sees nothing at all.
+
+The switch itself is clean: once detection gives up, the ODP character under
+way is finished and the line held at mark - not the HDLC flags LAPM would
+idle with - and two characters of mark go out before the first async one, so
+the far end's framer is lined up for it.
 
 ### What it costs
 
@@ -1226,16 +1245,15 @@ on.
 ```
 
 The last three take flags for the link layer, so the same call can be driven
-over each of the three protocols:
+over each of the three protocols (V.42/V.42bis is the default):
 
 ```
-CALL_FLAGS="--v42 detect --v42bis" ANS_FLAGS="--v42 detect --v42bis" \
-    ./scripts/loopback-test.sh
+CALL_FLAGS="--no-v42bis" ./scripts/loopback-test.sh      # V.42 alone
 
-DM_FLAGS="--v42 detect --v42bis" ./scripts/pty-test.py
+DM_FLAGS="--v42 off" ./scripts/pty-test.py                # direct async
 
-# V.42 offered by the caller only: the fallback path
-CALL_FLAGS="--v42 detect --v42-timeout 8" \
+# an answering end with no V.42: the caller's fallback path
+ANS_FLAGS="--v42 off" \
     EXPECT_CALL="falling back to a direct async connection" \
     ./scripts/loopback-test.sh
 ```
@@ -1247,7 +1265,7 @@ modulation problem from a SIP problem. Try it on each modulation:
 
 ```
 for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do ./build/datamodem selftest --modulation $m --no-step-down; done
-for v in "" "--v42 detect" "--v42 detect --v42bis"; do
+for v in "--v42 off" "--no-v42bis" ""; do
     ./build/datamodem selftest $v
 done
 ```
@@ -1299,9 +1317,10 @@ DATAMODEM_V34_RENEGOTIATE=2:14400  # caller renegotiates down 2 s in; ":answer" 
 ```
 
 Stepping down has a matrix too: a modem at its defaults calling and
-answering every older one, over three lines, with and without V.42, and
-pairs that both step down from different places — about ninety cases, a
-minute or so:
+answering every older one, over three lines, with and without V.42; pairs
+that both step down from different places; and each of V.42's fall backs -
+a far end that will not compress, one with no V.42 at all - at each
+modulation. About 140 cases, a couple of minutes:
 
 ```
 ./scripts/step-down-test.sh
@@ -1315,6 +1334,14 @@ that steps down from there too:
 DATAMODEM_SELFTEST_FAR=answer:v22bis ./build/datamodem selftest          # V.34 calls a V.22bis modem
 DATAMODEM_SELFTEST_FAR=call:bell103 ./build/datamodem selftest           # a Bell 103 modem calls V.34
 DATAMODEM_SELFTEST_FAR=answer:v34:auto ./build/datamodem selftest --modulation v21
+```
+
+and `DATAMODEM_SELFTEST_V42`, which changes one end's link layer:
+
+```
+DATAMODEM_SELFTEST_V42=answer:off ./build/datamodem selftest            # no V.42 there: async
+DATAMODEM_SELFTEST_V42=call:no-v42bis ./build/datamodem selftest        # V.42 without compression
+DATAMODEM_SELFTEST_V42=answer:require ./build/datamodem selftest
 ```
 
 A few more test hooks, none of them options:

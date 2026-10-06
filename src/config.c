@@ -107,10 +107,13 @@ static const opt_def_t OPTS[] = {
 
     /* Error correction and compression */
     STR_OPT("v42", v42,
-            "V.42 error correction: off (default) | detect (fall back to async) | require"),
+            "V.42 error correction: detect (default: use it if the far end does, else async) | "
+            "require | off"),
     INT_OPT("v42-timeout", v42_timeout_s, 2, 120,
             "seconds to keep trying to establish V.42 before falling back (default 10)"),
-    BOOL_OPT("v42bis", v42bis, "V.42bis compression; needs --v42"),
+    BOOL_OPT("v42bis", v42bis,
+             "offer V.42bis compression inside V.42 (default on); a far end that declines it gets "
+             "V.42 alone"),
     INT_OPT("v42bis-dict", v42bis_dict, 512, 4096,
             "most V.42bis dictionary to offer, in codewords (default 2048); the far end may take less"),
     INT_OPT("v42bis-max-string", v42bis_max_string, 6, 250,
@@ -196,11 +199,14 @@ void dm_config_defaults(dm_config_t *cfg)
     cfg->train_timeout_s = 45;
     cfg->max_retrains = 4;
 
-    /* Off by default. V.42's detection phase puts ODP patterns on the line,
-     * and spandsp keeps sending them forever against a far end that does not
-     * answer - so turning this on blind would spray junk at a plain async
-     * host for --v42-timeout seconds before falling back. */
-    snprintf(cfg->v42, sizeof(cfg->v42), "%s", "off");
+    /* What a modem with its factory settings does (&Q5, %C1): V.42 with
+     * V.42bis when the far end will, V.42 alone when it will not compress,
+     * and a direct async link when it does not do V.42 at all. The cost is
+     * the detection window at the start of a call to an async-only far end:
+     * ODP patterns on the line until our detection gives up on it, and
+     * whatever that far end says meanwhile held back and delivered after. */
+    snprintf(cfg->v42, sizeof(cfg->v42), "%s", "detect");
+    cfg->v42bis = true;
     cfg->v42_timeout_s = 10;
     /* What real modems shipped with, and three times better than the 512/6
      * that spandsp's own XID advertises. Since nothing is actually
@@ -828,21 +834,21 @@ void dm_usage(void)
            "each in turn until the caller replies, the way V.32bis Annex A does.\n"
            "--modulation starts lower and still steps down from there; --no-step-down\n"
            "runs that one modulation only. v23 never steps down.\n\n");
-    printf("V.42 error correction and V.42bis compression are available on top of any of\n"
-           "them, and are off by default because the V.42 handshake puts junk on the line\n"
-           "when the far end does not answer it:\n"
-           "  --v42 detect     try V.42, fall back to direct async if nobody answers\n"
-           "  --v42 require    try V.42, give up on the call if nobody answers\n"
-           "  --v42bis         offer compression too (needs --v42); the far end may\n"
-           "                   decline it, or take less than --v42bis-dict and\n"
-           "                   --v42bis-max-string offer\n\n");
+    printf("V.42 error correction and V.42bis compression run on top of any of them, and\n"
+           "are on by default, calling and answering, as on a modem with factory settings:\n"
+           "V.42 with V.42bis when the far end does both, V.42 alone when it will not\n"
+           "compress, and a direct async link when it does not do V.42 at all.\n"
+           "  --v42 require    give up on the call rather than run without V.42\n"
+           "  --v42 off        direct async only, with no V.42 handshake at the start\n"
+           "  --no-v42bis      V.42 without offering compression\n"
+           "The far end may also take a smaller dictionary or shorter strings than\n"
+           "--v42bis-dict and --v42bis-max-string offer. V.23 never runs V.42.\n\n");
     printf("Examples:\n"
            "  export DATAMODEM_PASSWORD=...\n"
            "  datamodem +15551234567 --server sip.example.com --username 1001\n\n"
            "  datamodem 5551234 --server sip.example.com --username 1001 \\\n"
            "      --modulation bell103 --data-bits 7 --parity even\n\n"
-           "  datamodem 5551234 --server sip.example.com --username 1001 \\\n"
-           "      --v42 detect --v42bis\n\n"
+           "  datamodem 5551234 --server sip.example.com --username 1001 --v42 off\n\n"
            "  echo -e 'help\\r' | datamodem 5551234 --server sip.example.com --username 1001\n\n"
            "  datamodem answer --server sip.example.com --username 1001 --password ...\n\n"
            "  datamodem selftest --modulation v32bis\n\n");

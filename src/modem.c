@@ -316,6 +316,7 @@ struct dm_modem
     dm_ring_t comp_out;        /* compressor output waiting for a frame */
 
     /* Our own asynchronous transmit framer, see tx_get_bit(). */
+    int tx_idle_bits;          /* mark to send before the next character */
     int tx_bitpos;
     unsigned tx_byte;
     int tx_parity;
@@ -1008,25 +1009,23 @@ bool dm_modem_params_check(const dm_modem_params_t *p, char *err, size_t err_len
          * T401 - the time the far end waits for an acknowledgement - is one
          * second. Every frame would be given up on before it had finished
          * transmitting. V.42 was written for symmetric modems at 1200 bps
-         * and above, and V.23 predates it; the combination never existed. */
-        if (mode != DM_V42_OFF && mod == DM_MOD_V23)
+         * and above, and V.23 predates it; the combination never existed.
+         * detect, the default, means "if the far end will" - and over V.23
+         * it will not, so dm_modem_create() runs it as off. Only require is
+         * a contradiction. */
+        if (mode == DM_V42_REQUIRE && mod == DM_MOD_V23)
         {
             snprintf(err, err_len,
-                     "--v42 cannot run over V.23: its 75 bps back channel takes 14 seconds to "
-                     "send one LAPM frame, and the acknowledgement timer is one second");
+                     "--v42 require cannot run over V.23: its 75 bps back channel takes 14 seconds "
+                     "to send one LAPM frame, and the acknowledgement timer is one second");
             return false;
         }
-        if (p->v42bis && mode == DM_V42_OFF)
-        {
-            /* Compression without error correction is not a thing. V.42bis
-             * keeps a dictionary that both ends build as they go; one
-             * corrupted byte and the two dictionaries diverge, after which
-             * everything that follows is garbage rather than one bad
-             * character. It is only safe on top of a corrected link. */
-            snprintf(err, err_len, "--v42bis needs --v42 (compression without error correction "
-                                   "turns one bad byte into a broken session)");
-            return false;
-        }
+        /* --v42bis with --v42 off is not an error: V.42bis is an offer made
+         * inside V.42's XID exchange, and with no V.42 there is nothing to
+         * make it in, so it is simply not offered. Compression without error
+         * correction would not be safe anyway - V.42bis keeps a dictionary
+         * that both ends build as they go, and one corrupted byte leaves the
+         * two diverged for the rest of the call. */
         if (p->v42bis_dict < V42BIS_MIN_DICTIONARY_SIZE || p->v42bis_dict > V42BIS_MAX_CODEWORDS)
         {
             snprintf(err, err_len, "--v42bis-dict must be between %d and %d codewords",
@@ -1127,7 +1126,14 @@ static int async_framer_get_bit(dm_modem_t *m)
 
     if (m->tx_bitpos == 0)
     {
-        int c = dm_ring_getc(&m->tx);
+        int c;
+
+        if (m->tx_idle_bits > 0)
+        {
+            m->tx_idle_bits--;
+            return 1;
+        }
+        c = dm_ring_getc(&m->tx);
 
         if (c < 0)
             return 1; /* idle mark */
@@ -1743,6 +1749,20 @@ static void v42_status(void *user, int status)
     }
 }
 
+/* Once detection has given up: the rest of the ODP pair under way, so that
+ * an async far end is not left half a character, then mark. */
+static int v42_detect_tail_bit(v42_state_t *v)
+{
+    int bit;
+
+    if (!v->calling_party || v->neg.txbits <= 0)
+        return 1;
+    bit = (int) (v->neg.txstream & 1);
+    v->neg.txstream >>= 1;
+    v->neg.txbits--;
+    return bit;
+}
+
 static int tx_get_bit(void *user)
 {
     dm_modem_t *m = user;
@@ -1754,8 +1774,20 @@ static int tx_get_bit(void *user)
      * far end still working out what we are. */
     if (is_fsk(m->mod) && !m->connected)
         return 1;
+    /* Detection has given up on the far end, and a fall back to async is
+     * moments away: mark, rather than the HDLC flags LAPM would idle with,
+     * which an async far end would print. */
     if (m->v42 != NULL && !m->v42_fell_back)
-        return v42_tx_bit(m->v42);
+    {
+        int bit;
+
+        if (m->v42->lapm.state == DM_LAPM_V42_UNSUPPORTED)
+            return v42_detect_tail_bit(m->v42);
+        /* T400 runs out inside this call, which then hands back the first
+         * bit of a flag. */
+        bit = v42_tx_bit(m->v42);
+        return m->v42->lapm.state == DM_LAPM_V42_UNSUPPORTED ? v42_detect_tail_bit(m->v42) : bit;
+    }
     return async_framer_get_bit(m);
 }
 
@@ -2236,6 +2268,11 @@ static void check_v42_deadline(dm_modem_t *m)
      * carrier is untouched; only the meaning of the bits changes. */
     m->v42_fell_back = true;
     m->tx_bitpos = 0;
+    /* Two characters' worth of mark first. The far end was hearing ODP, or
+     * LAPM, cut off mid-character; its framer needs the line idle for a
+     * whole character to find the next start bit, or the first few come out
+     * garbled. */
+    m->tx_idle_bits = 2 * (1 + m->data_bits + (m->parity != ASYNC_PARITY_NONE) + m->stop_bits);
     DM_WARN("modem", "giving up on V.42 (%s); falling back to a direct async connection "
                      "(tag=%s)", v42_failure_reason(m), m->tag);
 
@@ -3025,6 +3062,12 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     }
 
     parse_v42_mode(params->v42, &m->v42_mode);
+    if (m->v42_mode == DM_V42_DETECT && m->mod == DM_MOD_V23)
+    {
+        DM_DEBUG("modem", "no V.42 over V.23: its 75 bps back channel cannot carry LAPM (tag=%s)",
+                 params->tag ? params->tag : "");
+        m->v42_mode = DM_V42_OFF;
+    }
     m->v42_timeout_s = params->v42_timeout_s > 0 ? params->v42_timeout_s : 10;
 #if defined(DATAMODEM_VENDORED_V42)
     /* Test hook, not an option: see third_party/spandsp-v42. Reproduces a far
@@ -4105,6 +4148,7 @@ int dm_modem_selftest(const dm_config_t *cfg)
     long iterations = 0;
     long max_iterations = (long) SELFTEST_MAX_SECONDS * DM_SAMPLE_RATE / SELFTEST_CHUNK;
     long connected_at = -1;
+    size_t handshake_bytes = 0;
     long settle_until = 0;    /* ignore what arrives while a rate change drains */
     int settled_offer = 0;
     int rc = DM_EXIT_OK;
@@ -4180,6 +4224,40 @@ int dm_modem_selftest(const dm_config_t *cfg)
             fp->step_down = mode[0] != '\0';
             DM_INFO("selftest", "the %s end runs %s%s", role, far_mod,
                     fp->step_down ? " and steps down from there" : " only");
+        }
+    }
+    /* DATAMODEM_SELFTEST_V42, a test hook: "answer:off" makes the answering
+     * end one with no V.42 at all, "call:no-v42bis" a calling end that does
+     * V.42 but will not compress, "answer:require" one that insists - so
+     * that each of the other end's fallbacks gets exercised. */
+    {
+        const char *v = getenv("DATAMODEM_SELFTEST_V42");
+        char role[16] = "";
+        char what[16] = "";
+
+        if (v != NULL && *v != '\0')
+        {
+            dm_modem_params_t *fp;
+
+            if (sscanf(v, "%15[^:]:%15s", role, what) != 2 ||
+                (strcmp(role, "answer") != 0 && strcmp(role, "call") != 0) ||
+                (strcmp(what, "off") != 0 && strcmp(what, "no-v42bis") != 0 && strcmp(what, "require") != 0))
+            {
+                DM_ERROR("selftest", "DATAMODEM_SELFTEST_V42 wants answer: or call:, then off, no-v42bis "
+                                     "or require");
+                selftest_line_free(&line);
+                free(sent_out);
+                free(sent_in);
+                free(got_out);
+                free(got_in);
+                return DM_EXIT_CONFIG;
+            }
+            fp = strcmp(role, "answer") == 0 ? &ans_params : &call_params;
+            if (strcmp(what, "no-v42bis") == 0)
+                fp->v42bis = false;
+            else
+                fp->v42 = what;
+            DM_INFO("selftest", "the %s end runs V.42 %s", role, what);
         }
     }
 
@@ -4264,12 +4342,40 @@ int dm_modem_selftest(const dm_config_t *cfg)
             continue;
         }
 
+        /* Before both ends have a usable link, what arrives is handshake: an
+         * end with no V.42 hears the other's ODP - DC1s, which is what V.42
+         * chose so that async hosts would take them for XON - for as long
+         * as detection lasts. A session waits for the link the same way. */
+        if (connected_at < 0 && !(dm_modem_data_ready(caller) && dm_modem_data_ready(answerer)))
+        {
+            unsigned char drain[512];
+            size_t n;
+
+            while ((n = dm_modem_recv(caller, drain, sizeof(drain))) > 0)
+                handshake_bytes += n;
+            while ((n = dm_modem_recv(answerer, drain, sizeof(drain))) > 0)
+                handshake_bytes += n;
+        }
+
         if (dm_modem_data_ready(caller) && dm_modem_data_ready(answerer))
         {
             if (connected_at < 0)
             {
                 dm_modem_status(caller, &cs);
+                dm_modem_status(answerer, &as);
                 connected_at = iterations;
+                /* One end gave up on V.42 just now. The last of its ODP is
+                 * still on the way to the other, which has been async all
+                 * along and takes it for what it is meant to look like:
+                 * XON. Let it land before counting. */
+                if (cs.v42_fell_back || as.v42_fell_back)
+                {
+                    settle_until = iterations + DM_SAMPLE_RATE / 2 / SELFTEST_CHUNK;
+                    DM_INFO("selftest", "link up after %.1f simulated seconds (%s, V.42 fell back); "
+                                        "letting the last of the handshake land",
+                            (double) iterations * SELFTEST_CHUNK / DM_SAMPLE_RATE, cs.protocol);
+                    continue;
+                }
                 if (getenv("DATAMODEM_SELFTEST_STALL") != NULL)
                 {
                     stall_from = iterations + 2L * DM_SAMPLE_RATE / SELFTEST_CHUNK;
@@ -4279,6 +4385,9 @@ int dm_modem_selftest(const dm_config_t *cfg)
                 }
                 DM_INFO("selftest", "link up after %.1f simulated seconds (%s)",
                         (double) iterations * SELFTEST_CHUNK / DM_SAMPLE_RATE, cs.protocol);
+                if (handshake_bytes > 0)
+                    DM_INFO("selftest", "%zu bytes arrived before the link was up, and were not counted",
+                            handshake_bytes);
             }
             out_queued += dm_modem_send(caller, sent_out + out_queued, nbytes - out_queued);
             in_queued += dm_modem_send(answerer, sent_in + in_queued, nbytes_in - in_queued);

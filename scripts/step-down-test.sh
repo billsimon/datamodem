@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Stepping down, over the selftest's simulated line: a modem left at its
 # defaults - V.34, stepping down - against every older modem it might meet,
-# calling and answering, and two that both step down from different places.
-# The older modem is datamodem with --no-step-down, which behaves as one: a
-# V.22 bis answerer that sends USB1 and waits, a V.21 caller that says nothing
-# until it hears channel 2.
+# calling and answering, and two that both step down from different places;
+# then V.42 and V.42bis, on by default, against far ends that will not
+# compress or do not do V.42 at all. The older modem is datamodem with
+# --no-step-down, which behaves as one: a V.22 bis answerer that sends USB1
+# and waits, a V.21 caller that says nothing until it hears channel 2.
 #
 #   scripts/step-down-test.sh [path/to/datamodem]
 #
 # Each case prints what the two ended up running and whether the data came
-# through intact. Takes about a minute.
+# through intact. Takes a couple of minutes.
 set -uo pipefail
 
 BIN=${1:-build/datamodem}
@@ -19,15 +20,20 @@ pass=0
 fail=0
 
 # case NAME EXPECT FAR LINE [datamodem selftest arguments]
-#   EXPECT  the modulation both should end up on
+#   EXPECT  the modulation both should end up on, and with V42= set, the
+#           protocol too: modulation/protocol
 #   FAR     DATAMODEM_SELFTEST_FAR: which end is the older modem, and what it is
 case_() {
     local name=$1 expect=$2 far=$3 line=$4; shift 4
-    local out rc got result
-    out=$(DATAMODEM_SELFTEST_FAR=$far DATAMODEM_SELFTEST_LINE=$line "$BIN" selftest "$@" 2>&1)
+    local out rc got proto result
+    out=$(DATAMODEM_SELFTEST_FAR=$far DATAMODEM_SELFTEST_V42=${V42:-} DATAMODEM_SELFTEST_LINE=$line \
+          "$BIN" selftest "$@" 2>&1)
     rc=$?
     got=$(printf '%s\n' "$out" | grep -oE "result modulation=[^ ]+" | head -1)
     got=${got#result modulation=}
+    proto=$(printf '%s\n' "$out" | grep -oE "result modulation=[^ ]+ rate=[0-9]+ protocol=[^ ]+" | head -1)
+    proto=${proto##*protocol=}
+    [ "$expect" = "${expect%/*}" ] || got="$got/$proto"
     result=$(printf '%s\n' "$out" | grep -oE "rate=[0-9]+ protocol=[^ ]+ link_seconds=[0-9.-]+" | head -1)
     if [ $rc -eq 0 ] && [ "$got" = "$expect" ]; then
         pass=$((pass + 1))
@@ -40,8 +46,8 @@ case_() {
 }
 
 for line in "" "ulaw,delay=150,echo=-12" "ulaw,delay=350,noise=-40"; do
-    for v42 in "" "--v42 detect"; do
-        tag="${line:-perfect}${v42:+, V.42}"
+    for v42 in "--v42 off" ""; do
+        tag="${line:-perfect}${v42:+, $v42}"
         echo "== $tag"
         # The answering end is the older modem; ours calls.
         case_ "calls a V.34 modem"          v34     answer:v34     "$line" $v42
@@ -70,6 +76,22 @@ case_ "v34 caller, v21 answerer"            v21     answer:v21:auto    ""  --mod
 case_ "bell103 caller, v34 answerer"        bell103 answer:v34:auto    ""  --modulation bell103
 case_ "v34 caller, v22 answerer"            v22bis  call:v34:auto      ""  --modulation v22
 case_ "--bit-rate 9600, a V.22 bis answerer" v22bis answer:v22bis      ""  --bit-rate 9600
+
+echo "== V.42 and V.42bis by default, and what each falls back to"
+for line in "" "ulaw,delay=150,echo=-12"; do
+    for mod in v34 v32bis v22bis v21 bell103; do
+        far="answer:$mod"
+        case_ "${line:-perfect}: $mod, both ends default"        "$mod/V.42/V.42bis" "$far" "$line"
+        V42=answer:no-v42bis \
+        case_ "${line:-perfect}: $mod, answerer will not compress" "$mod/V.42"       "$far" "$line"
+        V42=call:no-v42bis \
+        case_ "${line:-perfect}: $mod, caller will not compress"   "$mod/V.42"       "$far" "$line"
+        V42=answer:off \
+        case_ "${line:-perfect}: $mod, answerer has no V.42"       "$mod/async"      "$far" "$line"
+        V42=call:off \
+        case_ "${line:-perfect}: $mod, caller has no V.42"         "$mod/async"      "$far" "$line"
+    done
+done
 
 echo
 echo "$pass passed, $fail failed"
