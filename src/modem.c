@@ -873,9 +873,13 @@ static heard_t listen_block(dm_listen_t *l)
 
     /* Between 2190 and 2275 Hz is either Bell 103's answering mark, a pure
      * tone at 2225, or V.22's unscrambled ones: 600 baud of the same phase
-     * step, which is most of its power at 2250 and a fourteenth of it 600 Hz
-     * higher. The second line is what tells them apart; the frequency
-     * agrees. */
+     * step, which is most of its power at 2250 and, from some modems, a
+     * fourteenth of it 600 Hz higher. That second line settles it when it
+     * is there - but it is only the pulse shaping's imperfection, and a
+     * well-filtered modem's USB1 is a pure 2250 Hz tone (one answering for
+     * Diamond Mine was, and went unanswered for two seconds). Without the
+     * line, the frequency decides: a tone this long is found to within a
+     * few hertz, and the two are 25 Hz apart. */
     a = own_between(l, 2005.0f, 2275.0f) ? 0.0f : tone_peak(x, n, 2190.0f, 2275.0f, &at);
     if (a >= DM_LISTEN_SHARE * whole)
     {
@@ -883,8 +887,13 @@ static heard_t listen_block(dm_listen_t *l)
 
         if (at >= 2235.0f && at <= 2265.0f && side >= 0.02f * a)
             return HEARD_USB1;
-        if (at <= 2245.0f && side < 0.01f * a)
-            return HEARD_BELL_ANS;
+        if (side < 0.01f * a)
+        {
+            if (at <= 2235.0f)
+                return HEARD_BELL_ANS;
+            if (at >= 2240.0f && at <= 2265.0f)
+                return HEARD_USB1;
+        }
         return HEARD_NONE;
     }
     /* Bell 103 carrying data, its power spread around 2025 and 2225 Hz. */
