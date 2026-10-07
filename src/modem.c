@@ -292,6 +292,7 @@ struct dm_modem
     int v42bis_dict;
     int v42bis_max_string;
     bool lapm_up;
+    bool lapm_lost;            /* LAPM was up and has closed: the call is ending */
     bool rx_busy;              /* LAPM told the far end to wait: our receive queue is full */
     bool v42_fell_back;        /* gave up on V.42 and went back to raw async */
     int v42_timeout_s;
@@ -1384,7 +1385,7 @@ static const char *protocol_name(const dm_modem_t *m)
 {
     if (m->v42 == NULL || m->v42_fell_back)
         return "async";
-    if (!m->lapm_up)
+    if (!m->lapm_up && !m->lapm_lost)
         return "negotiating";
     if (m->v42bis == NULL || (!m->comp_tx && !m->comp_rx))
         return "V.42";
@@ -1689,9 +1690,24 @@ static void v42_status(void *user, int status)
          * what it is, and fall back at once. */
         if (m->lapm_up)
         {
+            const char *why = "";
+
+#if defined(DATAMODEM_VENDORED_V42)
+            why = dm_v42_disconnect_cause;
+#endif
             m->lapm_up = false;
+            m->lapm_lost = true;
             m->rx_busy = false;
-            DM_WARN("modem", "the far end closed the error-corrected link (tag=%s)", m->tag);
+            /* A far end that has been running LAPM goes on running it, so
+             * falling back to async now would only put its flags on the
+             * screen as ~?~?~?. A real modem says NO CARRIER here; so do we. */
+            m->carrier_lost = true;
+            m->phase = DM_PHASE_DOWN;
+            if (why != NULL && strcmp(why, "the far end sent DISC") == 0)
+                DM_INFO("modem", "the far end closed the error-corrected link; hanging up (tag=%s)", m->tag);
+            else
+                DM_ERROR("modem", "the error-corrected link was lost%s%s, so the call is no use (tag=%s)",
+                         (why != NULL && why[0] != '\0') ? " - " : "", (why != NULL) ? why : "", m->tag);
         }
         else if (!m->v42_peer_declined && !m->v42_fell_back)
         {
