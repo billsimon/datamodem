@@ -148,6 +148,9 @@ static const opt_def_t OPTS[] = {
     STR_OPT("exec", exec,
             "once connected, run this shell command with the line as its stdin and stdout, "
             "and clear the call when it exits - e.g. a BBS"),
+    BOOL_OPT("exec-tty", exec_tty,
+             "give --exec a terminal, as getty would, rather than a byte-exact pipe - "
+             "for a shell, login, or anything that wants a tty"),
     INT_OPT("calls", calls, 0, 1000000,
             "answer: calls to take before exiting (default 1, 0 = keep answering)"),
     BOOL_OPT("hangup-on-eof", hangup_on_eof,
@@ -744,6 +747,12 @@ bool dm_config_validate(const dm_config_t *cfg, char *err, size_t err_len)
     if (cfg->calls != 1 && cfg->command != DM_CMD_ANSWER)
     {
         snprintf(err, err_len, "--calls only applies to 'datamodem answer'");
+        return false;
+    }
+
+    if (cfg->exec_tty && cfg->exec[0] == '\0')
+    {
+        snprintf(err, err_len, "--exec-tty needs --exec");
         return false;
     }
     return true;

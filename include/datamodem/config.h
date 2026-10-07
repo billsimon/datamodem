@@ -110,6 +110,7 @@ typedef struct
     int media_timeout_s;           /* hang up after this long with no inbound RTP; 0 = off */
     int max_call_s;                /* hard ceiling on one call; 0 = off */
     char exec[DM_STR_MAX];         /* run this per call, with the line as its stdin/stdout */
+    bool exec_tty;                 /* ...on a pseudo-terminal rather than a pipe */
     int calls;                     /* `answer`: calls to take before exiting, 0 = no limit */
     bool hangup_on_eof;            /* clear the call once input ends and is sent */
     /* Logging */
