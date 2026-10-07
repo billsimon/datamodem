@@ -267,6 +267,9 @@ struct dm_v34
     uint8_t v8msg[256];       /* one CM or JM, as bits */
     int v8msg_len;
     bool v8_repeat;
+    long long v8_done_at;     /* transmit time CJ's last stop bit was out, -1 until then */
+    bool v8_quiet;            /* stop V.8 at the next transmit sample */
+    long long p2_due;         /* transmit time Phase 2 starts, -1 if not due */
     v34_p2tx_t p2tx;
     long long p2_off_at;      /* carrier off at this line time, -1 if not */
     long long p2_probe_at;    /* L1 starts at this line time */
@@ -437,7 +440,13 @@ static int v8_get_bit(void *user)
     if (v->v8h == v->v8t)
     {
         if (!v->v8_repeat || v->v8msg_len <= 0)
+        {
+            /* Asked for the bit after the last one queued: CJ's final stop
+             * bit has just gone out whole. */
+            if (v->v8_done_at < 0)
+                v->v8_done_at = v->ntx;
             return 1;
+        }
         for (int i = 0; i < v->v8msg_len; i++)
         {
             v->v8q[v->v8t] = v->v8msg[i];
@@ -478,6 +487,7 @@ static void v8_start_fsk(dm_v34_t *v, bool repeat)
 {
     v->v8h = v->v8t = 0;
     v->v8_repeat = repeat;
+    v->v8_done_at = -1;
     if (v->fsk_tx == NULL)
         v->fsk_tx = fsk_tx_init(NULL, &preset_fsk_specs[v->calling ? FSK_V21CH1 : FSK_V21CH2], v8_get_bit, v);
     else
@@ -2635,12 +2645,13 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         }
         break;
     case ST_V8_C_CJ:
-        if (v->v8h == v->v8t)
+        /* dm_v34_tx goes quiet once CJ's last stop bit is out, and starts
+         * Phase 2 75 ms later (11.1.1.1). 11.2.1.1.1: the receiver listens
+         * for INFO0a through the silence. */
+        if (v->p2_due >= 0)
         {
-            /* 11.2.1.1.1: the receiver listens for INFO0a through the
-             * silence. */
             p2_start_rx(v);
-            stage_enter(v, ST_V8_DONE, 0.075);
+            stage_enter(v, ST_V8_DONE, 0.5);
         }
         break;
     case ST_V8_A_ANSAM:
@@ -2673,16 +2684,14 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
     case ST_V8_A_JM:
         if (v->v8_got_cj)
         {
-            v->txm = TXM_SILENCE;
+            /* 11.1.2.2: silence, then Phase 2 75 ms later - both timed by
+             * dm_v34_tx. */
+            v->v8_quiet = true;
             p2_start_rx(v);
-            stage_enter(v, ST_V8_DONE, 0.075);
+            stage_enter(v, ST_V8_DONE, 0.5);
         }
         break;
     case ST_V8_DONE:
-        /* Let the last bit of CJ finish, and a few of mark after it, so that
-         * the far end's demodulator has the stop bit whole. */
-        if (v->txm == TXM_V8 && n - v->t_stage > MS(15))
-            v->txm = TXM_SILENCE;
         break;
 
     /* ------------------------------------------------ Phase 2, calling */
@@ -2957,6 +2966,8 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             return;
         }
         case ST_V8_DONE:
+            /* Only if dm_v34_tx never got there itself. */
+            v->p2_due = -1;
             v->txm = TXM_SILENCE;
             begin_phase2(v);
             return;
@@ -2995,6 +3006,11 @@ int dm_v34_tx(dm_v34_t *v, int16_t *amp, int len)
         switch (v->txm)
         {
         case TXM_SILENCE:
+            if (v->p2_due >= 0 && v->ntx >= v->p2_due)
+            {
+                v->p2_due = -1;
+                begin_phase2(v);
+            }
             break;
         case TXM_V8:
         {
@@ -3010,6 +3026,19 @@ int dm_v34_tx(dm_v34_t *v, int16_t *amp, int len)
                 fsk_tx(v->fsk_tx, &s, 1);
             }
             x = s;
+            /* The end of V.8, timed here in transmit time and not by the
+             * stage machine: that runs on receive time, a frame behind, and
+             * used to cut CJ off before its last stop bit, which left the
+             * far end without a third octet and still sending JM. A few bits
+             * of mark after CJ, then 75 ms of silence (11.1.1.1, 11.1.2.2). */
+            if (v->v8_quiet || (v->v8_done_at >= 0 && v->ntx >= v->v8_done_at + MS(10)))
+            {
+                v->v8_quiet = false;
+                v->v8_done_at = -1;
+                v->txm = TXM_SILENCE;
+                v->p2_due = v->ntx + MS(75);
+                x = 0.0f;
+            }
             break;
         }
         case TXM_P2:
@@ -3172,6 +3201,7 @@ dm_v34_t *dm_v34_create(const dm_v34_params_t *p)
 
     if (v == NULL)
         return NULL;
+    v->v8_done_at = v->p2_due = -1;
     v->calling = p->calling;
     snprintf(v->tag, sizeof(v->tag), "%s", p->tag ? p->tag : (p->calling ? "out" : "in"));
     if (!v34_ec_init(&v->ec, v->tag))
