@@ -13,9 +13,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -41,6 +43,11 @@ extern char **environ;
  * which at 300 bps is over half an hour the caller's keystrokes would wait
  * behind; a socket with a small send buffer makes the command wait instead. */
 #define DM_EXEC_OUTPUT_BUFFER 1024
+
+/* --exec-tty: the screen the command is told it has. The caller's terminal
+ * cannot tell us, so this is what a BBS caller's most likely has. */
+#define DM_EXEC_TTY_ROWS 24
+#define DM_EXEC_TTY_COLS 80
 /* ------------------------------------------------------- escape detector */
 
 void dm_escape_init(dm_escape_t *e, int escape_char, int guard_ms)
@@ -682,6 +689,81 @@ static void env_add(char **env, size_t *n, size_t env_max, char *storage, size_t
     *used += (size_t) len + 1;
 }
 
+/* The fastest standard line speed not above the connect rate, which is what
+ * --exec-tty tells the command its terminal runs at: stty shows it, and the
+ * likes of vi and less redraw more sparingly when it is low. */
+static speed_t tty_speed(int bit_rate)
+{
+    static const struct
+    {
+        int rate;
+        speed_t speed;
+    } speeds[] = {
+        {38400, B38400}, {19200, B19200}, {9600, B9600}, {4800, B4800},
+        {2400, B2400},   {1200, B1200},   {600, B600},
+    };
+
+    for (size_t i = 0; i < sizeof(speeds) / sizeof(speeds[0]); i++)
+        if (bit_rate >= speeds[i].rate)
+            return speeds[i].speed;
+    return B300;
+}
+
+/* Opens a pseudo-terminal for --exec-tty, set up as a freshly opened serial
+ * line would be: cooked, echoing, CR in as NL and NL out as CR LF, ^C a
+ * signal. Both ends are returned open; the command takes the slave as its
+ * controlling terminal after fork, and until then it is held open here, so
+ * that the master never sees a hangup before the command has started. */
+static bool open_tty(int bit_rate, int *master_out, int *slave_out)
+{
+    struct termios t;
+    struct winsize ws;
+    const char *name;
+    int master, slave;
+
+    master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0)
+    {
+        DM_ERROR("exec", "posix_openpt: %s", strerror(errno));
+        return false;
+    }
+    /* ptsname() is not thread-safe, but the session thread is the only one
+     * that calls it. */
+    if (grantpt(master) != 0 || unlockpt(master) != 0 || (name = ptsname(master)) == NULL)
+    {
+        DM_ERROR("exec", "pseudo-terminal: %s", strerror(errno));
+        close(master);
+        return false;
+    }
+    slave = open(name, O_RDWR | O_NOCTTY);
+    if (slave < 0)
+    {
+        DM_ERROR("exec", "open %s: %s", name, strerror(errno));
+        close(master);
+        return false;
+    }
+
+    if (tcgetattr(slave, &t) == 0)
+    {
+        t.c_iflag |= ICRNL | IXON | BRKINT;
+        t.c_iflag &= ~(INLCR | IGNCR | ISTRIP);
+        t.c_oflag |= OPOST | ONLCR;
+        t.c_cflag = (t.c_cflag & ~(CSIZE | PARENB)) | CS8 | CREAD | HUPCL;
+        t.c_lflag |= ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN;
+        cfsetispeed(&t, tty_speed(bit_rate));
+        cfsetospeed(&t, tty_speed(bit_rate));
+        tcsetattr(slave, TCSANOW, &t);
+    }
+    memset(&ws, 0, sizeof(ws));
+    ws.ws_row = DM_EXEC_TTY_ROWS;
+    ws.ws_col = DM_EXEC_TTY_COLS;
+    ioctl(slave, TIOCSWINSZ, &ws);
+
+    *master_out = master;
+    *slave_out = slave;
+    return true;
+}
+
 /* Starts --exec, with the line as its stdin and stdout and what is known of
  * the call in its environment:
  *
@@ -696,7 +778,13 @@ static void env_add(char **env, size_t *n, size_t env_max, char *storage, size_t
  *
  * CALLER_ID, CALLER_NAME and CONNECT are the names mgetty gave them, so
  * scripts written for it read them unchanged. Our own DATAMODEM_* settings,
- * the SIP password among them, are not passed on. */
+ * the SIP password among them, are not passed on.
+ *
+ * The line is a pipe in and a socket out by default, byte for byte, for a
+ * program that speaks to it as a bridge does. With --exec-tty it is a
+ * pseudo-terminal instead - stdin, stdout and stderr, and the command's
+ * controlling terminal, in a session of its own - for a shell or login,
+ * which say nothing to anything that is not a terminal. */
 static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
 {
     enum { ENV_MAX = 512 };
@@ -705,7 +793,9 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
     char rate[16], connect[64];
     size_t n = 0, used = 0;
     dm_call_party_t party;
-    int to_child[2], from_child[2];
+    int to_child[2] = {-1, -1}, from_child[2] = {-1, -1};
+    int master = -1, slave = -1;
+    bool tty = s->cfg->exec_tty;
     char *argv[4];
     pid_t pid;
     bool answering = (s->cfg->command == DM_CMD_ANSWER);
@@ -738,23 +828,42 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
     }
     env[n] = NULL;
 
-    if (pipe(to_child) != 0)
+    if (tty)
     {
-        DM_ERROR("exec", "pipe: %s", strerror(errno));
-        return false;
+        if (!open_tty(st->bit_rate, &master, &slave))
+            return false;
+        /* Two descriptors for the one master, so that each direction can be
+         * closed on its own as the pipes' are. */
+        to_child[1] = master;
+        from_child[0] = dup(master);
+        if (from_child[0] < 0)
+        {
+            DM_ERROR("exec", "dup: %s", strerror(errno));
+            close(master);
+            close(slave);
+            return false;
+        }
     }
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, from_child) != 0)
+    else
     {
-        DM_ERROR("exec", "socketpair: %s", strerror(errno));
-        close(to_child[0]);
-        close(to_child[1]);
-        return false;
-    }
-    {
-        int size = DM_EXEC_OUTPUT_BUFFER;
+        if (pipe(to_child) != 0)
+        {
+            DM_ERROR("exec", "pipe: %s", strerror(errno));
+            return false;
+        }
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, from_child) != 0)
+        {
+            DM_ERROR("exec", "socketpair: %s", strerror(errno));
+            close(to_child[0]);
+            close(to_child[1]);
+            return false;
+        }
+        {
+            int size = DM_EXEC_OUTPUT_BUFFER;
 
-        setsockopt(from_child[1], SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
-        setsockopt(from_child[0], SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+            setsockopt(from_child[1], SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+            setsockopt(from_child[0], SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+        }
     }
 
     if (max_fd < 0 || max_fd > 65536)
@@ -770,10 +879,15 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
     if (pid < 0)
     {
         DM_ERROR("exec", "fork: %s", strerror(errno));
-        close(to_child[0]);
-        close(to_child[1]);
-        close(from_child[0]);
-        close(from_child[1]);
+        for (int i = 0; i < 2; i++)
+        {
+            if (to_child[i] >= 0)
+                close(to_child[i]);
+            if (from_child[i] >= 0)
+                close(from_child[i]);
+        }
+        if (slave >= 0)
+            close(slave);
         return false;
     }
     if (pid == 0)
@@ -781,8 +895,18 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
         struct sigaction sa;
         sigset_t none;
         /* Its own process group, so that SIGHUP reaches everything the
-         * command starts, as a real hangup would. */
-        setpgid(0, 0);
+         * command starts, as a real hangup would. With a terminal, its own
+         * session too, with the terminal as its controlling one: then
+         * closing the master is a hangup, and a shell's job control works. */
+        if (tty)
+        {
+            setsid();
+            ioctl(slave, TIOCSCTTY, 0);
+        }
+        else
+        {
+            setpgid(0, 0);
+        }
         memset(&sa, 0, sizeof(sa));
         sa.sa_handler = SIG_DFL;
         sigaction(SIGPIPE, &sa, NULL);
@@ -792,8 +916,17 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
         sigemptyset(&none);
         sigprocmask(SIG_SETMASK, &none, NULL);
 
-        dup2(to_child[0], STDIN_FILENO);
-        dup2(from_child[1], STDOUT_FILENO);
+        if (tty)
+        {
+            dup2(slave, STDIN_FILENO);
+            dup2(slave, STDOUT_FILENO);
+            dup2(slave, STDERR_FILENO);
+        }
+        else
+        {
+            dup2(to_child[0], STDIN_FILENO);
+            dup2(from_child[1], STDOUT_FILENO);
+        }
         for (long fd = 3; fd < max_fd; fd++)
             close((int) fd);
         execve("/bin/sh", argv, env);
@@ -801,10 +934,19 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
     }
 
     /* As well as in the child, so that the group exists however soon the
-     * call ends and exec_stop() signals it. */
-    setpgid(pid, pid);
-    close(to_child[0]);
-    close(from_child[1]);
+     * call ends and exec_stop() signals it. Not for a terminal's session:
+     * a process group leader cannot call setsid(), so the child's own must
+     * be the only one. */
+    if (tty)
+    {
+        close(slave);
+    }
+    else
+    {
+        setpgid(pid, pid);
+        close(to_child[0]);
+        close(from_child[1]);
+    }
     s->child_pid = pid;
     s->child_in = to_child[1];
     s->child_out = from_child[0];
@@ -812,8 +954,8 @@ static bool exec_start(dm_session_t *s, const dm_modem_status_t *st)
     fcntl(s->child_out, F_SETFL, O_NONBLOCK);
     fcntl(s->child_in, F_SETFD, FD_CLOEXEC);
     fcntl(s->child_out, F_SETFD, FD_CLOEXEC);
-    dm_log_event(DM_LOG_INFO, "exec", "started", "pid=%d command=\"%s\" caller_id=\"%s\"", (int) pid,
-                 s->cfg->exec, party.remote_number);
+    dm_log_event(DM_LOG_INFO, "exec", "started", "pid=%d command=\"%s\" caller_id=\"%s\" tty=%s",
+                 (int) pid, s->cfg->exec, party.remote_number, tty ? "yes" : "no");
     return true;
 }
 
@@ -888,14 +1030,18 @@ static void exec_stop(dm_session_t *s)
     got = waitpid(s->child_pid, &status, WNOHANG);
     if (got == 0)
     {
-        kill(-s->child_pid, SIGHUP);
+        /* A command on a terminal that has not yet reached setsid() has no
+         * group of its own to signal. */
+        if (kill(-s->child_pid, SIGHUP) != 0)
+            kill(s->child_pid, SIGHUP);
         deadline = dm_now_ms() + DM_EXEC_EXIT_GRACE_MS;
         while ((got = waitpid(s->child_pid, &status, WNOHANG)) == 0 && dm_now_ms() < deadline)
             usleep(50 * 1000);
         if (got == 0)
         {
             DM_WARN("exec", "the command did not exit after SIGHUP, killing it");
-            kill(-s->child_pid, SIGKILL);
+            if (kill(-s->child_pid, SIGKILL) != 0)
+                kill(s->child_pid, SIGKILL);
             got = waitpid(s->child_pid, &status, 0);
         }
     }
@@ -1085,6 +1231,13 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
             {
                 s.input_eof = true;
                 DM_DEBUG("session", s.exec ? "the command closed its output" : "local input ended");
+            }
+            else if (s.exec && cfg->exec_tty && errno == EIO)
+            {
+                /* A terminal's master reads EIO, not end of file, once the
+                 * last of the command has closed the slave. */
+                s.input_eof = true;
+                DM_DEBUG("session", "the command closed its terminal");
             }
             else if (errno != EINTR && errno != EAGAIN)
             {

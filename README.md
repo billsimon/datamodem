@@ -205,6 +205,28 @@ sent `SIGHUP` - to its whole process group, as a dropped carrier would - and
 datamodem answer --calls 0 --exec 'x84-modem-bridge --port 6510'
 ```
 
+The line is a pipe, byte for byte, which is what a bridge like that wants -
+and not a terminal, so a shell or `login` run this way has nothing to say:
+`bash` reading a pipe prints no prompt and echoes nothing, and `login`
+refuses to run at all. `--exec-tty` gives the command a terminal instead,
+as getty would: a pseudo-terminal as its stdin, stdout, stderr and
+controlling terminal, in a session of its own, set up the way a freshly
+opened serial line is - echoing, line at a time, the caller's CR read as a
+newline and every newline sent as CR LF, `^C` an interrupt. It is 80 by 24,
+and its speed is the connect rate (or the fastest standard one below it).
+When the caller hangs up, the terminal hangs up too, so a shell's jobs get
+`SIGHUP` as they would on a real line.
+
+```
+datamodem answer --calls 0 --exec-tty --exec 'exec login'
+datamodem answer --exec-tty --exec 'TERM=ansi exec bash -l'
+```
+
+`TERM` is whatever datamodem's own environment has, which is the
+operator's terminal and not the caller's; set it in the command, as above,
+for anything full-screen. A program that wants the raw bytes on a terminal
+puts it into raw mode itself, as `rz`, `sz` and BBS software do.
+
 The command's environment says what is known about the call, under the
 names mgetty gave them, so scripts written for it read them unchanged:
 
@@ -1256,6 +1278,7 @@ on.
 ./scripts/loopback-test.sh                    # a real call over real RTP
 ./scripts/escape-test.sh                      # +++ over a real call
 ./scripts/exec-test.sh                        # answering for a program, three calls
+./scripts/exec-tty-test.sh                    # the same on a pseudo-terminal (--exec-tty)
 ./scripts/pty-test.py                         # the same, on a real terminal
 ```
 
