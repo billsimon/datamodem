@@ -267,6 +267,9 @@ struct dm_v34
     uint8_t v8msg[256];       /* one CM or JM, as bits */
     int v8msg_len;
     bool v8_repeat;
+    long long v8_done_at;     /* transmit time CJ's last stop bit was out, -1 until then */
+    bool v8_quiet;            /* stop V.8 at the next transmit sample */
+    long long p2_due;         /* transmit time Phase 2 starts, -1 if not due */
     v34_p2tx_t p2tx;
     long long p2_off_at;      /* carrier off at this line time, -1 if not */
     long long p2_probe_at;    /* L1 starts at this line time */
@@ -359,6 +362,7 @@ struct dm_v34
     bool have_mp, far_ack, far_e;
     long long rtd;            /* samples; -1 until measured */
     long long rev_sent;       /* line time of our reversal */
+    double rev_cand;          /* a reversal not yet known to be followed by L1, -1 if none */
     int sr_tx, sr_rx;
     bool high_tx, high_rx;
     int pe_tx;                /* the filter the far end chose for us */
@@ -437,7 +441,13 @@ static int v8_get_bit(void *user)
     if (v->v8h == v->v8t)
     {
         if (!v->v8_repeat || v->v8msg_len <= 0)
+        {
+            /* Asked for the bit after the last one queued: CJ's final stop
+             * bit has just gone out whole. */
+            if (v->v8_done_at < 0)
+                v->v8_done_at = v->ntx;
             return 1;
+        }
         for (int i = 0; i < v->v8msg_len; i++)
         {
             v->v8q[v->v8t] = v->v8msg[i];
@@ -478,6 +488,7 @@ static void v8_start_fsk(dm_v34_t *v, bool repeat)
 {
     v->v8h = v->v8t = 0;
     v->v8_repeat = repeat;
+    v->v8_done_at = -1;
     if (v->fsk_tx == NULL)
         v->fsk_tx = fsk_tx_init(NULL, &preset_fsk_specs[v->calling ? FSK_V21CH1 : FSK_V21CH2], v8_get_bit, v);
     else
@@ -1921,7 +1932,7 @@ static void heard_mp(dm_v34_t *v, const v34_mp_t *mp)
                  mp->ack ? "'" : "", mp->rate_c_to_a * 2400, mp->rate_a_to_c * 2400, 16 << mp->trellis,
                  mp->expanded ? ", expanded shaping" : "", mp->nonlinear ? ", non-linear encoding" : "",
                  pre ? ", precoding" : "", mp->asymmetric ? "" : ", symmetric", v->tag);
-    if (mp->type == 1 || !v->have_mp)
+    if (mp->type == 1)
     {
         v->mp_far = *mp;
     }
@@ -1929,7 +1940,11 @@ static void heard_mp(dm_v34_t *v, const v34_mp_t *mp)
     {
         int16_t h[3][2];
 
-        /* A type 0 leaves the precoding coefficients as they were. */
+        /* A type 0 leaves the precoding coefficients as they were - even the
+         * first MP of a rate renegotiation, which is usually a type 0: the
+         * far end goes on un-precoding with the coefficients it sent in
+         * Phase 4, so we must go on precoding with them. Only a retrain
+         * zeroes them (restart_phase2). */
         memcpy(h, v->mp_far.h, sizeof(h));
         v->mp_far = *mp;
         memcpy(v->mp_far.h, h, sizeof(h));
@@ -2451,6 +2466,8 @@ static void restart_phase2(dm_v34_t *v, bool initiate, const char *why)
     v->renegotiating = false;
     v->rate_tx = v->rate_rx = 0;
     v->have_mp = v->far_ack = v->far_e = false;
+    /* 10.1.3.9: the coefficients are zero until the first MP of Phase 4. */
+    memset(v->mp_far.h, 0, sizeof(v->mp_far.h));
     v->probing = false;
     v->q.mode = RQ_OFF;
     /* 11.5: 70 ms of silence, then our tone. */
@@ -2629,12 +2646,13 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         }
         break;
     case ST_V8_C_CJ:
-        if (v->v8h == v->v8t)
+        /* dm_v34_tx goes quiet once CJ's last stop bit is out, and starts
+         * Phase 2 75 ms later (11.1.1.1). 11.2.1.1.1: the receiver listens
+         * for INFO0a through the silence. */
+        if (v->p2_due >= 0)
         {
-            /* 11.2.1.1.1: the receiver listens for INFO0a through the
-             * silence. */
             p2_start_rx(v);
-            stage_enter(v, ST_V8_DONE, 0.075);
+            stage_enter(v, ST_V8_DONE, 0.5);
         }
         break;
     case ST_V8_A_ANSAM:
@@ -2667,16 +2685,14 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
     case ST_V8_A_JM:
         if (v->v8_got_cj)
         {
-            v->txm = TXM_SILENCE;
+            /* 11.1.2.2: silence, then Phase 2 75 ms later - both timed by
+             * dm_v34_tx. */
+            v->v8_quiet = true;
             p2_start_rx(v);
-            stage_enter(v, ST_V8_DONE, 0.075);
+            stage_enter(v, ST_V8_DONE, 0.5);
         }
         break;
     case ST_V8_DONE:
-        /* Let the last bit of CJ finish, and a few of mark after it, so that
-         * the far end's demodulator has the stop bit whole. */
-        if (v->txm == TXM_V8 && n - v->t_stage > MS(15))
-            v->txm = TXM_SILENCE;
         break;
 
     /* ------------------------------------------------ Phase 2, calling */
@@ -2693,6 +2709,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         {
             /* 11.2.1.1.3: our reversal 40 ms after theirs. */
             p2_reverse(v, (long long) rev + MS(40), 10, false);
+            v->rev_cand = -1.0;
             stage_enter(v, ST_C2_REV2, 2.1);
             DM_DEBUG("v34", "tone A reversed; reversing B (tag=%s)", v->tag);
         }
@@ -2708,8 +2725,27 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             stage_enter(v, ST_C2_INFO0, 10.0);
             break;
         }
+        /* 11.2.1.2.5: the answerer's second reversal is followed, 10 ms
+         * later, by L1 - which has no 2400 Hz in it, so tone A goes. A
+         * reversal with tone A still there 50 ms on was something else: a
+         * MICA has been heard to reverse A several times over when our last
+         * INFO0c was still reaching it, taking its DPSK for tone B's
+         * reversal, and timing the round trip from one of those put the
+         * probing window in the wrong place. We send nothing at this
+         * reversal, so there is time to look. */
         if (reversed && rev > (double) v->rev_sent)
+            v->rev_cand = rev;
+        if (v->rev_cand >= 0.0 && (double) n >= v->rev_cand + MS(50))
         {
+            rev = v->rev_cand;
+            v->rev_cand = -1.0;
+            if (tone)
+            {
+                DM_DEBUG("v34", "tone A reversed %.1f ms after ours but went on, so that was not the reversal before "
+                                "L1; still waiting (tag=%s)",
+                         (rev - (double) v->rev_sent) / 8.0, v->tag);
+                break;
+            }
             /* 11.2.1.1.4 */
             v->rtd = (long long) (rev - (double) v->rev_sent) - MS(40);
             if (v->rtd < 0)
@@ -2951,6 +2987,8 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             return;
         }
         case ST_V8_DONE:
+            /* Only if dm_v34_tx never got there itself. */
+            v->p2_due = -1;
             v->txm = TXM_SILENCE;
             begin_phase2(v);
             return;
@@ -2989,6 +3027,11 @@ int dm_v34_tx(dm_v34_t *v, int16_t *amp, int len)
         switch (v->txm)
         {
         case TXM_SILENCE:
+            if (v->p2_due >= 0 && v->ntx >= v->p2_due)
+            {
+                v->p2_due = -1;
+                begin_phase2(v);
+            }
             break;
         case TXM_V8:
         {
@@ -3004,6 +3047,19 @@ int dm_v34_tx(dm_v34_t *v, int16_t *amp, int len)
                 fsk_tx(v->fsk_tx, &s, 1);
             }
             x = s;
+            /* The end of V.8, timed here in transmit time and not by the
+             * stage machine: that runs on receive time, a frame behind, and
+             * used to cut CJ off before its last stop bit, which left the
+             * far end without a third octet and still sending JM. A few bits
+             * of mark after CJ, then 75 ms of silence (11.1.1.1, 11.1.2.2). */
+            if (v->v8_quiet || (v->v8_done_at >= 0 && v->ntx >= v->v8_done_at + MS(10)))
+            {
+                v->v8_quiet = false;
+                v->v8_done_at = -1;
+                v->txm = TXM_SILENCE;
+                v->p2_due = v->ntx + MS(75);
+                x = 0.0f;
+            }
             break;
         }
         case TXM_P2:
@@ -3166,6 +3222,7 @@ dm_v34_t *dm_v34_create(const dm_v34_params_t *p)
 
     if (v == NULL)
         return NULL;
+    v->v8_done_at = v->p2_due = -1;
     v->calling = p->calling;
     snprintf(v->tag, sizeof(v->tag), "%s", p->tag ? p->tag : (p->calling ? "out" : "in"));
     if (!v34_ec_init(&v->ec, v->tag))

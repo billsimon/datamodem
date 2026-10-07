@@ -292,6 +292,7 @@ struct dm_modem
     int v42bis_dict;
     int v42bis_max_string;
     bool lapm_up;
+    bool lapm_lost;            /* LAPM was up and has closed: the call is ending */
     bool rx_busy;              /* LAPM told the far end to wait: our receive queue is full */
     bool v42_fell_back;        /* gave up on V.42 and went back to raw async */
     int v42_timeout_s;
@@ -872,9 +873,13 @@ static heard_t listen_block(dm_listen_t *l)
 
     /* Between 2190 and 2275 Hz is either Bell 103's answering mark, a pure
      * tone at 2225, or V.22's unscrambled ones: 600 baud of the same phase
-     * step, which is most of its power at 2250 and a fourteenth of it 600 Hz
-     * higher. The second line is what tells them apart; the frequency
-     * agrees. */
+     * step, which is most of its power at 2250 and, from some modems, a
+     * fourteenth of it 600 Hz higher. That second line settles it when it
+     * is there - but it is only the pulse shaping's imperfection, and a
+     * well-filtered modem's USB1 is a pure 2250 Hz tone (one answering for
+     * Diamond Mine was, and went unanswered for two seconds). Without the
+     * line, the frequency decides: a tone this long is found to within a
+     * few hertz, and the two are 25 Hz apart. */
     a = own_between(l, 2005.0f, 2275.0f) ? 0.0f : tone_peak(x, n, 2190.0f, 2275.0f, &at);
     if (a >= DM_LISTEN_SHARE * whole)
     {
@@ -882,8 +887,13 @@ static heard_t listen_block(dm_listen_t *l)
 
         if (at >= 2235.0f && at <= 2265.0f && side >= 0.02f * a)
             return HEARD_USB1;
-        if (at <= 2245.0f && side < 0.01f * a)
-            return HEARD_BELL_ANS;
+        if (side < 0.01f * a)
+        {
+            if (at <= 2235.0f)
+                return HEARD_BELL_ANS;
+            if (at >= 2240.0f && at <= 2265.0f)
+                return HEARD_USB1;
+        }
         return HEARD_NONE;
     }
     /* Bell 103 carrying data, its power spread around 2025 and 2225 Hz. */
@@ -1384,7 +1394,7 @@ static const char *protocol_name(const dm_modem_t *m)
 {
     if (m->v42 == NULL || m->v42_fell_back)
         return "async";
-    if (!m->lapm_up)
+    if (!m->lapm_up && !m->lapm_lost)
         return "negotiating";
     if (m->v42bis == NULL || (!m->comp_tx && !m->comp_rx))
         return "V.42";
@@ -1689,9 +1699,24 @@ static void v42_status(void *user, int status)
          * what it is, and fall back at once. */
         if (m->lapm_up)
         {
+            const char *why = "";
+
+#if defined(DATAMODEM_VENDORED_V42)
+            why = dm_v42_disconnect_cause;
+#endif
             m->lapm_up = false;
+            m->lapm_lost = true;
             m->rx_busy = false;
-            DM_WARN("modem", "the far end closed the error-corrected link (tag=%s)", m->tag);
+            /* A far end that has been running LAPM goes on running it, so
+             * falling back to async now would only put its flags on the
+             * screen as ~?~?~?. A real modem says NO CARRIER here; so do we. */
+            m->carrier_lost = true;
+            m->phase = DM_PHASE_DOWN;
+            if (why != NULL && strcmp(why, "the far end sent DISC") == 0)
+                DM_INFO("modem", "the far end closed the error-corrected link; hanging up (tag=%s)", m->tag);
+            else
+                DM_ERROR("modem", "the error-corrected link was lost%s%s, so the call is no use (tag=%s)",
+                         (why != NULL && why[0] != '\0') ? " - " : "", (why != NULL) ? why : "", m->tag);
         }
         else if (!m->v42_peer_declined && !m->v42_fell_back)
         {

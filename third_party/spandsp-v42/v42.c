@@ -838,6 +838,7 @@ static void t401_expired(v42_state_t *ss)
             report_rx_status_change(ss, SIG_STATUS_LINK_DISCONNECTED);
             break;
         case LAPM_DATA:
+            dm_cause("the far end stopped answering our polls");
             lapm_disconnect(ss);
             break;
         }
