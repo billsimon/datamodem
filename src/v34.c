@@ -362,6 +362,7 @@ struct dm_v34
     bool have_mp, far_ack, far_e;
     long long rtd;            /* samples; -1 until measured */
     long long rev_sent;       /* line time of our reversal */
+    double rev_cand;          /* a reversal not yet known to be followed by L1, -1 if none */
     int sr_tx, sr_rx;
     bool high_tx, high_rx;
     int pe_tx;                /* the filter the far end chose for us */
@@ -2708,6 +2709,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         {
             /* 11.2.1.1.3: our reversal 40 ms after theirs. */
             p2_reverse(v, (long long) rev + MS(40), 10, false);
+            v->rev_cand = -1.0;
             stage_enter(v, ST_C2_REV2, 2.1);
             DM_DEBUG("v34", "tone A reversed; reversing B (tag=%s)", v->tag);
         }
@@ -2723,8 +2725,27 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             stage_enter(v, ST_C2_INFO0, 10.0);
             break;
         }
+        /* 11.2.1.2.5: the answerer's second reversal is followed, 10 ms
+         * later, by L1 - which has no 2400 Hz in it, so tone A goes. A
+         * reversal with tone A still there 50 ms on was something else: a
+         * MICA has been heard to reverse A several times over when our last
+         * INFO0c was still reaching it, taking its DPSK for tone B's
+         * reversal, and timing the round trip from one of those put the
+         * probing window in the wrong place. We send nothing at this
+         * reversal, so there is time to look. */
         if (reversed && rev > (double) v->rev_sent)
+            v->rev_cand = rev;
+        if (v->rev_cand >= 0.0 && (double) n >= v->rev_cand + MS(50))
         {
+            rev = v->rev_cand;
+            v->rev_cand = -1.0;
+            if (tone)
+            {
+                DM_DEBUG("v34", "tone A reversed %.1f ms after ours but went on, so that was not the reversal before "
+                                "L1; still waiting (tag=%s)",
+                         (rev - (double) v->rev_sent) / 8.0, v->tag);
+                break;
+            }
             /* 11.2.1.1.4 */
             v->rtd = (long long) (rev - (double) v->rev_sent) - MS(40);
             if (v->rtd < 0)
