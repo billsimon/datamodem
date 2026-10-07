@@ -66,6 +66,7 @@ typedef struct
     char codec[16];                /* pcmu | pcma */
     int jitter_buffer_ms;
     bool user_phone;               /* append ;user=phone to the request URI */
+    bool speaker;                  /* play the line until carrier, like ATM1 */
 
     /* Modem */
     char modulation[16];           /* v34 | v32bis | v32 | v22bis | v22 | v21 | bell103 | v23: the

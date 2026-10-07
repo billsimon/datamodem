@@ -80,6 +80,16 @@ datamodem 5551234 --server sip.example.com --username 1001 \
 echo -e 'help\r' | datamodem 5551234 --server sip.example.com --username 1001
 ```
 
+`--speaker` plays the call through the computer's default sound device from
+the moment the far end starts ringing until the modems have trained, and then
+goes quiet, the way a modem's speaker does at its usual setting (ATM1). You
+hear the ringing, then both modems: the answer tone, the handshake, and the
+training. Ringing that the network sends as early media (a 183) plays as it
+is. A plain 180 carries no audio, so datamodem makes the North American
+ringing tone itself. It is off by default. The speaker runs on its own clock alongside the call's audio, so
+turning it on and off leaves the samples the modem sees unchanged. Only the
+playback side of the device is opened; the microphone never is.
+
 ### The screen
 
 Run from a terminal, datamodem works the way a 1990s terminal program did.

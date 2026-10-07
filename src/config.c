@@ -72,6 +72,9 @@ static const opt_def_t OPTS[] = {
     INT_OPT("jitter-buffer-ms", jitter_buffer_ms, 0, 500,
             "fixed jitter buffer size (default 150); smaller starves the modem on a real path"),
     BOOL_OPT("user-phone", user_phone, "append ;user=phone to the request URI"),
+    BOOL_OPT("speaker", speaker,
+             "play the line through the default sound device while the far end rings and the "
+             "modems train, stopping at carrier like a modem's speaker (ATM1) (default off)"),
 
     /* Modem */
     STR_OPT("modulation", modulation,
@@ -757,12 +760,13 @@ void dm_config_log(const dm_config_t *cfg)
              cfg->local_port);
     DM_DEBUG("config",
              "modulation=%s step_down=%s bit_rate=%d guard=%s format=%d%c%d v14=%s codec=%s "
-             "jitter_buffer_ms=%d",
+             "jitter_buffer_ms=%d speaker=%s",
              cfg->modulation, cfg->step_down ? "on" : "off", cfg->bit_rate, cfg->guard_tone, cfg->data_bits,
              cfg->parity[0] == 'e' || cfg->parity[0] == 'E'
                  ? 'E'
                  : (cfg->parity[0] == 'o' || cfg->parity[0] == 'O' ? 'O' : 'N'),
-             cfg->stop_bits, cfg->v14 ? "on" : "off", cfg->codec, cfg->jitter_buffer_ms);
+             cfg->stop_bits, cfg->v14 ? "on" : "off", cfg->codec, cfg->jitter_buffer_ms,
+             cfg->speaker ? "on" : "off");
     DM_DEBUG("config", "v42=%s v42_timeout=%d v42bis=%s dict=%d max_string=%d", cfg->v42,
              cfg->v42_timeout_s, cfg->v42bis ? "on" : "off", cfg->v42bis_dict, cfg->v42bis_max_string);
     DM_DEBUG("config", "escape_char=%d escape_guard_ms=%d escape_key=%d idle_timeout=%d media_timeout=%d "

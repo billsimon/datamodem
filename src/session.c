@@ -1116,6 +1116,10 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
             s.have_quality = true;
         update_screen(&s, &st);
 
+        /* The speaker plays the training and stops at carrier, as ATM1. */
+        if (st.connected)
+            dm_sip_speaker_off();
+
         /* Wait for a usable link rather than merely a carrier: with V.42
          * asked for there is a handshake still to run, and announcing
          * CONNECT before it finishes would invite the user to type into a

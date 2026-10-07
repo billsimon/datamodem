@@ -34,6 +34,12 @@ int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem, volat
  * cfg->answer_timeout_s (0 = forever) or until *stop becomes non-zero. */
 int dm_sip_answer(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomic_t *stop);
 
+/* With --speaker, the line plays through the default sound device from the
+ * moment the far end rings, or dm_sip_answer() takes a call. This silences
+ * it - the session calls it once the modems have trained, and hanging up
+ * does too. Does nothing when the speaker is already off. */
+void dm_sip_speaker_off(void);
+
 /* True once the far end has cleared, or the stack has torn the call down. */
 bool dm_sip_call_ended(void);
 

@@ -10,6 +10,10 @@
 
 #include <pjsua-lib/pjsua.h>
 
+#ifdef __APPLE__
+#include <CoreAudio/CoreAudio.h>
+#endif
+
 #define DM_CLOCK_RATE 8000
 #define DM_PTIME_MS 20
 #define DM_HANGUP_GRACE_MS 3000
@@ -33,6 +37,7 @@ typedef struct
     pjsua_conf_port_id slot;
     bool media_active;
     bool answered;            /* the far end picked up; ringback is over */
+    int64_t ringing_ms;       /* outbound: when a 180 or 183 came, 0 before */
     bool disconnected;
     bool inbound;
     int last_status;
@@ -67,7 +72,14 @@ static struct
     bool inbound_enabled;
     dm_modem_t *pending_modem; /* handed to the next inbound call */
     dm_call_t *active;         /* one call at a time */
-} g = {.acc_id = PJSUA_INVALID_ID, .lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
+    pjsua_ext_snd_dev *speaker;        /* --speaker while it plays; main thread only */
+    pjsua_conf_port_id speaker_slot;   /* its bridge slot, for on_call_media_state */
+    pj_pool_t *ringback_pool;          /* the speaker's ringing tone; main thread only */
+    pjmedia_port *ringback;
+    pjsua_conf_port_id ringback_slot;
+    bool ringback_on;
+} g = {.acc_id = PJSUA_INVALID_ID, .speaker_slot = PJSUA_INVALID_ID,
+     .ringback_slot = PJSUA_INVALID_ID, .lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -113,12 +125,13 @@ typedef struct
     bool media_active;
     bool answered;
     bool disconnected;
+    int64_t ringing_ms;
     pjsua_call_id call_id;
 } call_view_t;
 
 static call_view_t call_view(void)
 {
-    call_view_t v = { false, false, false, false, PJSUA_INVALID_ID };
+    call_view_t v = { false, false, false, false, 0, PJSUA_INVALID_ID };
 
     pthread_mutex_lock(&g.lock);
     if (g.active != NULL)
@@ -126,6 +139,7 @@ static call_view_t call_view(void)
         v.exists = true;
         v.media_active = g.active->media_active;
         v.answered = g.active->answered;
+        v.ringing_ms = g.active->ringing_ms;
         v.disconnected = g.active->disconnected;
         v.call_id = g.active->call_id;
     }
@@ -155,6 +169,13 @@ static void log_pj_error(const char *what, pj_status_t status)
     char buf[PJ_ERR_MSG_SIZE];
     pj_strerror(status, buf, sizeof(buf));
     DM_ERROR("sip", "%s failed: %s (%d)", what, buf, (int) status);
+}
+
+static void log_pj_warning(const char *what, pj_status_t status)
+{
+    char buf[PJ_ERR_MSG_SIZE];
+    pj_strerror(status, buf, sizeof(buf));
+    DM_WARN("sip", "%s failed: %s (%d)", what, buf, (int) status);
 }
 
 /* ------------------------------------------------------------ media port  */
@@ -283,6 +304,211 @@ static void call_destroy(dm_call_t *c)
     free(c);
 }
 
+/* ---------------------------------------------------------------- speaker */
+
+/* --speaker: the line, both directions, through the default sound device
+ * from the moment the far end rings until the modems have trained - a
+ * modem's speaker at ATM1. It is pjsua's extra sound device, not the bridge's own:
+ * the bridge, and so the modem, keeps the null device's steady clock, and
+ * pjsua bridges the sound card's clock to it, so turning the speaker on and
+ * off does nothing to the samples the modem sees. Playback only, so no
+ * microphone is opened. A machine without a sound device just stays quiet. */
+
+/* The system's default output, as pjmedia numbers it. Not
+ * PJMEDIA_AUD_DEFAULT_PLAYBACK_DEV: pjmedia resolves that to the first
+ * device that can both record and play whenever there is one - on a Mac
+ * with Teams installed, Teams's virtual device, which nobody hears. So ask
+ * the system, and find its device by name; elsewhere, or if that fails, the
+ * first device that plays, which is where pjmedia's Core Audio and ALSA
+ * backends list the default. */
+static pjmedia_aud_dev_index default_output_device(pjmedia_aud_dev_info *info)
+{
+    char want[sizeof(info->name)] = "";
+    pjmedia_aud_dev_index first = PJMEDIA_AUD_INVALID_DEV;
+    pjmedia_aud_dev_info di;
+    unsigned count = pjmedia_aud_dev_count();
+    unsigned i;
+
+#ifdef __APPLE__
+    {
+        AudioObjectPropertyAddress addr = {kAudioHardwarePropertyDefaultOutputDevice,
+                                           kAudioObjectPropertyScopeGlobal, 0};
+        AudioDeviceID dev;
+        UInt32 size = sizeof(dev);
+
+        if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, &dev) == noErr)
+        {
+            /* The same property pjmedia names its devices by. */
+            addr.mSelector = kAudioDevicePropertyDeviceName;
+            size = sizeof(want) - 1;
+            if (AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, want) != noErr)
+                want[0] = '\0';
+        }
+    }
+#endif
+
+    for (i = 0; i < count; i++)
+    {
+        if (pjmedia_aud_dev_get_info((pjmedia_aud_dev_index) i, &di) != PJ_SUCCESS || di.output_count == 0)
+            continue;
+        if (want[0] != '\0' && strcmp(di.name, want) == 0)
+        {
+            *info = di;
+            return (pjmedia_aud_dev_index) i;
+        }
+        if (first == PJMEDIA_AUD_INVALID_DEV)
+        {
+            first = (pjmedia_aud_dev_index) i;
+            *info = di;
+        }
+    }
+    return first;
+}
+
+static void speaker_on(void)
+{
+    pjmedia_snd_port_param prm;
+    pjmedia_aud_dev_info dev_info;
+    pjmedia_aud_dev_index dev;
+    pjsua_ext_snd_dev *spk;
+    pjsua_conf_port_id spk_slot;
+    pjsua_conf_port_id modem_slot = PJSUA_INVALID_ID;
+    pjsua_call_info ci;
+    call_view_t v = call_view();
+    pj_status_t status;
+
+    if (!g.cfg.speaker || g.speaker != NULL || !v.exists || v.call_id == PJSUA_INVALID_ID)
+        return;
+
+    dev = default_output_device(&dev_info);
+    if (dev == PJMEDIA_AUD_INVALID_DEV)
+    {
+        DM_WARN("sip", "speaker: there is no sound device to play through");
+        return;
+    }
+    pjmedia_snd_port_param_default(&prm);
+    status = pjmedia_aud_dev_default_param(dev, &prm.base);
+    if (status != PJ_SUCCESS)
+    {
+        log_pj_warning("speaker: reading the sound device's settings", status);
+        return;
+    }
+    prm.base.dir = PJMEDIA_DIR_PLAYBACK;
+    prm.base.play_id = dev;
+    prm.base.rec_id = PJMEDIA_AUD_INVALID_DEV;
+    prm.base.clock_rate = DM_CLOCK_RATE;
+    prm.base.channel_count = 1;
+    prm.base.samples_per_frame = DM_CLOCK_RATE * DM_PTIME_MS / 1000;
+    prm.base.bits_per_sample = 16;
+    status = pjsua_ext_snd_dev_create(&prm, &spk);
+    if (status != PJ_SUCCESS)
+    {
+        log_pj_warning("speaker: opening the sound device", status);
+        return;
+    }
+    spk_slot = pjsua_ext_snd_dev_get_conf_port(spk);
+
+    pthread_mutex_lock(&g.lock);
+    if (g.active != NULL)
+        modem_slot = g.active->slot;
+    g.speaker_slot = spk_slot;
+    pthread_mutex_unlock(&g.lock);
+    g.speaker = spk;
+
+    /* What the far end sends, and what our modem sends: the bridge mixes
+     * the two, as a line would. */
+    if (pjsua_call_get_info(v.call_id, &ci) == PJ_SUCCESS && ci.conf_slot != PJSUA_INVALID_ID)
+        pjsua_conf_connect(ci.conf_slot, spk_slot);
+    if (modem_slot != PJSUA_INVALID_ID)
+        pjsua_conf_connect(modem_slot, spk_slot);
+    DM_INFO("sip", "speaker on until the modems train: %s", dev_info.name);
+}
+
+/* Ringing the far end. A 183 brings the network's own ringback as early
+ * media, and that plays as it is; a bare 180 brings no audio at all, and
+ * then the speaker makes the ringing itself, as a phone would: the North
+ * American tone, 440 + 480 Hz, two seconds on and four off, at about the
+ * level it has on a line. */
+static void ringback(bool on)
+{
+    if (g.speaker == NULL || on == g.ringback_on)
+        return;
+
+    if (on && g.ringback == NULL)
+    {
+        pjmedia_tone_desc tone;
+        pj_status_t status;
+
+        g.ringback_pool = pjsua_pool_create("ringback", 512, 512);
+        if (g.ringback_pool == NULL)
+            return;
+        status = pjmedia_tonegen_create(g.ringback_pool, DM_CLOCK_RATE, 1, DM_CLOCK_RATE * DM_PTIME_MS / 1000,
+                                        16, 0, &g.ringback);
+        if (status == PJ_SUCCESS)
+        {
+            pj_bzero(&tone, sizeof(tone));
+            tone.freq1 = 440;
+            tone.freq2 = 480;
+            tone.on_msec = 2000;
+            tone.off_msec = 4000;
+            tone.volume = 2500; /* -19 dBm0 each */
+            status = pjmedia_tonegen_play(g.ringback, 1, &tone, PJMEDIA_TONEGEN_LOOP);
+        }
+        if (status == PJ_SUCCESS)
+            status = pjsua_conf_add_port(g.ringback_pool, g.ringback, &g.ringback_slot);
+        if (status != PJ_SUCCESS)
+        {
+            log_pj_warning("speaker: making the ringing tone", status);
+            if (g.ringback != NULL)
+                pjmedia_port_destroy(g.ringback);
+            g.ringback = NULL;
+            g.ringback_slot = PJSUA_INVALID_ID;
+            pj_pool_release(g.ringback_pool);
+            g.ringback_pool = NULL;
+            return;
+        }
+    }
+    if (g.ringback == NULL)
+        return;
+
+    if (on)
+    {
+        /* From the top of the cadence, not wherever it last stopped. */
+        pjmedia_tonegen_rewind(g.ringback);
+        pjsua_conf_connect(g.ringback_slot, g.speaker_slot);
+    }
+    else
+    {
+        pjsua_conf_disconnect(g.ringback_slot, g.speaker_slot);
+    }
+    g.ringback_on = on;
+    DM_DEBUG("sip", "speaker: ringing tone %s", on ? "on" : "off");
+}
+
+void dm_sip_speaker_off(void)
+{
+    pjsua_ext_snd_dev *spk = g.speaker;
+
+    if (spk == NULL)
+        return;
+    ringback(false);
+    if (g.ringback != NULL)
+    {
+        pjsua_conf_remove_port(g.ringback_slot);
+        pjmedia_port_destroy(g.ringback);
+        pj_pool_release(g.ringback_pool);
+        g.ringback = NULL;
+        g.ringback_pool = NULL;
+        g.ringback_slot = PJSUA_INVALID_ID;
+    }
+    pthread_mutex_lock(&g.lock);
+    g.speaker_slot = PJSUA_INVALID_ID;
+    pthread_mutex_unlock(&g.lock);
+    g.speaker = NULL;
+    pjsua_ext_snd_dev_destroy(spk);
+    DM_INFO("sip", "speaker off");
+}
+
 /* -------------------------------------------------------------- callbacks */
 
 /* Let the modem start only once the call is genuinely up.
@@ -320,7 +546,11 @@ static void on_call_state(pjsua_call_id call_id, pjsip_event *e)
              ci.last_status_text.ptr);
 
     if (ci.state == PJSIP_INV_STATE_EARLY && !c->inbound && (ci.last_status == 180 || ci.last_status == 183))
+    {
         dm_term_state("RINGING", "%d %s", ci.last_status, c->last_reason);
+        if (c->ringing_ms == 0)
+            c->ringing_ms = dm_now_ms();
+    }
     else if (ci.state == PJSIP_INV_STATE_CONFIRMED && !c->inbound)
         dm_term_state("ANSWERED", "starting the modem");
     else if (ci.state == PJSIP_INV_STATE_DISCONNECTED)
@@ -343,6 +573,7 @@ static void on_call_media_state(pjsua_call_id call_id)
     dm_call_t *c;
     pjsua_call_info ci;
     pjsua_conf_port_id slot;
+    pjsua_conf_port_id speaker_slot;
 
     if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS)
         return;
@@ -355,11 +586,15 @@ static void on_call_media_state(pjsua_call_id call_id)
         if (c == NULL)
             return;
         slot = c->slot;
+        speaker_slot = g.speaker_slot;
         call_unlock();
 
         /* Not under the lock: see the comment on g. */
         pjsua_conf_connect(ci.conf_slot, slot);
         pjsua_conf_connect(slot, ci.conf_slot);
+        /* A re-INVITE can give the call a new slot while the speaker plays. */
+        if (speaker_slot != PJSUA_INVALID_ID)
+            pjsua_conf_connect(ci.conf_slot, speaker_slot);
 
         c = call_lock(call_id);
         if (c == NULL)
@@ -886,6 +1121,7 @@ void dm_sip_stop(void)
 
     if (!g.started)
         return;
+    dm_sip_speaker_off();
     pthread_mutex_lock(&g.lock);
     c = g.active;
     g.active = NULL;
@@ -1027,7 +1263,23 @@ int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem, volat
         call_view_t v = call_view();
 
         if (v.media_active && v.answered)
+        {
+            speaker_on();
+            ringback(false);
             return DM_EXIT_OK;
+        }
+        if (v.ringing_ms != 0 && !v.disconnected)
+        {
+            /* Early media is the far end's own ringing; without it, ours.
+             * pjsua reports a 183 a moment before the media that came with
+             * it, so give that a moment to show up before deciding there is
+             * none - or the speaker chirps ringing tone over the top of it. */
+            speaker_on();
+            if (v.media_active || v.answered)
+                ringback(false);
+            else if (dm_now_ms() - v.ringing_ms >= 250)
+                ringback(true);
+        }
         if (v.disconnected)
         {
             int status_code;
@@ -1118,7 +1370,10 @@ int dm_sip_answer(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomic
         pthread_mutex_unlock(&g.lock);
 
         if (up)
+        {
+            speaker_on();
             return DM_EXIT_OK;
+        }
         if (gone != NULL)
         {
             DM_ERROR("answer", "the caller hung up before media came up (%d %s)", status_code, reason);
@@ -1222,6 +1477,7 @@ void dm_sip_hangup(dm_call_result_t *result)
     call_view_t v = call_view();
     dm_call_t *c;
 
+    dm_sip_speaker_off();
     if (result != NULL)
         memset(result, 0, sizeof(*result));
     if (!v.exists)
