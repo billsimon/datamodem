@@ -47,7 +47,9 @@ typedef enum
 typedef struct
 {
     bool calling;              /* true when we placed the call (originate) */
-    const char *modulation;    /* v34 | v32bis | v32 | v22bis | v22 | v21 | bell103 | v23 */
+    const char *modulation;    /* v34 | v32bis | v32 | v22bis | v22 | v21 | bell103 | v23: with
+                                * step_down, the fastest to try */
+    bool step_down;            /* fall back to slower modulations, down to bell103 */
     int bit_rate;              /* V.34 2400 .. 33600 in steps of 2400 (a ceiling),
                                 * V.32bis 14400 | 12000 | 9600 | 7200 | 4800, V.32 9600 | 4800,
                                 * V.22bis 2400 | 1200; 0 = the most it can do */
@@ -74,7 +76,7 @@ typedef struct
 {
     dm_modem_phase_t phase;
     const char *phase_text;
-    const char *modulation;    /* what we actually ran */
+    const char *modulation;    /* what we are running: after a step down, not what we started with */
     int bit_rate;              /* negotiated rate once trained, else the offered one; V.34: receive */
     int tx_bit_rate;           /* V.34 only: what we transmit at, which may differ */
     int symbol_rate;           /* V.34 only: the far end's symbol rate, and ours */

@@ -21,7 +21,8 @@
  * end's requests and making its own when reception degrades. A V.32 bis
  * modem works to V.32's rules with a far end that is only V.32, as the
  * Recommendation requires. Not implemented: 2400 bit/s, which V.32 leaves for
- * further study, and the Annex A automode fallback to V.22bis. */
+ * further study. Annex A's automode fallback to V.22bis is modem.c's
+ * business, as the other steps down are. */
 #ifndef DATAMODEM_V32_H
 #define DATAMODEM_V32_H
 
@@ -97,6 +98,11 @@ void dm_v32_rx_fillin(dm_v32_t *v, int len);
  * (5.1, and 5.4 Note 1). dm_v32_started() says which has happened. */
 void dm_v32_start(dm_v32_t *v);
 bool dm_v32_started(const dm_v32_t *v);
+
+/* The far end has answered in V.32's terms - AC heard by a calling modem, AA
+ * by an answering one - so it is a V.32 modem and the handshake is under
+ * way. Until then it may be something else altogether. */
+bool dm_v32_engaged(const dm_v32_t *v);
 
 int dm_v32_bit_rate(const dm_v32_t *v);
 

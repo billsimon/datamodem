@@ -61,9 +61,9 @@ of them; `examples/datamodem.conf` is a commented starting point.
 export DATAMODEM_PASSWORD=...
 datamodem +15551234567 --server sip.example.com --username 1001
 
-# up to 33600 bps, where the far end is a V.34 (or V.90...) modem; the two
-# probe the line and settle the rate in each direction between them
-datamodem 5551234 --server sip.example.com --username 1001 --modulation v34 --v42 detect
+# the defaults: V.34 up to 33600 bps, stepping down to whatever the far end
+# is, with V.42 and V.42bis if the far end does them and plain async if not
+datamodem 5551234 --server sip.example.com --username 1001
 
 # 14400 bps, where the far end is a V.32bis (or V.34, V.90...) modem; a far
 # end that only does V.32 gets 9600
@@ -192,8 +192,7 @@ sent `SIGHUP` - to its whole process group, as a dropped carrier would - and
 `SIGKILL` five seconds later if it is still there.
 
 ```
-datamodem answer --calls 0 --modulation v32bis --v42 detect --v42bis \
-    --exec 'x84-modem-bridge --port 6510'
+datamodem answer --calls 0 --exec 'x84-modem-bridge --port 6510'
 ```
 
 The command's environment says what is known about the call, under the
@@ -235,13 +234,13 @@ the call is cleared as soon as everything is sent.
 ## What it can actually do
 | `--modulation` | Standard | Rate | Calling end transmits | Answering end transmits |
 |---|---|---|---|---|
-| `v34` | ITU-T V.34 | 33600 down to 2400, in steps of 2400, each direction its own | 2400 to 3429 symbols/s, carrier chosen by probing | the same band |
+| `v34` (default) | ITU-T V.34 | 33600 down to 2400, in steps of 2400, each direction its own | 2400 to 3429 symbols/s, carrier chosen by probing | the same band |
 | `v32bis` | ITU-T V.32bis | 14400, 12000, 9600, 7200 or 4800 | 1800 Hz carrier | 1800 Hz carrier, the same band |
 | `v32` | ITU-T V.32 | 9600 or 4800 | 1800 Hz carrier | 1800 Hz carrier, the same band |
 | `v22bis` | ITU-T V.22bis | 2400 or 1200 | 1200 Hz carrier | 2400 Hz carrier |
 | `v22` | ITU-T V.22 | 1200 | 1200 Hz carrier | 2400 Hz carrier |
 | `v23` | ITU-T V.23 | 1200 down, 75 up | 390/450 Hz | 1300/2100 Hz |
-| `v21` (default) | ITU-T V.21 | 300 full duplex | 980/1180 Hz | 1650/1850 Hz |
+| `v21` | ITU-T V.21 | 300 full duplex | 980/1180 Hz | 1650/1850 Hz |
 | `bell103` | Bell 103 | 300 full duplex | 1270/1070 Hz | 2225/2025 Hz |
 
 All eight carry data, verified byte-for-byte in both directions by `selftest`
@@ -265,14 +264,78 @@ to ten, depending on the round trip - and QAM is far less tolerant of a poor
 audio path than FSK is. If a trunk is doing anything at all to the audio,
 the 300 bps modes will survive it and the QAM ones will not.
 
-The default is still `v21`, because 300 bps will get through an audio path
-that nothing else will, and thirty characters a second is a perfectly usable
-interactive terminal — it is how everyone did this in 1982. Reach for
-`--modulation v34`, `v32bis`, `v32` or `v22bis` when you want the speed and
-the line is good; V.34 drops to V.32bis for a far end that does not answer
-V.8, and V.32bis and V.32 need the far end to be a V.32 modem or anything
-later (all of which fall back to it - V.32bis itself drops to V.32 for a far
-end that is only V.32), V.22bis is what nearly everything speaks.
+The default is `v34`, stepping down to whatever the far end turns out to be
+— see below. What stepping down does not do is notice a bad line: it follows
+the far end's capabilities, and V.34 copes with a poor line by choosing a
+lower rate within V.34. A path so bad that nothing faster than 300 bps will
+cross it needs `--modulation v21` (or `bell103`) by hand, and thirty
+characters a second is a perfectly usable interactive terminal — it is how
+everyone did this in 1982.
+
+### Stepping down
+
+A modem with its factory settings connects to whatever answers — or calls —
+at the fastest modulation the two have in common, and so does datamodem:
+
+    v34 → v32bis → v32 → v22bis → v22 → v21 → bell103
+
+V.32bis already trains with a far end that is only V.32 (at 9600), and
+V.22bis with one that is only V.22 (at 1200), so `v32` and `v22` are only
+ever where a `--modulation` starts. `--modulation` sets the fastest to try,
+and stepping down carries on from there; `--no-step-down` runs that one
+modulation and nothing else. `v23` is on no ladder and never steps down.
+`--bit-rate` still caps the rate of whatever ends up running, and one below
+anything the starting modulation can do starts lower instead: `--bit-rate
+1200` on its own is V.22bis at 1200.
+
+**Calling**, datamodem listens for what the answering modem sends before it
+has heard anything it recognises, and answers in kind:
+
+| It hears | Which means | So it runs |
+|---|---|---|
+| ANSam (2100 Hz, amplitude modulated) — decided after one second of the tone, from a clean 15 Hz sine about 20% deep on its envelope | V.8 | V.34, once the far end answers CM with JM |
+| a plain answer tone | no V.8: an older modem | V.32bis — AA once it has heard a second of the tone |
+| what sounded like ANSam, and then no JM | an older modem whose answer tone had some amplitude modulation on it by the time it arrived | V.32bis, silent until it hears AC — and on hearing USB1 or a V.21 carrier during V.8, stop CM and go to it |
+| AC (600 + 3000 Hz) | V.32 | V.32bis |
+| USB1, V.22's unscrambled ones | V.22bis or V.22 | V.22bis, at once — not after Annex A's Tc > 3.1 s, which a real 2400 bps modem, offering USB1 for three seconds and then V.21, outlasted (as Annex A's own Note 1 warns) |
+| 1650 Hz | V.21 channel 2 | V.21 |
+| 2225 Hz | Bell 103's answering carrier | Bell 103 |
+
+**Answering**, it has to offer, because a V.22bis, V.21 or Bell 103 caller
+says nothing until it hears its own kind of answering signal. With V.34 at
+the top it sends ANSam and listens for V.8's CM; a caller that does not
+answer with one gets each of these for three seconds in turn, round and
+round until `--train-timeout`, and the first to be answered is kept:
+
+1. V.22bis's USB1, listening for S1 or SB1 (Annex A's Ta);
+2. V.32's AC, listening for AA (three seconds plus the round trip);
+3. V.21's channel 2 carrier, listening for channel 1;
+4. Bell 103's 2225 Hz, listening for 1270 Hz.
+
+A V.21 or Bell 103 caller is only taken once its carrier has been offered:
+a real one says nothing until then, and what is in its band before that is
+something else - V.8's CM, which is V.21 channel 1 too.
+
+A caller that sent V.32's AA during the answer tone — which an automode V.32
+caller does — goes straight to V.32bis, and so does one heard sending AA at
+any later point. At 300 bps it is the same: a V.21 or Bell 103 caller heard
+during any offer is answered in its own modulation at once.
+
+Telling these apart is done with Goertzel filters over 40 ms blocks, against
+the block's whole power less the echo of whatever this end is sending. The
+hard pair is Bell 103's 2225 Hz and USB1, which puts most of its power at
+2250 Hz: 40 ms makes those two bins orthogonal, and USB1's second line,
+600 Hz higher and a fourteenth of its power, settles it. V.21 and Bell 103
+carrying data — V.42's ODP, say — smear between their tones, and their
+calling bands interleave 90 Hz apart, so which one it is is decided over the
+whole run of blocks rather than one at a time.
+
+V.21 and Bell 103 now wait to hear the far end's tone before they connect, at
+either end, rather than taking any energy for a carrier — a V.32 caller's AA,
+or the far end's echo of our own, used to be enough. A calling FSK modem
+stays silent until it hears the answering carrier, as the real ones did, and
+then holds its own at mark for half a second plus the path before it passes
+data, so the answerer is listening when the first character arrives.
 
 ### The V.22bis situation, and why `third_party` exists
 
@@ -505,7 +568,7 @@ precoding, the Viterbi decoder), `src/v34_info.c` (INFO sequences, MP, V.8's
 CM/JM/CJ) and `src/v34_dsp.c` (the Phase 2 DPSK, probing and its analysis).
 
 ```
-datamodem 5551234 --server sip.example.com --username 1001 --modulation v34 --v42 detect
+datamodem 5551234 --server sip.example.com --username 1001 --modulation v34
 ```
 
 The start-up is four phases, each logged as it goes:
@@ -565,18 +628,26 @@ V.90 is a different machine again, and nothing here implements it.
 ## Error correction and compression
 
 V.42 (LAPM) and V.42bis are both implemented, on top of any modulation, and
-both are **off by default**:
+both are **on by default**, calling and answering, the way a modem with its
+factory settings had them (`&Q5`, `%C1`). Each falls back gracefully:
+
+- both ends do V.42 and V.42bis: `CONNECT ... V.42/V.42bis`;
+- the far end does V.42 but will not compress, or takes less of the
+  dictionary than offered: `CONNECT ... V.42`, or V.42bis on its terms;
+- the far end does not do V.42 at all: a direct async link, `CONNECT ...`.
 
 ```
-datamodem 5551234 --v42 detect             # error correction
-datamodem 5551234 --v42 detect --v42bis    # and compression
+datamodem 5551234                          # all of the above
+datamodem 5551234 --no-v42bis              # error correction, no compression
+datamodem 5551234 --v42 off                # direct async only, no handshake
+datamodem 5551234 --v42 require            # V.42 or nothing
 ```
 
 | `--v42` | |
 |---|---|
-| `off` (default) | direct async: start and stop bits, no error correction |
-| `detect` | run the V.42 handshake; fall back to direct async if the far end does not answer |
+| `detect` (default) | run the V.42 handshake; fall back to direct async if the far end does not answer |
 | `require` | run the handshake; give up on the call if the far end does not answer |
+| `off` | direct async: start and stop bits, no error correction |
 
 With V.42 running there are no start and stop bits on the line at all — the
 bit stream is HDLC frames, retransmitted until they arrive intact. `--data-bits`,
@@ -589,11 +660,14 @@ CONNECT 300 V.42             # error corrected
 CONNECT 300 V.42/V.42bis     # error corrected and compressed
 ```
 
-`--v42bis` requires `--v42`, and is refused without it. It is an offer: the
-far end may take less of it, or none - see below. Compression on an
-uncorrected link is worse than no compression: both ends build a shared
-dictionary as they go, so a single corrupted byte desynchronises them and
-everything after it is garbage rather than one bad character.
+`--v42bis` is an offer made inside V.42's XID exchange: the far end may take
+less of it, or none - see below. With `--v42 off`, or after a fall back to
+async, there is nothing to make it in and it does not run. That is as it
+should be: compression on an uncorrected link is worse than none, because
+both ends build a shared dictionary as they go, so a single corrupted byte
+desynchronises them and everything after it is garbage rather than one bad
+character. V.23 never runs V.42 (its 75 bps back channel cannot carry LAPM):
+`detect` runs it without, and `require` is refused.
 
 `ATI` reports what compression actually bought, per direction:
 
@@ -1051,9 +1125,18 @@ there is no way to ask, and the oldest data still goes, as it would on a
 real modem.
 
 **Detection traffic is real junk to a far end that is not listening for it.**
-The ODP pattern will show up as perhaps a hundred garbage characters before
-the fallback happens. Real modems had the same problem, and it is the reason
-`--v42` is off by default here rather than on.
+A calling modem's ODP pattern is DC1 characters - 0x11, and 0x91 with the
+parity bit - chosen so that an async host would take them for XON, and one
+that has never heard of V.42 sees a second or so of them (several seconds at
+300 bps, where the window is longest) before the fallback. Real modems did
+the same, which is why it is on by default anyway; `--v42 off` spares a host
+that chokes on it. An answering modem sends nothing during detection, so an
+async caller sees nothing at all.
+
+The switch itself is clean: once detection gives up, the ODP character under
+way is finished and the line held at mark - not the HDLC flags LAPM would
+idle with - and two characters of mark go out before the first async one, so
+the far end's framer is lined up for it.
 
 ### What it costs
 
@@ -1167,16 +1250,15 @@ on.
 ```
 
 The last three take flags for the link layer, so the same call can be driven
-over each of the three protocols:
+over each of the three protocols (V.42/V.42bis is the default):
 
 ```
-CALL_FLAGS="--v42 detect --v42bis" ANS_FLAGS="--v42 detect --v42bis" \
-    ./scripts/loopback-test.sh
+CALL_FLAGS="--no-v42bis" ./scripts/loopback-test.sh      # V.42 alone
 
-DM_FLAGS="--v42 detect --v42bis" ./scripts/pty-test.py
+DM_FLAGS="--v42 off" ./scripts/pty-test.py                # direct async
 
-# V.42 offered by the caller only: the fallback path
-CALL_FLAGS="--v42 detect --v42-timeout 8" \
+# an answering end with no V.42: the caller's fallback path
+ANS_FLAGS="--v42 off" \
     EXPECT_CALL="falling back to a direct async connection" \
     ./scripts/loopback-test.sh
 ```
@@ -1187,8 +1269,8 @@ needs no network and no credentials, and it is the fastest way to tell a
 modulation problem from a SIP problem. Try it on each modulation:
 
 ```
-for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do ./build/datamodem selftest --modulation $m; done
-for v in "" "--v42 detect" "--v42 detect --v42bis"; do
+for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do ./build/datamodem selftest --modulation $m --no-step-down; done
+for v in "--v42 off" "--no-v42bis" ""; do
     ./build/datamodem selftest $v
 done
 ```
@@ -1237,6 +1319,63 @@ DATAMODEM_V34_PRE_EMPHASIS=5       # 0 to 10
 DATAMODEM_V34_TRELLIS=64           # what our receiver asks for: 16, 32 or 64
 DATAMODEM_V34_SHAPING=1            # ask for expanded shaping
 DATAMODEM_V34_RENEGOTIATE=2:14400  # caller renegotiates down 2 s in; ":answer" for the answerer
+```
+
+Stepping down has a matrix too: a modem at its defaults calling and
+answering every older one, over three lines, with and without V.42; pairs
+that both step down from different places; and each of V.42's fall backs -
+a far end that will not compress, one with no V.42 at all - at each
+modulation. About 140 cases, a couple of minutes:
+
+```
+./scripts/step-down-test.sh
+```
+
+It is built on `DATAMODEM_SELFTEST_FAR`, which makes one end of the selftest
+an older modem — one modulation, no stepping down — or, with `:auto`, one
+that steps down from there too:
+
+```
+DATAMODEM_SELFTEST_FAR=answer:v22bis ./build/datamodem selftest          # V.34 calls a V.22bis modem
+DATAMODEM_SELFTEST_FAR=call:bell103 ./build/datamodem selftest           # a Bell 103 modem calls V.34
+DATAMODEM_SELFTEST_FAR=answer:v34:auto ./build/datamodem selftest --modulation v21
+```
+
+`DATAMODEM_RECORD=path` records a real call's audio from the moment it is
+answered, to `path.<tag>.wav`: stereo at 8 kHz, what we heard on the left and
+what we sent on the right. A log says what datamodem concluded; the
+recording says what the far end actually sent.
+
+```
+DATAMODEM_RECORD=/tmp/call ./build/datamodem 5551234 --log-level debug --log-file call.log
+```
+
+`DATAMODEM_REPLAY=call.wav` plays such a recording back: one calling modem,
+against the left channel, instead of two modems back to back. The far end
+cannot react to anything new, so past the first exchange the two drift
+apart, but everything up to it - which answer tone it was, when CM went out,
+what came after it, what we stepped down to - plays out exactly as it would
+have, with the time into the recording at which each happened:
+
+```
+DATAMODEM_REPLAY=/tmp/call.out.wav ./build/datamodem selftest
+```
+
+`scripts/replay-test.sh` replays every recording in `recordings/` (kept out
+of git) and checks each still links up - in the modulation its name starts
+with, as in `v22bis-2400-synchronet.wav`.
+
+A real 2400 bps modem's call, replayed like that, is how the ANSam decision
+came to be made after one second of tone rather than spandsp's two and a
+half: CM then starts at 3.5 s into the call instead of 5.0, with 2.6 s of
+the far end's ANSam left to hear it in rather than 1.1.
+
+And `DATAMODEM_SELFTEST_V42`, which changes one end's link layer:
+
+```
+DATAMODEM_SELFTEST_V42=answer:off ./build/datamodem selftest            # no V.42 there: async
+DATAMODEM_SELFTEST_V42=call:no-v42bis ./build/datamodem selftest        # V.42 without compression
+DATAMODEM_SELFTEST_V42=answer:require ./build/datamodem selftest
 ```
 
 A few more test hooks, none of them options:

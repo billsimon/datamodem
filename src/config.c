@@ -75,11 +75,15 @@ static const opt_def_t OPTS[] = {
 
     /* Modem */
     STR_OPT("modulation", modulation,
-            "v34 | v32bis | v32 | v22bis | v22 | v23 | v21 | bell103 (default v21; v34 is up to 33600 "
-            "bps, v32bis 14400, v32 9600, v22bis 2400)"),
+            "v34 | v32bis | v32 | v22bis | v22 | v23 | v21 | bell103: the fastest to try (default v34, "
+            "up to 33600 bps; v32bis 14400, v32 9600, v22bis 2400)"),
+    BOOL_OPT("step-down", step_down,
+             "fall back from --modulation to slower ones the far end turns out to want, down to v21 "
+             "and bell103 (default on; --no-step-down for that modulation only)"),
     INT_OPT("bit-rate", bit_rate, 0, 33600,
             "rate ceiling: a multiple of 2400 up to 33600 for v34, 14400, 12000, 9600, 7200 or 4800 for v32bis, 9600 or 4800 for v32, 2400 "
-            "or 1200 for v22bis (default 0, the most the modulation can do)"),
+            "or 1200 for v22bis (default 0, the most the modulation can do); stepping down, one below "
+            "what --modulation can do starts lower, as 1200 starts at v22bis"),
     STR_OPT("guard-tone", guard_tone,
             "none | 550 | 1800; the answering modem's guard tone (default none)"),
     INT_OPT("data-bits", data_bits, 5, 8, "character length (default 8)"),
@@ -103,10 +107,13 @@ static const opt_def_t OPTS[] = {
 
     /* Error correction and compression */
     STR_OPT("v42", v42,
-            "V.42 error correction: off (default) | detect (fall back to async) | require"),
+            "V.42 error correction: detect (default: use it if the far end does, else async) | "
+            "require | off"),
     INT_OPT("v42-timeout", v42_timeout_s, 2, 120,
             "seconds to keep trying to establish V.42 before falling back (default 10)"),
-    BOOL_OPT("v42bis", v42bis, "V.42bis compression; needs --v42"),
+    BOOL_OPT("v42bis", v42bis,
+             "offer V.42bis compression inside V.42 (default on); a far end that declines it gets "
+             "V.42 alone"),
     INT_OPT("v42bis-dict", v42bis_dict, 512, 4096,
             "most V.42bis dictionary to offer, in codewords (default 2048); the far end may take less"),
     INT_OPT("v42bis-max-string", v42bis_max_string, 6, 250,
@@ -162,12 +169,12 @@ void dm_config_defaults(dm_config_t *cfg)
     snprintf(cfg->realm, sizeof(cfg->realm), "%s", "*");
     snprintf(cfg->transport, sizeof(cfg->transport), "%s", "udp");
     snprintf(cfg->codec, sizeof(cfg->codec), "%s", "pcmu");
-    /* V.21 rather than the eight-times-faster V.22bis, because 300 bps FSK
-     * will get through an audio path that QAM will not, and a default should
-     * connect rather than be quick. --modulation v22bis when the line is
-     * good. (V.22bis was previously excluded because spandsp's was broken;
-     * it is not any more - see third_party/spandsp-v22bis.) */
-    snprintf(cfg->modulation, sizeof(cfg->modulation), "%s", "v21");
+    /* The fastest there is, stepping down to whatever the far end turns out
+     * to be - V.32 bis, V.22 bis, V.21 or Bell 103 - the way a modem with
+     * factory settings does. A path that will not carry V.34 is found out in
+     * training, and --modulation is how to start lower. */
+    snprintf(cfg->modulation, sizeof(cfg->modulation), "%s", "v34");
+    cfg->step_down = true;
     snprintf(cfg->guard_tone, sizeof(cfg->guard_tone), "%s", "none");
     snprintf(cfg->parity, sizeof(cfg->parity), "%s", "none");
 
@@ -192,11 +199,14 @@ void dm_config_defaults(dm_config_t *cfg)
     cfg->train_timeout_s = 45;
     cfg->max_retrains = 4;
 
-    /* Off by default. V.42's detection phase puts ODP patterns on the line,
-     * and spandsp keeps sending them forever against a far end that does not
-     * answer - so turning this on blind would spray junk at a plain async
-     * host for --v42-timeout seconds before falling back. */
-    snprintf(cfg->v42, sizeof(cfg->v42), "%s", "off");
+    /* What a modem with its factory settings does (&Q5, %C1): V.42 with
+     * V.42bis when the far end will, V.42 alone when it will not compress,
+     * and a direct async link when it does not do V.42 at all. The cost is
+     * the detection window at the start of a call to an async-only far end:
+     * ODP patterns on the line until our detection gives up on it, and
+     * whatever that far end says meanwhile held back and delivered after. */
+    snprintf(cfg->v42, sizeof(cfg->v42), "%s", "detect");
+    cfg->v42bis = true;
     cfg->v42_timeout_s = 10;
     /* What real modems shipped with, and three times better than the 512/6
      * that spandsp's own XID advertises. Since nothing is actually
@@ -746,8 +756,9 @@ void dm_config_log(const dm_config_t *cfg)
              cfg->password[0] ? "<set>" : "<unset>", cfg->do_register ? "yes" : "no", cfg->transport,
              cfg->local_port);
     DM_DEBUG("config",
-             "modulation=%s bit_rate=%d guard=%s format=%d%c%d v14=%s codec=%s jitter_buffer_ms=%d",
-             cfg->modulation, cfg->bit_rate, cfg->guard_tone, cfg->data_bits,
+             "modulation=%s step_down=%s bit_rate=%d guard=%s format=%d%c%d v14=%s codec=%s "
+             "jitter_buffer_ms=%d",
+             cfg->modulation, cfg->step_down ? "on" : "off", cfg->bit_rate, cfg->guard_tone, cfg->data_bits,
              cfg->parity[0] == 'e' || cfg->parity[0] == 'E'
                  ? 'E'
                  : (cfg->parity[0] == 'o' || cfg->parity[0] == 'O' ? 'O' : 'N'),
@@ -799,7 +810,7 @@ static void print_options(void)
 
 void dm_usage(void)
 {
-    printf("datamodem %s - a softmodem for data calls over SIP (V.21, Bell 103, V.23)\n\n",
+    printf("datamodem %s - a softmodem for data calls over SIP (V.34 down to Bell 103)\n\n",
            DATAMODEM_VERSION);
     printf("Usage:\n"
            "  datamodem <number> [options]      dial it and hand the terminal to the far modem\n"
@@ -816,26 +827,28 @@ void dm_usage(void)
            "  datamodem 5551234 --log-file dm.log  keeps the terminal clean\n\n");
     printf("Modulations: v34 (33600 down to 2400), v32bis (14400 down to 4800), v32\n"
            "(9600/4800), v22bis (2400), v22 (1200), v23 (1200 down / 75 up), v21 and\n"
-           "bell103 (300). The default is v21 because 300 bps FSK gets through an audio\n"
-           "path that QAM will not; use --modulation v34, v32bis, v32 or v22bis when the\n"
-           "line is good. v34 probes the line and picks its own rate in each direction,\n"
-           "and drops to v32bis for a far end that does not do V.8; v32bis also talks\n"
-           "to a far end that is only V.32, at 9600.\n\n");
-    printf("V.42 error correction and V.42bis compression are available on top of any of\n"
-           "them, and are off by default because the V.42 handshake puts junk on the line\n"
-           "when the far end does not answer it:\n"
-           "  --v42 detect     try V.42, fall back to direct async if nobody answers\n"
-           "  --v42 require    try V.42, give up on the call if nobody answers\n"
-           "  --v42bis         offer compression too (needs --v42); the far end may\n"
-           "                   decline it, or take less than --v42bis-dict and\n"
-           "                   --v42bis-max-string offer\n\n");
+           "bell103 (300). The default is v34, which probes the line and picks its own\n"
+           "rate in each direction - and steps down to whatever the far end turns out to\n"
+           "be: v32bis (which also talks to v32), v22bis (and v22), v21 or bell103.\n"
+           "Calling, it listens for what the answering modem sends; answering, it offers\n"
+           "each in turn until the caller replies, the way V.32bis Annex A does.\n"
+           "--modulation starts lower and still steps down from there; --no-step-down\n"
+           "runs that one modulation only. v23 never steps down.\n\n");
+    printf("V.42 error correction and V.42bis compression run on top of any of them, and\n"
+           "are on by default, calling and answering, as on a modem with factory settings:\n"
+           "V.42 with V.42bis when the far end does both, V.42 alone when it will not\n"
+           "compress, and a direct async link when it does not do V.42 at all.\n"
+           "  --v42 require    give up on the call rather than run without V.42\n"
+           "  --v42 off        direct async only, with no V.42 handshake at the start\n"
+           "  --no-v42bis      V.42 without offering compression\n"
+           "The far end may also take a smaller dictionary or shorter strings than\n"
+           "--v42bis-dict and --v42bis-max-string offer. V.23 never runs V.42.\n\n");
     printf("Examples:\n"
            "  export DATAMODEM_PASSWORD=...\n"
            "  datamodem +15551234567 --server sip.example.com --username 1001\n\n"
            "  datamodem 5551234 --server sip.example.com --username 1001 \\\n"
            "      --modulation bell103 --data-bits 7 --parity even\n\n"
-           "  datamodem 5551234 --server sip.example.com --username 1001 \\\n"
-           "      --v42 detect --v42bis\n\n"
+           "  datamodem 5551234 --server sip.example.com --username 1001 --v42 off\n\n"
            "  echo -e 'help\\r' | datamodem 5551234 --server sip.example.com --username 1001\n\n"
            "  datamodem answer --server sip.example.com --username 1001 --password ...\n\n"
            "  datamodem selftest --modulation v32bis\n\n");

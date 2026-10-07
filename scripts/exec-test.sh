@@ -80,7 +80,7 @@ for call in 1 2; do
     set -e
     took=$(( $(date +%s) - start ))
     cat -v "$WORK/dial$call.out"
-    for want in "caller=\[555012$call\]" "called=\[ans\]" "connect=\[300\]" "rate=\[300\]" \
+    for want in "caller=\[555012$call\]" "called=\[ans\]" "connect=\[300 V\.42/V\.42bis\]" "rate=\[300\]" \
                 "password=\[\]" "you said \[hello from call $call\]" "goodbye"; do
         LC_ALL=C grep -a -qE "$want" "$WORK/dial$call.out" || {
             echo "==> FAIL: call $call: expected /$want/" >&2; fail=1; }

@@ -26,10 +26,10 @@ So most of this directory is not a patch set. It is the smallest possible
 slice of a newer spandsp, taken because the version the platform ships
 predates the work that made V.22bis usable.
 
-## The one patch: come back at the rate we settled on
+## The first patch: come back at the rate we settled on
 
-`v22bis_rx.c` carries a single local change, marked `datamodem:` in the
-source. On carrier loss upstream does:
+`v22bis_rx.c` carries three local changes, marked `datamodem:` in the
+source; this is the first. On carrier loss upstream does:
 
 ```c
 v22bis_restart(s, s->bit_rate);
@@ -55,12 +55,40 @@ upstream. Note also that a spandsp-to-spandsp test will not show it, because
 both ends restart together and renegotiate in step. It only appears against
 equipment that holds its rate — which is to say, against real modems.
 
+## Two more: an answerer that hears AA
+
+V.32bis Annex A has a V.32 automode caller send AA, a pure 1800 Hz tone,
+through the answering modem's answer tone and after it, and it relies on a
+V.22bis answerer ignoring it: AA is out of the answerer's band, and real
+V.22bis modems do. This one did not, in two ways, both marked `datamodem:`
+in `v22bis_rx.c`. Enough AA leaks through the 1200 Hz receive filter to sit
+right at the -43 dBm0 carrier threshold.
+
+- **Each flicker of that carrier restarted the transmitter too.** On carrier
+  loss upstream calls `v22bis_restart()`, which puts an answerer back to its
+  75 ms of silence before USB1 - so with the carrier coming and going, USB1
+  never went out at all, and the caller, which says nothing in V.22bis terms
+  until it hears USB1, waited for ever. Before the handshake has begun (the
+  transmitter still silent or still sending USB1) only the receiver is
+  restarted now.
+- **Any 270 ms of signal passed for SB1.** Upstream's answerer counts 270 ms
+  in the low channel and commits to 1200 bps without looking at what it
+  decoded. It now counts the symbols that do not descramble to ones - spare
+  in `rx.training_error`, otherwise unused - and if more than a quarter of
+  them did not, it was not SB1: the receiver starts again and USB1 carries
+  on.
+
+datamodem's own answering modem steps away from V.22bis when it hears AA, so
+it is mostly the `--no-step-down` V.22bis answerer that needed these - and
+the selftest's stand-in for an older V.22bis modem, which has to behave like
+one.
+
 ## What is here
 
 | | |
 |---|---|
 | `v22bis_tx.c` | verbatim from the later 0.0.6 snapshot |
-| `v22bis_rx.c` | the same, plus the one patch above |
+| `v22bis_rx.c` | the same, plus the three patches above |
 | `generated/*_rrc.h` | root-raised-cosine filter tables |
 | `floating_fudge.h` | verbatim; needed by the two sources |
 | `config.h` | ours — see the comment in it |
@@ -96,7 +124,7 @@ cc -O2 -DHAVE_CONFIG_H -I<dir with config.h> -Isrc \
   of the shared library.
 
 If a future libspandsp fixes V.22bis, this directory still cannot go away
-entirely: the restart-rate patch above is not upstream. Rebase it onto the
+entirely: none of the patches above are upstream. Rebase it onto the
 newer `v22bis_rx.c` and keep `DATAMODEM_VENDOR_V22BIS` on, or drop the whole
 directory and accept that calls which negotiate down to 1200 will retrain
 until they die.

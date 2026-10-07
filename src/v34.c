@@ -36,6 +36,12 @@
 #define PI 3.14159265358979323846
 #define MS(x) ((long long) ((x) * 8))
 
+/* ANSam is 2100 Hz amplitude modulated by a 15 Hz sine, 20% deep (V.8
+ * 7.1). A second of its envelope at 100 samples a second is fifteen whole
+ * cycles, so the 15 Hz bin stands alone. */
+#define ENV_BLOCK 80
+#define ENV_BLOCKS 100
+
 /* ----------------------------------------------------------------- stages */
 
 typedef enum
@@ -296,6 +302,16 @@ struct dm_v34
     v34_ec_t ec;
     fsk_rx_state_t *fsk_rx;
     modem_connect_tones_rx_state_t *ansam_rx;
+    bool ansam_claimed;       /* spandsp says ANSam; ansam_verify() has the last word */
+    /* The answer tone's envelope, every 10 ms, for ansam_verify(). */
+    float env_re, env_im;
+    float env_pwr;            /* the whole block's power, to tell a tone from noise */
+    double env_phase;
+    int env_n;
+    int tone_run;             /* blocks in a row that were the 2100 Hz tone */
+    int tone_gap;             /* allowance for the block a phase reversal empties */
+    float env[ENV_BLOCKS];
+    int env_count;
     uint32_t v8_sr;
     int v8_bitcnt;
     bool v8_synced;
@@ -2460,6 +2476,69 @@ static void not_v34(dm_v34_t *v, bool no_v8)
     emit(v, no_v8 ? DM_V34_NO_V8 : DM_V34_NOT_V34);
 }
 
+/* Whether what spandsp took for ANSam really is: a clean 15 Hz sine on the
+ * tone's envelope, about 20% deep. spandsp has twice taken a 2400 bps
+ * modem's plain answer tone for ANSam on a real call - and CM sent at an
+ * older modem is FSK in its own calling band, which it may well answer as
+ * if we were a V.21 caller. Returns -1 while there is not yet a second of
+ * tone to judge, else 1 for ANSam and 0 for not. */
+static int ansam_verify(dm_v34_t *v)
+{
+    float x[ENV_BLOCKS];
+    float sorted[ENV_BLOCKS];
+    float median;
+    float mean = 0.0f;
+    float ac = 0.0f;
+    double re = 0.0;
+    double im = 0.0;
+    float a15;
+    float depth;
+    float purity;
+    bool yes;
+
+    if (v->env_count < ENV_BLOCKS)
+        return -1;
+    for (int k = 0; k < ENV_BLOCKS; k++)
+        x[k] = sorted[k] = v->env[(v->env_count + k) % ENV_BLOCKS];
+    for (int i = 1; i < ENV_BLOCKS; i++)
+        for (int j = i; j > 0 && sorted[j - 1] > sorted[j]; j--)
+        {
+            float t = sorted[j];
+
+            sorted[j] = sorted[j - 1];
+            sorted[j - 1] = t;
+        }
+    median = sorted[ENV_BLOCKS / 2];
+    if (median <= 0.0f)
+        return 0;
+    /* A phase reversal - ANSam's, every 450 ms - empties the block it falls
+     * in. 20% of AM never takes the envelope below 0.8 of its mean, so
+     * anything far below is a reversal, and is not modulation. */
+    for (int k = 0; k < ENV_BLOCKS; k++)
+    {
+        if (x[k] < 0.6f * median)
+            x[k] = median;
+        mean += x[k];
+    }
+    mean /= ENV_BLOCKS;
+    for (int k = 0; k < ENV_BLOCKS; k++)
+    {
+        double w = 2.0 * M_PI * 15.0 * k / 100.0;
+
+        re += (x[k] - mean) * cos(w);
+        im -= (x[k] - mean) * sin(w);
+        ac += (x[k] - mean) * (x[k] - mean);
+    }
+    ac /= ENV_BLOCKS;
+    a15 = (float) (2.0 * sqrt(re * re + im * im) / ENV_BLOCKS);
+    depth = a15 / mean;
+    purity = (ac > 0.0f) ? (a15 * a15 / 2.0f) / ac : 0.0f;
+    yes = depth >= 0.1f && depth <= 0.35f && purity >= 0.5f;
+    DM_INFO("v34", "answer tone: 15 Hz modulation %.0f%% deep, %.0f%% of its fluctuation - %s (tag=%s)",
+            100.0f * depth, 100.0f * purity, yes ? "ANSam" : "not ANSam, whatever spandsp says", v->tag);
+    return yes ? 1 : 0;
+}
+
 /* --------------------------------------------------------- control loop */
 
 static void begin_phase2(dm_v34_t *v)
@@ -2486,10 +2565,27 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
     {
         int t = modem_connect_tones_rx_get(v->ansam_rx);
 
-        if (t == MODEM_CONNECT_TONES_ANSAM || t == MODEM_CONNECT_TONES_ANSAM_PR)
+        /* spandsp's detector takes two and a half seconds to call ANSam -
+         * which on a real call left an answerer one second of our CM before
+         * its ANSam ran out. A second of the tone is enough to measure. */
+        if (t == MODEM_CONNECT_TONES_ANSAM || t == MODEM_CONNECT_TONES_ANSAM_PR || v->tone_run >= ENV_BLOCKS)
+            v->ansam_claimed = true;
+        if (v->ansam_claimed)
         {
-            DM_DEBUG("v34", "ANSam heard (tag=%s)", v->tag);
-            stage_enter(v, ST_V8_C_TE, 0.5);
+            int ok = ansam_verify(v);
+
+            if (ok == 1)
+            {
+                DM_DEBUG("v34", "ANSam heard (tag=%s)", v->tag);
+                stage_enter(v, ST_V8_C_TE, 0.5);
+            }
+            else if (ok == 0)
+            {
+                DM_INFO("v34", "the far end answered with a plain answer tone and no V.8, so it is not a V.34 "
+                               "modem (tag=%s)",
+                        v->tag);
+                not_v34(v, true);
+            }
         }
         else if (t == MODEM_CONNECT_TONES_ANS || t == MODEM_CONNECT_TONES_ANS_PR)
         {
@@ -2971,6 +3067,41 @@ static void rx_sample(dm_v34_t *v, float x, bool missing)
         int16_t s = (int16_t) lrintf(e);
 
         modem_connect_tones_rx(v->ansam_rx, &s, 1);
+        /* The tone's envelope: mixed down from 2100 Hz and averaged over
+         * 10 ms, which passes 15 Hz and a tone up to V.25's 15 Hz off. */
+        v->env_re += e * (float) cos(v->env_phase);
+        v->env_im -= e * (float) sin(v->env_phase);
+        v->env_pwr += e * e;
+        v->env_phase += 2.0 * M_PI * 2100.0 / 8000.0;
+        if (v->env_phase > 2.0 * M_PI)
+            v->env_phase -= 2.0 * M_PI;
+        if (++v->env_n == ENV_BLOCK)
+        {
+            float a = sqrtf(v->env_re * v->env_re + v->env_im * v->env_im) / ENV_BLOCK;
+            float ms = v->env_pwr / ENV_BLOCK;
+
+            v->env[v->env_count++ % ENV_BLOCKS] = 2.0f * a;
+            /* A tone of amplitude A mixes down to A/2 and has A^2/2 of mean
+             * square: most of the block, at a level worth hearing, is the
+             * answer tone. One block that is not - where a phase reversal
+             * fell - does not end the run. */
+            if (ms > v->pmin && 2.0f * a * a >= 0.6f * ms)
+            {
+                v->tone_run++;
+                v->tone_gap = 0;
+            }
+            else if (v->tone_run > 0 && v->tone_gap == 0)
+            {
+                v->tone_run++;
+                v->tone_gap = 1;
+            }
+            else
+            {
+                v->tone_run = 0;
+            }
+            v->env_re = v->env_im = v->env_pwr = 0.0f;
+            v->env_n = 0;
+        }
         break;
     }
     case ST_V8_C_CM:
@@ -3114,6 +3245,17 @@ void dm_v34_free(dm_v34_t *v)
 int dm_v34_tx_rate(const dm_v34_t *v)
 {
     return (v->stage == ST_DATA || v->tx_in_data) ? v->rate_tx : 0;
+}
+
+bool dm_v34_engaged(const dm_v34_t *v)
+{
+    /* Calling, ANSam alone is not enough: an older modem's answer tone can
+     * be taken for it, and the CM that follows then goes unanswered. JM is
+     * the far end saying V.8. */
+    if (v->calling)
+        return v->stage != ST_V8_C_LISTEN && v->stage != ST_V8_C_TE && v->stage != ST_V8_C_CM &&
+               v->stage != ST_DEAD;
+    return v->stage != ST_V8_A_ANSAM && v->stage != ST_DEAD;
 }
 
 int dm_v34_rx_rate(const dm_v34_t *v)

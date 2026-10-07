@@ -68,7 +68,7 @@ case_ "renegotiate, answerer asks"    DATAMODEM_V34_RENEGOTIATE=2:19200:answer D
 case_ "clock +100 ppm, V.42, 100 kB"  DATAMODEM_SELFTEST_BYTES=100000 DATAMODEM_SELFTEST_LINE=ulaw,drift=100 -- --v42 require
 case_ "clock -100 ppm, V.42, 100 kB"  DATAMODEM_SELFTEST_BYTES=100000 DATAMODEM_SELFTEST_LINE=ulaw,drift=-100 -- --v42 require
 case_ "clock 40 ppm, echo, 300 ms"    DATAMODEM_SELFTEST_BYTES=50000 DATAMODEM_SELFTEST_LINE=ulaw,drift=40,delay=150,echo=-12 -- --v42 require
-case_ "async, 200 kB"                 DATAMODEM_SELFTEST_BYTES=200000 DATAMODEM_SELFTEST_LINE=ulaw
+case_ "async, 200 kB"                 DATAMODEM_SELFTEST_BYTES=200000 DATAMODEM_SELFTEST_LINE=ulaw -- --v42 off
 case_ "rate ceiling 14400"            DATAMODEM_SELFTEST_LINE=ulaw -- --bit-rate 14400
 case_ "rate ceiling 2400"             DATAMODEM_SELFTEST_LINE=ulaw -- --bit-rate 2400
 

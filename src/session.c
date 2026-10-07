@@ -1233,7 +1233,7 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
         {
             dm_tty_message("NO CARRIER");
             if (st.train_stage != NULL)
-                /* V.32 agrees its rate explicitly, so the ends cannot
+                /* V.32 and V.34 agree their rates explicitly, so the ends cannot
                  * disagree about it the way V.22bis's can; and each retrain
                  * already picks the rate the line will bear. One that still
                  * will not hold has a line problem. */
@@ -1242,7 +1242,9 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
                          "the audio path is too poor for %s. --modulation v22bis or v21 ask far "
                          "less of it.",
                          st.retrains, st.bit_rate, (double) st.snr_db,
-                         strcmp(st.modulation, "v32bis") == 0 ? "V.32bis" : "V.32");
+                         strcmp(st.modulation, "v34") == 0      ? "V.34"
+                         : strcmp(st.modulation, "v32bis") == 0 ? "V.32bis"
+                                                                : "V.32");
             else if (st.offered_rate > 0 && st.bit_rate < st.offered_rate)
                 DM_ERROR("session",
                          "the link retrained %u times and will not hold. It settled at %d bps "

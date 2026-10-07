@@ -112,6 +112,11 @@ void dm_v34_rx(dm_v34_t *v, const int16_t *amp, int len);
 /* Audio that never arrived. */
 void dm_v34_rx_fillin(dm_v34_t *v, int len);
 
+/* V.8 is under way: JM heard by a calling modem, CM by an answering one.
+ * Until then the far end may be something older that never will be - even
+ * after a calling modem has heard what it took for ANSam. */
+bool dm_v34_engaged(const dm_v34_t *v);
+
 /* Data signalling rate in each direction; 0 until data mode. */
 int dm_v34_tx_rate(const dm_v34_t *v);
 int dm_v34_rx_rate(const dm_v34_t *v);
