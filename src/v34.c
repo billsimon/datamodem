@@ -1921,7 +1921,7 @@ static void heard_mp(dm_v34_t *v, const v34_mp_t *mp)
                  mp->ack ? "'" : "", mp->rate_c_to_a * 2400, mp->rate_a_to_c * 2400, 16 << mp->trellis,
                  mp->expanded ? ", expanded shaping" : "", mp->nonlinear ? ", non-linear encoding" : "",
                  pre ? ", precoding" : "", mp->asymmetric ? "" : ", symmetric", v->tag);
-    if (mp->type == 1 || !v->have_mp)
+    if (mp->type == 1)
     {
         v->mp_far = *mp;
     }
@@ -1929,7 +1929,11 @@ static void heard_mp(dm_v34_t *v, const v34_mp_t *mp)
     {
         int16_t h[3][2];
 
-        /* A type 0 leaves the precoding coefficients as they were. */
+        /* A type 0 leaves the precoding coefficients as they were - even the
+         * first MP of a rate renegotiation, which is usually a type 0: the
+         * far end goes on un-precoding with the coefficients it sent in
+         * Phase 4, so we must go on precoding with them. Only a retrain
+         * zeroes them (restart_phase2). */
         memcpy(h, v->mp_far.h, sizeof(h));
         v->mp_far = *mp;
         memcpy(v->mp_far.h, h, sizeof(h));
@@ -2451,6 +2455,8 @@ static void restart_phase2(dm_v34_t *v, bool initiate, const char *why)
     v->renegotiating = false;
     v->rate_tx = v->rate_rx = 0;
     v->have_mp = v->far_ack = v->far_e = false;
+    /* 10.1.3.9: the coefficients are zero until the first MP of Phase 4. */
+    memset(v->mp_far.h, 0, sizeof(v->mp_far.h));
     v->probing = false;
     v->q.mode = RQ_OFF;
     /* 11.5: 70 ms of silence, then our tone. */
