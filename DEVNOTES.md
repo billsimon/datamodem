@@ -148,9 +148,11 @@ round until `--train-timeout`, and the first to be answered is kept:
 3. V.21's channel 2 carrier, listening for channel 1;
 4. Bell 103's 2225 Hz, listening for 1270 Hz.
 
-A V.21 or Bell 103 caller is only taken once its carrier has been offered:
-a real one says nothing until then, and what is in its band before that is
-something else - V.8's CM, which is V.21 channel 1 too.
+A V.21 caller is only taken once its carrier has been offered: a real one
+says nothing until then, and what is in its band before that is something
+else - V.8's CM, which is V.21 channel 1 too. A Bell 103 caller is taken
+whenever it is heard, answer tone included, because a real one may well
+speak first (below), and nothing else a caller sends sits at 1270 Hz.
 
 A caller that sent V.32's AA during the answer tone — which an automode V.32
 caller does — goes straight to V.32bis, and so does one heard sending AA at
@@ -168,10 +170,22 @@ whole run of blocks rather than one at a time.
 
 V.21 and Bell 103 now wait to hear the far end's tone before they connect, at
 either end, rather than taking any energy for a carrier — a V.32 caller's AA,
-or the far end's echo of our own, used to be enough. A calling FSK modem
+or the far end's echo of our own, used to be enough. A calling V.21 modem
 stays silent until it hears the answering carrier, as the real ones did, and
 then holds its own at mark for half a second plus the path before it passes
 data, so the answerer is listening when the first character arrives.
+
+A calling Bell 103 modem goes on air sooner: on hearing an answer tone
+(2100 Hz) or USB1 (2250 Hz) it raises its 1270 Hz mark, though it still
+connects only once it has heard 2225 Hz. A real Bell 103 caller's receiver
+takes anything between about 2025 and 2225 Hz for the answering carrier, and
+both of those are in it, so real ones do the same - and automode answerers
+depend on it. A Cisco MICA answers with its answer tone, USB1, V.21's 1650 Hz
+and V.23's 1300 Hz in turn, and never offers 2225 Hz unprompted: it listens
+for the caller's 1270 Hz instead. A Bell 103 caller that waited for 2225 Hz,
+as ours used to, sat silent until the MICA hung up. V.21's answering band,
+1650 to 1850 Hz, does not include 2100 Hz, which is why a real V.21 caller
+does wait and why the MICA offers V.21 explicitly.
 
 ### The V.22bis situation, and why `third_party` exists
 
@@ -832,17 +846,14 @@ and up; V.23 predates it and the combination never existed.
 
 V.21 and Bell 103 used to run V.42 like everything else, and between two
 datamodems it works (see "What it costs" below). Against real equipment it
-looked to do harm. A Cisco MICA answering at V.21 does not answer V.42
-detection, and seems to have passed our ODP through to the BBS behind it as
-data: the BBS echoed 14 `?` into its login field before anyone typed, and
-nothing typed afterwards got a response, although the recording shows it
-going out cleanly. At 300 bps the detection window is nearly
-eight seconds, so a host without V.42 - which is most hosts at that speed -
-gets over a hundred DC1s. So `carries_v42()` in `modem.c` now says no for all
-three: a call that starts on one runs `detect` as `off`, and one that steps
-down to one drops its V.42 state when the carrier comes up, before anything
-has gone through it. `--v42 require` is refused up front for the three, and
-hangs up on a call that steps down to one.
+gains nothing and costs a lot: a Cisco MICA answering at V.21 does not
+answer V.42 detection, and at 300 bps the detection window is nearly eight
+seconds, so a host without V.42 - which is most hosts at that speed - gets
+over a hundred DC1s before the fall back. So `carries_v42()` in `modem.c`
+now says no for all three: a call that starts on one runs `detect` as `off`,
+and one that steps down to one drops its V.42 state when the carrier comes
+up, before anything has gone through it. `--v42 require` is refused up front
+for the three, and hangs up on a call that steps down to one.
 
 ### V.42bis is negotiated, in the XID exchange
 

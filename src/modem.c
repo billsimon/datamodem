@@ -188,6 +188,7 @@ typedef enum
     HEARD_NONE = 0,
     HEARD_AC,        /* a V.32 answering modem: 600 and 3000 Hz */
     HEARD_AA,        /* a V.32 calling modem: 1800 Hz */
+    HEARD_ANS,       /* an answer tone, V.25's or V.8's: 2100 Hz */
     HEARD_USB1,      /* a V.22 bis or V.22 answering modem's unscrambled ones */
     HEARD_V21_ANS,   /* V.21 channel 2, the answering modem's: mark 1650 Hz */
     HEARD_BELL_ANS,  /* Bell 103's answering band: mark 2225 Hz */
@@ -353,6 +354,7 @@ struct dm_modem
     bool offered_bell;         /* and Bell 103's 2225 Hz */
     bool fsk_carrier;
     bool fsk_confirmed;        /* the far end's FSK tone has been heard, not just energy */
+    bool fsk_announced;        /* calling Bell 103: carrier up before 2225 Hz, see hunt_heard() */
     long long fsk_mark_from;   /* calling: when our own carrier went out, -1 = not yet */
     size_t tx_limit;           /* DM_TX_SECONDS of the current line rate, in bytes */
     int bit_rate;
@@ -880,6 +882,8 @@ static heard_t listen_block(dm_listen_t *l)
         return HEARD_AC;
     if (!own_between(l, 1780.0f, 1820.0f) && tone_peak(x, n, 1780.0f, 1820.0f, &at) >= DM_LISTEN_SHARE * whole)
         return HEARD_AA;
+    if (!own_between(l, 2080.0f, 2120.0f) && tone_peak(x, n, 2080.0f, 2120.0f, &at) >= DM_LISTEN_SHARE * whole)
+        return HEARD_ANS;
 
     /* Between 2190 and 2275 Hz is either Bell 103's answering mark, a pure
      * tone at 2225, or V.22's unscrambled ones: 600 baud of the same phase
@@ -941,6 +945,8 @@ static const char *heard_name(heard_t h)
         return "V.32's AC";
     case HEARD_AA:
         return "V.32's AA";
+    case HEARD_ANS:
+        return "an answer tone";
     case HEARD_USB1:
         return "V.22's unscrambled ones";
     case HEARD_V21_ANS:
@@ -2848,6 +2854,7 @@ static void step_now(dm_modem_t *m)
     m->pump_started = false;
     m->fsk_carrier = false;
     m->fsk_confirmed = m->switch_confirmed;
+    m->fsk_announced = false;
     m->fsk_mark_from = -1;
     listen_reset(&m->listen);
     if (!create_pump(m, m->calling && is_v32(to)))
@@ -3076,6 +3083,20 @@ static void hunt_heard(dm_modem_t *m, heard_t h, int run)
      * enough for the others that a passing coincidence does not count. */
     if (run < 4)
         return;
+    /* A Bell 103 calling modem's receiver takes anything in its band for
+     * the answering carrier, and an answer tone at 2100 Hz or USB1 at 2250
+     * is in it. So a real one raises its 1270 Hz carrier during them, and an
+     * automode answerer - a Cisco MICA is one - listens for exactly that
+     * before it offers Bell 103: it plays its answer tone, USB1, V.21 and
+     * V.23 in turn and never 2225 Hz unprompted. Ours goes on air the same
+     * way, but still connects only on hearing 2225 Hz itself. */
+    if (m->calling && m->mod == DM_MOD_BELL103 && !m->fsk_confirmed && !m->fsk_announced &&
+        (h == HEARD_ANS || h == HEARD_USB1))
+    {
+        m->fsk_announced = true;
+        DM_INFO("modem", "%s heard; raising our Bell 103 carrier so the far end can tell what we are "
+                         "(tag=%s)", heard_name(h), m->tag);
+    }
     switch (h)
     {
     case HEARD_AC:
@@ -3148,7 +3169,10 @@ static void hunt_heard(dm_modem_t *m, heard_t h, int run)
             fsk_heard(m, DM_MOD_V21, h);
         break;
     case HEARD_BELL_ORIG:
-        if (!m->calling && m->offered_bell)
+        /* Unlike V.21's, a Bell 103 caller may speak first: it takes our
+         * answer tone or USB1 for its carrier (see above). Nothing else a
+         * caller sends sits at 1270 Hz - V.8's CM is at 980 and 1180. */
+        if (!m->calling)
             fsk_heard(m, DM_MOD_BELL103, h);
         break;
     default:
@@ -3722,7 +3746,8 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
         }
         else if (m->v22 != NULL)
             n = v22bis_tx(m->v22, samples, max_count);
-        else if (m->fsk_tx != NULL && m->calling && fsk_needs_tone(m->mod) && !m->fsk_confirmed)
+        else if (m->fsk_tx != NULL && m->calling && fsk_needs_tone(m->mod) && !m->fsk_confirmed &&
+                 !m->fsk_announced)
             ; /* a calling FSK modem is silent until it hears the answering carrier */
         else if (m->fsk_tx != NULL)
         {
