@@ -50,9 +50,9 @@ static const opt_def_t OPTS[] = {
     STR_OPT("from", from_uri, "override the From/contact URI"),
     STR_OPT("proxy", proxy, "outbound proxy URI, e.g. sip:edge.example.com;lr"),
     STR_OPT("caller-id", caller_id,
-            "asserted caller ID: sets P-Asserted-Identity on the INVITE (and the From display name)"),
+            "asserted caller ID, sent as P-Asserted-Identity and the From display name"),
     BOOL_OPT("register", do_register,
-             "maintain a SIP registration (default: off when dialling, on when answering)"),
+             "keep a SIP registration (default off when dialling, on when answering)"),
     INT_OPT("reg-timeout", reg_timeout_s, 1, 600, "seconds to wait for REGISTER to succeed"),
     INT_OPT("reg-expires", reg_expires_s, 30, 86400, "registration expiry requested"),
 
@@ -65,28 +65,24 @@ static const opt_def_t OPTS[] = {
     STR_OPT("nameserver", nameserver, "DNS server for SRV/NAPTR resolution"),
     INT_OPT("rtp-port", rtp_port, 0, 65535, "base RTP port"),
     INT_OPT("rtp-port-range", rtp_port_range, 0, 60000,
-            "ports above --rtp-port that media may use (default 100); open exactly this range"),
+            "ports above --rtp-port media may use (default 100); open exactly these"),
 
     /* Media */
     STR_OPT("codec", codec, "pcmu | pcma (default pcmu)"),
     INT_OPT("jitter-buffer-ms", jitter_buffer_ms, 0, 500,
-            "fixed jitter buffer size (default 150); smaller starves the modem on a real path"),
+            "fixed jitter buffer (default 150); smaller starves the modem on a real path"),
     BOOL_OPT("user-phone", user_phone, "append ;user=phone to the request URI"),
-    BOOL_OPT("speaker", speaker,
-             "play the line through the default sound device while the far end rings and the "
-             "modems train, stopping at carrier like a modem's speaker (ATM1) (default off)"),
 
     /* Modem */
     STR_OPT("modulation", modulation,
-            "v34 | v32bis | v32 | v22bis | v22 | v23 | v21 | bell103: the fastest to try (default v34, "
-            "up to 33600 bps; v32bis 14400, v32 9600, v22bis 2400)"),
+            "v34 | v32bis | v32 | v22bis | v22 | v23 | v21 | bell103: the fastest to try "
+            "(default v34)"),
     BOOL_OPT("step-down", step_down,
-             "fall back from --modulation to slower ones the far end turns out to want, down to v21 "
-             "and bell103 (default on; --no-step-down for that modulation only)"),
+             "fall back to slower modulations if the far end wants one (default on)"),
     INT_OPT("bit-rate", bit_rate, 0, 33600,
-            "rate ceiling: a multiple of 2400 up to 33600 for v34, 14400, 12000, 9600, 7200 or 4800 for v32bis, 9600 or 4800 for v32, 2400 "
-            "or 1200 for v22bis (default 0, the most the modulation can do); stepping down, one below "
-            "what --modulation can do starts lower, as 1200 starts at v22bis"),
+            "rate ceiling, a multiple of 2400: v34 up to 33600, v32bis 4800-14400, v32 4800 "
+            "or 9600, v22bis 1200 or 2400 (default 0 = the modulation's most); one below "
+            "--modulation's range starts on a slower one"),
     STR_OPT("guard-tone", guard_tone,
             "none | 550 | 1800; the answering modem's guard tone (default none)"),
     INT_OPT("data-bits", data_bits, 5, 8, "character length (default 8)"),
@@ -97,71 +93,72 @@ static const opt_def_t OPTS[] = {
     INT_OPT("answer-tone-ms", answer_tone_ms, 0, 10000,
             "length of the 2100 Hz answer tone when answering (default 3300, 0 = none)"),
     INT_OPT("answer-wait", answer_wait_s, 0, 120,
-            "seconds the caller lets the answering end announce itself before training "
-            "(default 5, 0 = train immediately)"),
+            "seconds to let the answering end announce itself before training (default 5, "
+            "0 = train at once)"),
     INT_OPT("answer-tail-ms", answer_tail_ms, 0, 10000,
-            "if the answer tone is heard, extend the wait to this long after hearing it "
-            "(default 3300; V.25 allows the tone up to 4s)"),
+            "on hearing answer tone, wait until this long after it (default 3300; V.25 "
+            "allows up to 4s)"),
     BOOL_OPT("calling-tone", calling_tone, "send the V.25 1300 Hz calling tone while waiting"),
     INT_OPT("train-timeout", train_timeout_s, 5, 600,
-            "give up if the modems have not trained by then (default 45)"),
+            "seconds allowed for training (default 45)"),
     INT_OPT("max-retrains", max_retrains, 0, 100,
-            "give up on a link that keeps retraining (default 4, 0 = never give up)"),
+            "retrains before hanging up (default 4, 0 = no limit)"),
+    BOOL_OPT("speaker", speaker,
+             "play the line on the sound device until carrier, like a modem's speaker (ATM1) "
+             "(default off)"),
 
     /* Error correction and compression */
     STR_OPT("v42", v42,
-            "V.42 error correction: detect (default: use it if the far end does, else async) | "
-            "require | off"),
+            "detect | require | off: V.42 error correction (default detect: use it if the far "
+            "end does)"),
     INT_OPT("v42-timeout", v42_timeout_s, 2, 120,
-            "seconds to keep trying to establish V.42 before falling back (default 10)"),
-    BOOL_OPT("v42bis", v42bis,
-             "offer V.42bis compression inside V.42 (default on); a far end that declines it gets "
-             "V.42 alone"),
+            "seconds to try for V.42 before going without (default 10)"),
+    BOOL_OPT("v42bis", v42bis, "offer V.42bis compression inside V.42 (default on)"),
     INT_OPT("v42bis-dict", v42bis_dict, 512, 4096,
-            "most V.42bis dictionary to offer, in codewords (default 2048); the far end may take less"),
+            "largest V.42bis dictionary to offer, in codewords (default 2048)"),
     INT_OPT("v42bis-max-string", v42bis_max_string, 6, 250,
-            "longest V.42bis string to offer (default 32); the far end may take less"),
+            "longest V.42bis string to offer (default 32)"),
 
-    /* Session */
+    /* Terminal */
     KEY_OPT("escape-char", escape_char,
-            "Hayes S2: the character typed three times to reach command mode (default +)"),
+            "Hayes S2: the character in +++ (default +)"),
     INT_OPT("escape-guard-ms", escape_guard_ms, 100, 10000,
-            "Hayes S12: silence needed either side of the escape sequence (default 1000)"),
+            "Hayes S12: silence either side of the escape sequence (default 1000)"),
     KEY_OPT("escape-key", escape_key,
-            "an extra single-keystroke escape, e.g. ^] - off by default because a real modem has none"),
-    BOOL_OPT("local-echo", local_echo, "echo what you type, for a far end that does not (ATE1)"),
+            "an extra one-keystroke escape, e.g. ^] (default none, as on a real modem)"),
+    BOOL_OPT("local-echo", local_echo, "echo what you type, for a far end that won't (ATE1)"),
     BOOL_OPT("tui", tui,
-             "take the whole terminal, with a status line at the bottom (default on when "
-             "interactive; --no-tui for plain line output)"),
+             "full screen with a status line at the bottom (default on when interactive)"),
     STR_OPT("charset", charset,
-            "cp437 | utf8 | ascii: what the far end's 8-bit characters are (default cp437, "
-            "what PC BBSes draw with)"),
+            "cp437 | utf8 | ascii: the far end's 8-bit character set (default cp437, as PC "
+            "BBSes use)"),
+
+    /* Calls */
     INT_OPT("connect-timeout", connect_timeout_s, 5, 600,
-            "seconds to wait for the call to be answered (default 60)"),
+            "seconds to wait for an answer (default 60)"),
     INT_OPT("answer-timeout", answer_timeout_s, 0, 86400,
-            "seconds to wait for an inbound call (default 0 = forever)"),
+            "seconds to wait for a call (default 0 = forever)"),
     INT_OPT("idle-timeout", idle_timeout_s, 0, 86400,
             "hang up after this long with nothing received (default 0 = never)"),
     INT_OPT("media-timeout", media_timeout_s, 0, 600,
             "hang up after this many seconds with no inbound RTP (default 20, 0 disables)"),
     INT_OPT("max-call", max_call_s, 0, 86400, "hard ceiling on one call, seconds (default 0 = none)"),
     STR_OPT("exec", exec,
-            "once connected, run this shell command with the line as its stdin and stdout, "
-            "and clear the call when it exits - e.g. a BBS"),
+            "run this command on the line once connected, e.g. a BBS; hang up when it "
+            "exits"),
     BOOL_OPT("exec-tty", exec_tty,
-             "give --exec a terminal, as getty would, rather than a byte-exact pipe - "
-             "for a shell, login, or anything that wants a tty"),
+             "give --exec a terminal, as getty would, not a byte-exact pipe"),
     INT_OPT("calls", calls, 0, 1000000,
-            "answer: calls to take before exiting (default 1, 0 = keep answering)"),
+            "answer: calls to take, 0 = no limit (default 1)"),
     BOOL_OPT("hangup-on-eof", hangup_on_eof,
-             "clear the call as soon as input ends and has been sent, rather than waiting "
-             "for a reply (always so with --exec)"),
+             "hang up once input ends and has been sent, not waiting for a reply (always so "
+             "with --exec)"),
+
     /* Logging */
     {"log-level", OPT_LOGLEVEL, offsetof(dm_config_t, log_level), 0, 0, 0,
      "error | warn | info | debug | trace (default info)"},
     BOOL_OPT("log-json", log_json, "emit one JSON object per line"),
-    STR_OPT("log-file", log_file,
-            "write the log here instead of stderr - what you want during a session"),
+    STR_OPT("log-file", log_file, "log here instead of stderr - best during a session"),
     INT_OPT("pjsip-log-level", pjsip_log_level, 0, 6, "override pjsip verbosity"),
     INT_OPT("spandsp-log-level", spandsp_log_level, 0, 10, "override spandsp verbosity"),
 };
@@ -784,14 +781,66 @@ void dm_config_log(const dm_config_t *cfg)
              cfg->media_timeout_s, cfg->max_call_s, cfg->train_timeout_s);
 }
 
+/* --help headings, each printed above the option that starts its group in OPTS. */
+static const struct
+{
+    const char *first;
+    const char *title;
+} OPT_SECTIONS[] = {
+    {"server", "VoIP (SIP and RTP)"},
+    {"modulation", "Modem"},
+    {"v42", "Error correction and compression"},
+    {"escape-char", "Terminal"},
+    {"connect-timeout", "Calls"},
+    {"log-level", "Logging"},
+};
+
+/* --help columns: options from 2, their help from HELP_COL, wrapped to HELP_WIDTH. */
+#define HELP_COL 28
+#define HELP_WIDTH 80
+
+/* Prints `text` word-wrapped into the help column; the cursor is already at HELP_COL. */
+static void print_help_text(const char *text)
+{
+    const int room = HELP_WIDTH - HELP_COL;
+
+    while (*text)
+    {
+        int len = (int) strlen(text);
+        int brk = len;
+
+        if (len > room)
+        {
+            for (brk = room; brk > 0 && text[brk] != ' '; brk--)
+                ;
+            if (brk == 0) /* one word wider than the column: let it overflow */
+                brk = (int) strcspn(text, " ");
+        }
+        printf("%.*s\n", brk, text);
+        text += brk;
+        while (*text == ' ')
+            text++;
+        if (*text)
+            printf("%*s", HELP_COL, "");
+    }
+}
+
 static void print_options(void)
 {
     printf("Options. Every flag also reads DATAMODEM_<FLAG_IN_CAPS> from the environment,\n"
-           "and any of them can be set in a --config file as key=value.\n\n");
+           "and any of them can be set in a --config file as key=value. Switches with no\n"
+           "<value> turn off with --no-, e.g. --no-tui.\n\n");
+    printf("General:\n");
+    printf("  --config <path>           read key=value settings from a file\n");
+    printf("  -h, --help                this text\n");
     for (size_t i = 0; i < N_OPTS; i++)
     {
         const char *arg = "";
         int pad;
+
+        for (size_t j = 0; j < sizeof(OPT_SECTIONS) / sizeof(OPT_SECTIONS[0]); j++)
+            if (strcmp(OPTS[i].name, OPT_SECTIONS[j].first) == 0)
+                printf("\n%s:\n", OPT_SECTIONS[j].title);
 
         switch (OPTS[i].kind)
         {
@@ -811,14 +860,17 @@ static void print_options(void)
             arg = "";
             break;
         }
-        pad = 24 - (int) strlen(OPTS[i].name) - (int) strlen(arg);
+        pad = HELP_COL - 4 - (int) strlen(OPTS[i].name) - (int) strlen(arg);
         if (pad < 1)
-            pad = 1;
-        printf("  --%s%s%*s%s\n", OPTS[i].name, arg, pad, "", OPTS[i].help);
+        {
+            printf("  --%s%s\n%*s", OPTS[i].name, arg, HELP_COL, "");
+            pad = 0;
+        }
+        else
+            printf("  --%s%s%*s", OPTS[i].name, arg, pad, "");
+        print_help_text(OPTS[i].help);
     }
-    printf("  --config <path>         read key=value settings from a file\n");
-    printf("  -v, --verbose           raise log verbosity (repeatable)\n");
-    printf("  -h, --help              this text\n");
+    printf("  -v, --verbose             raise log verbosity (repeatable)\n");
 }
 
 void dm_usage(void)
@@ -826,7 +878,7 @@ void dm_usage(void)
     printf("datamodem %s - a softmodem for data calls over SIP (V.34 down to Bell 103)\n\n",
            DATAMODEM_VERSION);
     printf("Usage:\n"
-           "  datamodem <number> [options]      dial it and hand the terminal to the far modem\n"
+           "  datamodem <number> [options]      dial, and hand the terminal to the far modem\n"
            "  datamodem dial <number> [options] the same thing, spelled out\n"
            "  datamodem answer [options]        answer one inbound call and do the same\n"
            "  datamodem selftest [options]      loop two modems back to back, no SIP\n"
