@@ -188,6 +188,7 @@ typedef enum
     HEARD_NONE = 0,
     HEARD_AC,        /* a V.32 answering modem: 600 and 3000 Hz */
     HEARD_AA,        /* a V.32 calling modem: 1800 Hz */
+    HEARD_ANS,       /* an answer tone, V.25's or V.8's: 2100 Hz */
     HEARD_USB1,      /* a V.22 bis or V.22 answering modem's unscrambled ones */
     HEARD_V21_ANS,   /* V.21 channel 2, the answering modem's: mark 1650 Hz */
     HEARD_BELL_ANS,  /* Bell 103's answering band: mark 2225 Hz */
@@ -353,6 +354,7 @@ struct dm_modem
     bool offered_bell;         /* and Bell 103's 2225 Hz */
     bool fsk_carrier;
     bool fsk_confirmed;        /* the far end's FSK tone has been heard, not just energy */
+    bool fsk_announced;        /* calling Bell 103: carrier up before 2225 Hz, see hunt_heard() */
     long long fsk_mark_from;   /* calling: when our own carrier went out, -1 = not yet */
     size_t tx_limit;           /* DM_TX_SECONDS of the current line rate, in bytes */
     int bit_rate;
@@ -503,6 +505,16 @@ static bool is_v32(dm_mod_t m)
 static bool is_fsk(dm_mod_t m)
 {
     return m == DM_MOD_V21 || m == DM_MOD_BELL103 || m == DM_MOD_V23;
+}
+
+/* Whether V.42 runs over this modulation at all. Not over V.23, whose 75 bps
+ * back channel takes 14 seconds to send one LAPM frame against a one second
+ * acknowledgement timer; and not over the 300 bps FSK modems either, where
+ * detection alone puts several seconds of DC1s on the line - typed input, to
+ * the many 300 bps hosts that do not do V.42, a Cisco MICA among them. */
+static bool carries_v42(dm_mod_t m)
+{
+    return !is_fsk(m);
 }
 
 static bool parse_parity(const char *s, int *out)
@@ -870,6 +882,8 @@ static heard_t listen_block(dm_listen_t *l)
         return HEARD_AC;
     if (!own_between(l, 1780.0f, 1820.0f) && tone_peak(x, n, 1780.0f, 1820.0f, &at) >= DM_LISTEN_SHARE * whole)
         return HEARD_AA;
+    if (!own_between(l, 2080.0f, 2120.0f) && tone_peak(x, n, 2080.0f, 2120.0f, &at) >= DM_LISTEN_SHARE * whole)
+        return HEARD_ANS;
 
     /* Between 2190 and 2275 Hz is either Bell 103's answering mark, a pure
      * tone at 2225, or V.22's unscrambled ones: 600 baud of the same phase
@@ -931,6 +945,8 @@ static const char *heard_name(heard_t h)
         return "V.32's AC";
     case HEARD_AA:
         return "V.32's AA";
+    case HEARD_ANS:
+        return "an answer tone";
     case HEARD_USB1:
         return "V.22's unscrambled ones";
     case HEARD_V21_ANS:
@@ -1023,20 +1039,19 @@ bool dm_modem_params_check(const dm_modem_params_t *p, char *err, size_t err_len
             snprintf(err, err_len, "--v42 must be off, detect or require");
             return false;
         }
-        /* V.42 cannot work over V.23's 75 bps back channel. One LAPM frame
-         * is 1072 bits, which takes 14 seconds to send at 75 bps, while
-         * T401 - the time the far end waits for an acknowledgement - is one
-         * second. Every frame would be given up on before it had finished
-         * transmitting. V.42 was written for symmetric modems at 1200 bps
-         * and above, and V.23 predates it; the combination never existed.
-         * detect, the default, means "if the far end will" - and over V.23
-         * it will not, so dm_modem_create() runs it as off. Only require is
-         * a contradiction. */
-        if (mode == DM_V42_REQUIRE && mod == DM_MOD_V23)
+        /* V.42 does not run over V.21, Bell 103 or V.23 - see carries_v42().
+         * detect, the default, means "if it can", so dm_modem_create() runs
+         * it as off there. Only require is a contradiction - and starting at
+         * one of these, there is nothing faster to step down from. */
+        if (mode == DM_V42_REQUIRE && !carries_v42(mod))
         {
-            snprintf(err, err_len,
-                     "--v42 require cannot run over V.23: its 75 bps back channel takes 14 seconds "
-                     "to send one LAPM frame, and the acknowledgement timer is one second");
+            if (mod == DM_MOD_V23)
+                snprintf(err, err_len,
+                         "--v42 require cannot run over V.23: its 75 bps back channel takes 14 "
+                         "seconds to send one LAPM frame, and the acknowledgement timer is one second");
+            else
+                snprintf(err, err_len, "--v42 require cannot run over %s: datamodem runs no V.42 at 300 bps",
+                         modulation_name(mod));
             return false;
         }
         /* --v42bis with --v42 off is not an error: V.42bis is an offer made
@@ -1783,14 +1798,26 @@ static void v42_status(void *user, int status)
     }
 }
 
-/* Once detection has given up: the rest of the ODP pair under way, so that
- * an async far end is not left half a character, then mark. */
+/* Once detection has given up: the rest of the ODP character under way and
+ * the ones after it, so that an async far end is not left half a character,
+ * then mark. spandsp loads the pair's second character only when it reaches
+ * it (txbits == 18), which the tail does not do: a first character ends
+ * there, already followed by its eight ones. */
+static bool v42_detect_tail_pending(const v42_state_t *v)
+{
+    return v->calling_party && v->neg.txbits > 0 && v->neg.txbits != 18;
+}
+
 static int v42_detect_tail_bit(v42_state_t *v)
 {
     int bit;
 
-    if (!v->calling_party || v->neg.txbits <= 0)
+    if (!v42_detect_tail_pending(v))
+    {
+        if (v->calling_party)
+            v->neg.txbits = 0;
         return 1;
+    }
     bit = (int) (v->neg.txstream & 1);
     v->neg.txstream >>= 1;
     v->neg.txbits--;
@@ -1822,6 +1849,14 @@ static int tx_get_bit(void *user)
         bit = v42_tx_bit(m->v42);
         return m->v42->lapm.state == DM_LAPM_V42_UNSUPPORTED ? v42_detect_tail_bit(m->v42) : bit;
     }
+    /* The fall back comes a frame or so after detection gives up, and the
+     * character under way may not be finished by then. Cut short, the rest
+     * of it goes out as mark and the far end receives a byte that is
+     * neither ODP nor anything we were asked to send - 0x91 arriving as
+     * 0xf1, say. */
+    if (m->v42 != NULL && m->v42_fell_back && m->v42->lapm.state == DM_LAPM_V42_UNSUPPORTED &&
+        v42_detect_tail_pending(m->v42))
+        return v42_detect_tail_bit(m->v42);
     return async_framer_get_bit(m);
 }
 
@@ -1864,6 +1899,25 @@ static void note_connected(dm_modem_t *m)
         m->bit_rate = dm_v34_rx_rate(m->v34);
         m->tx_bit_rate = dm_v34_tx_rate(m->v34);
         v42_set_bit_rate(m, m->tx_bit_rate);
+    }
+
+    /* Stepped down to a modulation that runs no V.42 - see carries_v42().
+     * Nothing has gone through it yet: until now the carrier was not up. */
+    if (first && m->v42 != NULL && !carries_v42(m->mod))
+    {
+        if (m->v42_mode == DM_V42_REQUIRE)
+        {
+            m->carrier_lost = true;
+            m->phase = DM_PHASE_DOWN;
+            DM_ERROR("modem", "the far end is a %s modem, which runs no V.42, and --v42 require was "
+                              "asked for, so the call is no use (tag=%s)", m->mod_name, m->tag);
+            return;
+        }
+        DM_INFO("modem", "no V.42 over %s; this link has no error correction (tag=%s)", m->mod_name, m->tag);
+        v42_release(m->v42);
+        v42_free(m->v42);
+        m->v42 = NULL;
+        m->v42_mode = DM_V42_OFF;
     }
 
     if (first)
@@ -2800,6 +2854,7 @@ static void step_now(dm_modem_t *m)
     m->pump_started = false;
     m->fsk_carrier = false;
     m->fsk_confirmed = m->switch_confirmed;
+    m->fsk_announced = false;
     m->fsk_mark_from = -1;
     listen_reset(&m->listen);
     if (!create_pump(m, m->calling && is_v32(to)))
@@ -3028,6 +3083,20 @@ static void hunt_heard(dm_modem_t *m, heard_t h, int run)
      * enough for the others that a passing coincidence does not count. */
     if (run < 4)
         return;
+    /* A Bell 103 calling modem's receiver takes anything in its band for
+     * the answering carrier, and an answer tone at 2100 Hz or USB1 at 2250
+     * is in it. So a real one raises its 1270 Hz carrier during them, and an
+     * automode answerer - a Cisco MICA is one - listens for exactly that
+     * before it offers Bell 103: it plays its answer tone, USB1, V.21 and
+     * V.23 in turn and never 2225 Hz unprompted. Ours goes on air the same
+     * way, but still connects only on hearing 2225 Hz itself. */
+    if (m->calling && m->mod == DM_MOD_BELL103 && !m->fsk_confirmed && !m->fsk_announced &&
+        (h == HEARD_ANS || h == HEARD_USB1))
+    {
+        m->fsk_announced = true;
+        DM_INFO("modem", "%s heard; raising our Bell 103 carrier so the far end can tell what we are "
+                         "(tag=%s)", heard_name(h), m->tag);
+    }
     switch (h)
     {
     case HEARD_AC:
@@ -3100,7 +3169,10 @@ static void hunt_heard(dm_modem_t *m, heard_t h, int run)
             fsk_heard(m, DM_MOD_V21, h);
         break;
     case HEARD_BELL_ORIG:
-        if (!m->calling && m->offered_bell)
+        /* Unlike V.21's, a Bell 103 caller may speak first: it takes our
+         * answer tone or USB1 for its carrier (see above). Nothing else a
+         * caller sends sits at 1270 Hz - V.8's CM is at 980 and 1180. */
+        if (!m->calling)
             fsk_heard(m, DM_MOD_BELL103, h);
         break;
     default:
@@ -3227,10 +3299,9 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     }
 
     parse_v42_mode(params->v42, &m->v42_mode);
-    if (m->v42_mode == DM_V42_DETECT && m->mod == DM_MOD_V23)
+    if (m->v42_mode == DM_V42_DETECT && !carries_v42(m->mod))
     {
-        DM_DEBUG("modem", "no V.42 over V.23: its 75 bps back channel cannot carry LAPM (tag=%s)",
-                 params->tag ? params->tag : "");
+        DM_DEBUG("modem", "no V.42 over %s (tag=%s)", m->mod_name, params->tag ? params->tag : "");
         m->v42_mode = DM_V42_OFF;
     }
     m->v42_timeout_s = params->v42_timeout_s > 0 ? params->v42_timeout_s : 10;
@@ -3675,7 +3746,8 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
         }
         else if (m->v22 != NULL)
             n = v22bis_tx(m->v22, samples, max_count);
-        else if (m->fsk_tx != NULL && m->calling && fsk_needs_tone(m->mod) && !m->fsk_confirmed)
+        else if (m->fsk_tx != NULL && m->calling && fsk_needs_tone(m->mod) && !m->fsk_confirmed &&
+                 !m->fsk_announced)
             ; /* a calling FSK modem is silent until it hears the answering carrier */
         else if (m->fsk_tx != NULL)
         {
