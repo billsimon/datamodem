@@ -899,7 +899,7 @@ void dm_usage(void)
            "each in turn until the caller replies, the way V.32bis Annex A does.\n"
            "--modulation starts lower and still steps down from there; --no-step-down\n"
            "runs that one modulation only. v23 never steps down.\n\n");
-    printf("V.42 error correction and V.42bis compression run on top of any of them, and\n"
+    printf("V.42 error correction and V.42bis compression run on top of V.22 and up, and\n"
            "are on by default, calling and answering, as on a modem with factory settings:\n"
            "V.42 with V.42bis when the far end does both, V.42 alone when it will not\n"
            "compress, and a direct async link when it does not do V.42 at all.\n"
@@ -907,7 +907,8 @@ void dm_usage(void)
            "  --v42 off        direct async only, with no V.42 handshake at the start\n"
            "  --no-v42bis      V.42 without offering compression\n"
            "The far end may also take a smaller dictionary or shorter strings than\n"
-           "--v42bis-dict and --v42bis-max-string offer. V.23 never runs V.42.\n\n");
+           "--v42bis-dict and --v42bis-max-string offer. V.21, Bell 103 and V.23 never\n"
+           "run V.42.\n\n");
     printf("Examples:\n"
            "  export DATAMODEM_PASSWORD=...\n"
            "  datamodem +15551234567 --server sip.example.com --username 1001\n\n"

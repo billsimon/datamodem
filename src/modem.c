@@ -505,6 +505,16 @@ static bool is_fsk(dm_mod_t m)
     return m == DM_MOD_V21 || m == DM_MOD_BELL103 || m == DM_MOD_V23;
 }
 
+/* Whether V.42 runs over this modulation at all. Not over V.23, whose 75 bps
+ * back channel takes 14 seconds to send one LAPM frame against a one second
+ * acknowledgement timer; and not over the 300 bps FSK modems either, where
+ * detection alone puts several seconds of DC1s on the line - typed input, to
+ * the many 300 bps hosts that do not do V.42, a Cisco MICA among them. */
+static bool carries_v42(dm_mod_t m)
+{
+    return !is_fsk(m);
+}
+
 static bool parse_parity(const char *s, int *out)
 {
     if (s == NULL || *s == '\0' || strcasecmp(s, "none") == 0 || strcasecmp(s, "n") == 0)
@@ -1023,20 +1033,19 @@ bool dm_modem_params_check(const dm_modem_params_t *p, char *err, size_t err_len
             snprintf(err, err_len, "--v42 must be off, detect or require");
             return false;
         }
-        /* V.42 cannot work over V.23's 75 bps back channel. One LAPM frame
-         * is 1072 bits, which takes 14 seconds to send at 75 bps, while
-         * T401 - the time the far end waits for an acknowledgement - is one
-         * second. Every frame would be given up on before it had finished
-         * transmitting. V.42 was written for symmetric modems at 1200 bps
-         * and above, and V.23 predates it; the combination never existed.
-         * detect, the default, means "if the far end will" - and over V.23
-         * it will not, so dm_modem_create() runs it as off. Only require is
-         * a contradiction. */
-        if (mode == DM_V42_REQUIRE && mod == DM_MOD_V23)
+        /* V.42 does not run over V.21, Bell 103 or V.23 - see carries_v42().
+         * detect, the default, means "if it can", so dm_modem_create() runs
+         * it as off there. Only require is a contradiction - and starting at
+         * one of these, there is nothing faster to step down from. */
+        if (mode == DM_V42_REQUIRE && !carries_v42(mod))
         {
-            snprintf(err, err_len,
-                     "--v42 require cannot run over V.23: its 75 bps back channel takes 14 seconds "
-                     "to send one LAPM frame, and the acknowledgement timer is one second");
+            if (mod == DM_MOD_V23)
+                snprintf(err, err_len,
+                         "--v42 require cannot run over V.23: its 75 bps back channel takes 14 "
+                         "seconds to send one LAPM frame, and the acknowledgement timer is one second");
+            else
+                snprintf(err, err_len, "--v42 require cannot run over %s: datamodem runs no V.42 at 300 bps",
+                         modulation_name(mod));
             return false;
         }
         /* --v42bis with --v42 off is not an error: V.42bis is an offer made
@@ -1783,14 +1792,26 @@ static void v42_status(void *user, int status)
     }
 }
 
-/* Once detection has given up: the rest of the ODP pair under way, so that
- * an async far end is not left half a character, then mark. */
+/* Once detection has given up: the rest of the ODP character under way and
+ * the ones after it, so that an async far end is not left half a character,
+ * then mark. spandsp loads the pair's second character only when it reaches
+ * it (txbits == 18), which the tail does not do: a first character ends
+ * there, already followed by its eight ones. */
+static bool v42_detect_tail_pending(const v42_state_t *v)
+{
+    return v->calling_party && v->neg.txbits > 0 && v->neg.txbits != 18;
+}
+
 static int v42_detect_tail_bit(v42_state_t *v)
 {
     int bit;
 
-    if (!v->calling_party || v->neg.txbits <= 0)
+    if (!v42_detect_tail_pending(v))
+    {
+        if (v->calling_party)
+            v->neg.txbits = 0;
         return 1;
+    }
     bit = (int) (v->neg.txstream & 1);
     v->neg.txstream >>= 1;
     v->neg.txbits--;
@@ -1822,6 +1843,14 @@ static int tx_get_bit(void *user)
         bit = v42_tx_bit(m->v42);
         return m->v42->lapm.state == DM_LAPM_V42_UNSUPPORTED ? v42_detect_tail_bit(m->v42) : bit;
     }
+    /* The fall back comes a frame or so after detection gives up, and the
+     * character under way may not be finished by then. Cut short, the rest
+     * of it goes out as mark and the far end receives a byte that is
+     * neither ODP nor anything we were asked to send - 0x91 arriving as
+     * 0xf1, say. */
+    if (m->v42 != NULL && m->v42_fell_back && m->v42->lapm.state == DM_LAPM_V42_UNSUPPORTED &&
+        v42_detect_tail_pending(m->v42))
+        return v42_detect_tail_bit(m->v42);
     return async_framer_get_bit(m);
 }
 
@@ -1864,6 +1893,25 @@ static void note_connected(dm_modem_t *m)
         m->bit_rate = dm_v34_rx_rate(m->v34);
         m->tx_bit_rate = dm_v34_tx_rate(m->v34);
         v42_set_bit_rate(m, m->tx_bit_rate);
+    }
+
+    /* Stepped down to a modulation that runs no V.42 - see carries_v42().
+     * Nothing has gone through it yet: until now the carrier was not up. */
+    if (first && m->v42 != NULL && !carries_v42(m->mod))
+    {
+        if (m->v42_mode == DM_V42_REQUIRE)
+        {
+            m->carrier_lost = true;
+            m->phase = DM_PHASE_DOWN;
+            DM_ERROR("modem", "the far end is a %s modem, which runs no V.42, and --v42 require was "
+                              "asked for, so the call is no use (tag=%s)", m->mod_name, m->tag);
+            return;
+        }
+        DM_INFO("modem", "no V.42 over %s; this link has no error correction (tag=%s)", m->mod_name, m->tag);
+        v42_release(m->v42);
+        v42_free(m->v42);
+        m->v42 = NULL;
+        m->v42_mode = DM_V42_OFF;
     }
 
     if (first)
@@ -3227,10 +3275,9 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     }
 
     parse_v42_mode(params->v42, &m->v42_mode);
-    if (m->v42_mode == DM_V42_DETECT && m->mod == DM_MOD_V23)
+    if (m->v42_mode == DM_V42_DETECT && !carries_v42(m->mod))
     {
-        DM_DEBUG("modem", "no V.42 over V.23: its 75 bps back channel cannot carry LAPM (tag=%s)",
-                 params->tag ? params->tag : "");
+        DM_DEBUG("modem", "no V.42 over %s (tag=%s)", m->mod_name, params->tag ? params->tag : "");
         m->v42_mode = DM_V42_OFF;
     }
     m->v42_timeout_s = params->v42_timeout_s > 0 ? params->v42_timeout_s : 10;

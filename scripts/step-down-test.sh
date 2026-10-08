@@ -3,7 +3,7 @@
 # defaults - V.34, stepping down - against every older modem it might meet,
 # calling and answering, and two that both step down from different places;
 # then V.42 and V.42bis, on by default, against far ends that will not
-# compress or do not do V.42 at all. The older modem is datamodem with
+# compress or do not do V.42 at all (and none of it at V.21 or Bell 103). The older modem is datamodem with
 # --no-step-down, which behaves as one: a V.22 bis answerer that sends USB1
 # and waits, a V.21 caller that says nothing until it hears channel 2.
 #
@@ -91,14 +91,17 @@ for line in "" "ulaw,delay=150,echo=-12" "ulaw,delay=350,noise=-40"; do
 done
 
 echo "== V.42 and V.42bis by default, and what each falls back to"
+# V.21 and Bell 103 run no V.42 at all, whatever either end asks for.
 for line in "" "ulaw,delay=150,echo=-12"; do
     for mod in v34 v32bis v22bis v21 bell103; do
         far="answer:$mod"
-        case_ "${line:-perfect}: $mod, both ends default"        "$mod/V.42/V.42bis" "$far" "$line"
+        both="$mod/V.42/V.42bis" ec="$mod/V.42"
+        case $mod in v21|bell103) both="$mod/async" ec="$mod/async" ;; esac
+        case_ "${line:-perfect}: $mod, both ends default"        "$both"             "$far" "$line"
         V42=answer:no-v42bis \
-        case_ "${line:-perfect}: $mod, answerer will not compress" "$mod/V.42"       "$far" "$line"
+        case_ "${line:-perfect}: $mod, answerer will not compress" "$ec"             "$far" "$line"
         V42=call:no-v42bis \
-        case_ "${line:-perfect}: $mod, caller will not compress"   "$mod/V.42"       "$far" "$line"
+        case_ "${line:-perfect}: $mod, caller will not compress"   "$ec"             "$far" "$line"
         V42=answer:off \
         case_ "${line:-perfect}: $mod, answerer has no V.42"       "$mod/async"      "$far" "$line"
         V42=call:off \
