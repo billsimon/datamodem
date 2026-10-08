@@ -194,6 +194,8 @@ typedef enum
     HEARD_BELL_ANS,  /* Bell 103's answering band: mark 2225 Hz */
     HEARD_V21_ORIG,  /* V.21 channel 1, the calling modem's: mark 980 Hz */
     HEARD_BELL_ORIG, /* Bell 103's originating band: mark 1270 Hz */
+    HEARD_V23_ANS,   /* V.23's forward channel, the answering modem's: mark 1300 Hz */
+    HEARD_V23_ORIG,  /* V.23's backward channel, the calling modem's: mark 390 Hz */
     HEARD_LOW_FSK,   /* one or the other: which, takes more than one block to say */
     HEARD_COUNT
 } heard_t;
@@ -354,7 +356,7 @@ struct dm_modem
     bool offered_bell;         /* and Bell 103's 2225 Hz */
     bool fsk_carrier;
     bool fsk_confirmed;        /* the far end's FSK tone has been heard, not just energy */
-    bool fsk_announced;        /* calling Bell 103: carrier up before 2225 Hz, see hunt_heard() */
+    bool fsk_announced;        /* calling: carrier up before the far end's, see hunt_heard() */
     long long fsk_mark_from;   /* calling: when our own carrier went out, -1 = not yet */
     size_t tx_limit;           /* DM_TX_SECONDS of the current line rate, in bytes */
     int bit_rate;
@@ -746,14 +748,6 @@ static bool can_step_down(const dm_modem_t *m)
     return rung(m->ceiling) < rung(DM_MOD_BELL103);
 }
 
-/* V.21 and Bell 103 receivers take any energy at all for a carrier, so a V.32
- * caller's AA, or our own echo, would connect them to nothing. They wait to
- * hear the far end's tone in its band. V.23 is left as it was. */
-static bool fsk_needs_tone(dm_mod_t mod)
-{
-    return mod == DM_MOD_V21 || mod == DM_MOD_BELL103;
-}
-
 /* --------------------------------------------------------------- listening
  *
  * Which modem is at the far end, from what it sends before it has heard
@@ -924,6 +918,16 @@ static heard_t listen_block(dm_listen_t *l)
         tone_peak(x, n, 1630.0f, 1670.0f, &at) + tone_peak(x, n, 1830.0f, 1870.0f, &at) >= 0.2f * whole)
         return HEARD_V21_ANS;
 
+    /* V.23 idling at mark: 1300 Hz forward, 390 Hz backward. Nothing else
+     * either end sends sits at 390. 1300 is 30 Hz above Bell 103's calling
+     * mark, which over a 40 ms block puts a quarter of its power at 1285, so
+     * a tone peaking from there up is V.23's. Only the mark is looked for:
+     * both ends idle at it until they are connected. */
+    if (!own_between(l, 1285.0f, 1320.0f) && tone_peak(x, n, 1285.0f, 1320.0f, &at) >= DM_LISTEN_SHARE * whole)
+        return HEARD_V23_ANS;
+    if (!own_between(l, 370.0f, 410.0f) && tone_peak(x, n, 370.0f, 410.0f, &at) >= DM_LISTEN_SHARE * whole)
+        return HEARD_V23_ORIG;
+
     /* The two calling bands overlap - V.21's 980 and 1180 Hz, Bell 103's
      * 1070 and 1270 - so the band says FSK and the tones say whose. Idling
      * at mark that is plain at once; carrying data, the power smears between
@@ -957,6 +961,10 @@ static const char *heard_name(heard_t h)
         return "V.21's calling carrier";
     case HEARD_BELL_ORIG:
         return "Bell 103's calling carrier";
+    case HEARD_V23_ANS:
+        return "V.23's answering carrier";
+    case HEARD_V23_ORIG:
+        return "V.23's calling carrier";
     default:
         return "nothing";
     }
@@ -1862,7 +1870,6 @@ static int tx_get_bit(void *user)
 
 static void settle(dm_modem_t *m, const char *why);
 static void fsk_maybe_connect(dm_modem_t *m);
-static bool fsk_needs_tone(dm_mod_t mod);
 
 static void note_connected(dm_modem_t *m)
 {
@@ -1993,7 +2000,7 @@ static void rx_status(void *user, int status)
             m->fsk_carrier = true;
             /* Once connected the far end's tone is known; a carrier coming
              * back is a recovery, as it always was. */
-            if (fsk_needs_tone(m->mod) && !m->connected)
+            if (!m->connected)
                 fsk_maybe_connect(m);
             else
                 note_connected(m);
@@ -2784,6 +2791,8 @@ static void listen_own(dm_modem_t *m)
             listen_set_own(l, 980.0f, 1180.0f);
         else if (m->mod == DM_MOD_BELL103)
             listen_set_own(l, 1270.0f, 1070.0f);
+        else if (m->mod == DM_MOD_V23)
+            listen_set_own(l, 390.0f, 450.0f);
         else
             listen_set_own(l, 0.0f, 0.0f);
     }
@@ -2797,13 +2806,15 @@ static void listen_own(dm_modem_t *m)
         listen_set_own(l, 1650.0f, 1850.0f);
     else if (m->mod == DM_MOD_BELL103)
         listen_set_own(l, 2225.0f, 2025.0f);
+    else if (m->mod == DM_MOD_V23)
+        listen_set_own(l, 1300.0f, 2100.0f);
     else
         listen_set_own(l, 0.0f, 0.0f);
 }
 
 static bool listening(const dm_modem_t *m)
 {
-    return m->hunting || (fsk_needs_tone(m->mod) && !m->fsk_confirmed);
+    return m->hunting || (is_fsk(m->mod) && !m->fsk_confirmed);
 }
 
 /* The far end has answered in our terms; whatever happens now is this
@@ -3039,10 +3050,13 @@ static void hunt_tick(dm_modem_t *m, int samples)
 
 /* An FSK link is connected once the far end's carrier is up, its tone has
  * been heard as well, and our own pump is running - and, calling, our own
- * carrier has had time to be heard. */
+ * carrier has had time to be heard. An FSK receiver takes any energy at all
+ * for a carrier: a V.32 caller's AA, our own echo, or - to a calling V.23
+ * modem, which then read 2100 Hz space for most of a minute - an answering
+ * modem's USB1 at 2250 Hz. Only the far end's own tone in its band counts. */
 static void fsk_maybe_connect(dm_modem_t *m)
 {
-    if (!fsk_needs_tone(m->mod) || !m->fsk_confirmed || !m->fsk_carrier || !m->pump_started || m->connected)
+    if (!is_fsk(m->mod) || !m->fsk_confirmed || !m->fsk_carrier || !m->pump_started || m->connected)
         return;
     if (m->calling &&
         (m->fsk_mark_from < 0 ||
@@ -3089,13 +3103,19 @@ static void hunt_heard(dm_modem_t *m, heard_t h, int run)
      * automode answerer - a Cisco MICA is one - listens for exactly that
      * before it offers Bell 103: it plays its answer tone, USB1, V.21 and
      * V.23 in turn and never 2225 Hz unprompted. Ours goes on air the same
-     * way, but still connects only on hearing 2225 Hz itself. */
-    if (m->calling && m->mod == DM_MOD_BELL103 && !m->fsk_confirmed && !m->fsk_announced &&
+     * way, but still connects only on hearing 2225 Hz itself.
+     *
+     * A V.23 caller does the same, as ours always has. A V.21 caller does
+     * not: V.21's answering band does not reach 2100 Hz, so a real one waits
+     * for 1650 Hz, and speaking first gains nothing - the Level 29 BBS's
+     * modem, a V.8 one offering USB1 alone, took a Bell 103 caller during it
+     * and ignored 38 seconds of V.21's 980 Hz. */
+    if (m->calling && is_fsk(m->mod) && m->mod != DM_MOD_V21 && !m->fsk_confirmed && !m->fsk_announced &&
         (h == HEARD_ANS || h == HEARD_USB1))
     {
         m->fsk_announced = true;
-        DM_INFO("modem", "%s heard; raising our Bell 103 carrier so the far end can tell what we are "
-                         "(tag=%s)", heard_name(h), m->tag);
+        DM_INFO("modem", "%s heard; raising our %s carrier so the far end can tell what we are "
+                         "(tag=%s)", heard_name(h), m->mod_name, m->tag);
     }
     switch (h)
     {
@@ -3174,6 +3194,14 @@ static void hunt_heard(dm_modem_t *m, heard_t h, int run)
          * caller sends sits at 1270 Hz - V.8's CM is at 980 and 1180. */
         if (!m->calling)
             fsk_heard(m, DM_MOD_BELL103, h);
+        break;
+    case HEARD_V23_ANS:
+        if (m->calling)
+            fsk_heard(m, DM_MOD_V23, h);
+        break;
+    case HEARD_V23_ORIG:
+        if (!m->calling)
+            fsk_heard(m, DM_MOD_V23, h);
         break;
     default:
         break;
@@ -3746,8 +3774,7 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
         }
         else if (m->v22 != NULL)
             n = v22bis_tx(m->v22, samples, max_count);
-        else if (m->fsk_tx != NULL && m->calling && fsk_needs_tone(m->mod) && !m->fsk_confirmed &&
-                 !m->fsk_announced)
+        else if (m->fsk_tx != NULL && m->calling && !m->fsk_confirmed && !m->fsk_announced)
             ; /* a calling FSK modem is silent until it hears the answering carrier */
         else if (m->fsk_tx != NULL)
         {

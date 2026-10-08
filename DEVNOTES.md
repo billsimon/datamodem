@@ -168,24 +168,37 @@ carrying data — V.42's ODP, say — smear between their tones, and their
 calling bands interleave 90 Hz apart, so which one it is is decided over the
 whole run of blocks rather than one at a time.
 
-V.21 and Bell 103 now wait to hear the far end's tone before they connect, at
-either end, rather than taking any energy for a carrier — a V.32 caller's AA,
-or the far end's echo of our own, used to be enough. A calling V.21 modem
-stays silent until it hears the answering carrier, as the real ones did, and
-then holds its own at mark for half a second plus the path before it passes
-data, so the answerer is listening when the first character arrives.
+V.21, Bell 103 and V.23 wait to hear the far end's tone before they connect,
+at either end, rather than taking any energy for a carrier — a V.32 caller's
+AA, or the far end's echo of our own, used to be enough. For V.23 the tones
+are the marks, 1300 Hz forward and 390 Hz back. A calling V.23 modem that
+took any energy for a carrier once "connected" to a V.8 answerer's USB1:
+2250 Hz is close enough to V.23's 2100 Hz space that the demodulator read
+continuous space, and passed on 0x00 at 120 bytes a second for most of a
+minute. A calling FSK modem holds its own carrier at mark for half a second
+plus the path before it passes data, so the answerer is listening when the
+first character arrives.
 
-A calling Bell 103 modem goes on air sooner: on hearing an answer tone
-(2100 Hz) or USB1 (2250 Hz) it raises its 1270 Hz mark, though it still
-connects only once it has heard 2225 Hz. A real Bell 103 caller's receiver
-takes anything between about 2025 and 2225 Hz for the answering carrier, and
-both of those are in it, so real ones do the same - and automode answerers
-depend on it. A Cisco MICA answers with its answer tone, USB1, V.21's 1650 Hz
-and V.23's 1300 Hz in turn, and never offers 2225 Hz unprompted: it listens
-for the caller's 1270 Hz instead. A Bell 103 caller that waited for 2225 Hz,
-as ours used to, sat silent until the MICA hung up. V.21's answering band,
-1650 to 1850 Hz, does not include 2100 Hz, which is why a real V.21 caller
-does wait and why the MICA offers V.21 explicitly.
+A calling Bell 103 or V.23 modem goes on air before it has heard the
+answering carrier: on hearing an answer tone (2100 Hz) or USB1 (2250 Hz) it
+raises its own mark, though it still connects only once it has heard the far
+end's. A real Bell 103 caller's receiver takes anything between about 2025
+and 2225 Hz for the answering carrier, and both of those are in it, so real
+ones do the same — and automode answerers depend on it. A Cisco MICA answers
+with its answer tone, USB1, V.21's 1650 Hz and V.23's 1300 Hz in turn, and
+never offers 2225 Hz unprompted: it listens for the caller's 1270 Hz instead.
+A Bell 103 caller that waited for 2225 Hz, as ours used to, sat silent until
+the MICA hung up. For the V.23 caller this keeps what it always did, going
+on the air as the answer tone ends; only with no answer tone or USB1 at all
+does it now wait for 1300 Hz.
+
+A calling V.21 modem stays silent until it hears 1650 Hz, as the real ones
+do: V.21's answering band, 1650 to 1850 Hz, does not include 2100 Hz. Against
+the MICA, which offers V.21 explicitly, that works. Speaking first was tried
+against the Level 29 BBS, whose V.8 modem, hearing no CM, plays ANSam and
+then 46 seconds of USB1 and nothing else: it answers a Bell 103 caller
+during the USB1, but ignored 38 seconds of V.21's 980 Hz. V.21 cannot reach
+it at all, and nothing else has needed a V.21 caller to speak first.
 
 ### The V.22bis situation, and why `third_party` exists
 
