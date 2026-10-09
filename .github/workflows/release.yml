@@ -129,7 +129,7 @@ jobs:
           ver=$(sed -n 's/^#define DATAMODEM_VERSION "\(.*\)"/\1/p' include/datamodem/version.h)
           case "$GITHUB_REF" in
             refs/tags/v*) ;;
-            *) ver="$ver-dev.$(git rev-parse --short HEAD)" ;;
+            *) ver="$ver-dev.${GITHUB_SHA:0:7}" ;;
           esac
           name=datamodem-$ver-${{ matrix.target }}
           mkdir -p "dist/$name"
@@ -213,9 +213,14 @@ jobs:
           path: deps
           key: deps-windows-x86_64-${{ hashFiles('scripts/build-deps.sh') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # Cygwin has no git of its own; the checkout's is Windows'.
+      - name: Note the commit time
+        shell: pwsh
+        run: |
+          "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> $env:GITHUB_ENV
+
       - name: Build
         run: |
-          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
           {
             cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
               -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
@@ -246,7 +251,7 @@ jobs:
           ver=$(sed -n 's/^#define DATAMODEM_VERSION "\(.*\)"/\1/p' include/datamodem/version.h)
           case "$GITHUB_REF" in
             refs/tags/v*) ;;
-            *) ver="$ver-dev.$(git rev-parse --short HEAD)" ;;
+            *) ver="$ver-dev.${GITHUB_SHA:0:7}" ;;
           esac
           name=datamodem-$ver-windows-x86_64
           mkdir -p "dist/$name"
