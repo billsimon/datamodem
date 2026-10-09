@@ -79,7 +79,7 @@ cmake --build build
 
 That is what `.github/workflows/release.yml` does on macOS, Linux and
 Cygwin for every push and pull request. Pushing a tag that matches
-`include/datamodem/version.h`, such as `v0.1.0`, publishes the four builds
+`include/datamodem/version.h`, such as `v1.0.0`, publishes the four builds
 as a GitHub release.
 
 ## Using it
