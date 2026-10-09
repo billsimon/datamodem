@@ -1,0 +1,242 @@
+# Release builds for macOS (Apple Silicon), Linux (x86_64, arm64) and Windows
+# (x86_64, under Cygwin). Every push and pull request builds and tests all
+# four; pushing a tag vX.Y.Z also publishes them as a GitHub release.
+#
+# spandsp, pjproject and OpenSSL are built from source by
+# scripts/build-deps.sh and linked statically, so each binary needs only
+# what the OS provides: macOS's frameworks, glibc and ALSA on Linux, and
+# cygwin1.dll (shipped beside it) on Windows. They are cached until that
+# script changes.
+name: Release builds
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  unix:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-15
+          # 22.04 rather than latest: the binary needs the glibc it was
+          # built against or newer, and 2.35 covers Debian 12, Ubuntu 22.04,
+          # RHEL 10 and anything since.
+          - target: linux-x86_64
+            runner: ubuntu-22.04
+          - target: linux-arm64
+            runner: ubuntu-22.04-arm
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install libtiff pkgconf
+          else
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends libtiff-dev libasound2-dev pkg-config
+          fi
+
+      - name: Restore dependencies
+        id: deps
+        uses: actions/cache@v6
+        with:
+          path: deps
+          key: deps-${{ matrix.target }}-${{ hashFiles('scripts/build-deps.sh') }}
+
+      - name: Build dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: DEPS_DOWNLOADS=$RUNNER_TEMP/deps-src scripts/build-deps.sh deps
+
+      - name: Build
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
+          cmake --build build --parallel
+
+      - name: Test
+        run: |
+          ctest --test-dir build --output-on-failure
+          build/datamodem version
+          for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
+            build/datamodem selftest --modulation $m --no-step-down
+          done
+
+      - name: Check what the binary links against
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            otool -L build/datamodem
+            if otool -L build/datamodem | tail -n +2 | grep -vE '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
+              echo "::error::linked against a library macOS does not ship"; exit 1
+            fi
+          else
+            readelf -d build/datamodem | grep NEEDED
+            if readelf -d build/datamodem | grep NEEDED |
+                grep -vE '\[(libc|libm|libpthread|libdl|librt|libasound)\.so\.[0-9]+\]|\[ld-linux[^]]*\]'; then
+              echo "::error::linked against a library outside glibc and ALSA"; exit 1
+            fi
+            echo "needs glibc $(objdump -T build/datamodem | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)"
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          ver=$(sed -n 's/^#define DATAMODEM_VERSION "\(.*\)"/\1/p' include/datamodem/version.h)
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *) ver="$ver-dev.$(git rev-parse --short HEAD)" ;;
+          esac
+          name=datamodem-$ver-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cmake --install build --prefix "$RUNNER_TEMP/install" --strip
+          cp "$RUNNER_TEMP/install/bin/datamodem" "dist/$name/"
+          cp README.md examples/datamodem.conf "dist/$name/"
+          cp -R deps/share/licenses "dist/$name/licenses"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "file=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.package.outputs.file }}
+          if-no-files-found: error
+
+  windows:
+    name: windows-x86_64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: C:\cygwin\bin\bash.exe --login -o igncr -eo pipefail '{0}'
+    env:
+      # A login shell, for Cygwin's PATH alone, that stays in the checkout.
+      CYGWIN_NOWINPATH: '1'
+      CHERE_INVOKING: '1'
+    steps:
+      - name: Keep line endings as committed
+        shell: pwsh
+        run: git config --global core.autocrlf input
+
+      - uses: actions/checkout@v7
+
+      - uses: cygwin/cygwin-install-action@v6
+        with:
+          install-dir: C:\cygwin
+          packages: >-
+            gcc-core make cmake pkg-config perl curl tar xz zip file
+            libtiff-devel
+
+      - name: Restore dependencies
+        id: deps
+        uses: actions/cache@v6
+        with:
+          path: deps
+          key: deps-windows-x86_64-${{ hashFiles('scripts/build-deps.sh') }}
+
+      - name: Build dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: DEPS_DOWNLOADS=$(cygpath "$RUNNER_TEMP")/deps-src scripts/build-deps.sh deps
+
+      - name: Build
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
+          cmake --build build --parallel
+
+      - name: Test
+        run: |
+          ctest --test-dir build --output-on-failure
+          build/datamodem version
+          for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
+            build/datamodem selftest --modulation $m --no-step-down
+          done
+
+      - name: Check what the binary links against
+        run: |
+          # Everything but cygwin1.dll should be Windows' own.
+          cygcheck build/datamodem.exe
+          if cygcheck build/datamodem.exe | sed 's/^ *//' | grep -viE '^(c:\\windows\\|.*\\cygwin1\.dll$)' | grep -iE '\.dll$'; then
+            echo "::error::needs a DLL other than cygwin1.dll"; exit 1
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          ver=$(sed -n 's/^#define DATAMODEM_VERSION "\(.*\)"/\1/p' include/datamodem/version.h)
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *) ver="$ver-dev.$(git rev-parse --short HEAD)" ;;
+          esac
+          name=datamodem-$ver-windows-x86_64
+          mkdir -p "dist/$name"
+          strip -o "dist/$name/datamodem.exe" build/datamodem.exe
+          cp /usr/bin/cygwin1.dll "dist/$name/"
+          cp README.md examples/datamodem.conf "dist/$name/"
+          cp -R deps/share/licenses "dist/$name/licenses"
+          mkdir -p "dist/$name/licenses/cygwin"
+          find /usr/share/doc -maxdepth 2 -ipath '*cygwin*' \( -iname 'COPYING*' -o -iname '*LICENSE*' \) \
+            -exec cp {} "dist/$name/licenses/cygwin/" \;
+          ls -l "dist/$name/licenses/cygwin"
+          cat > "dist/$name/licenses/cygwin/SOURCE.txt" <<EOF
+          cygwin1.dll is Cygwin $(uname -r), under the LGPLv3.
+          Its source is at https://cygwin.com/git/?p=newlib-cygwin.git
+          EOF
+          (cd dist && zip -qr "$name.zip" "$name")
+          echo "file=dist/$name.zip" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64
+          path: ${{ steps.package.outputs.file }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [unix, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches the version
+        run: |
+          ver=$(sed -n 's/^#define DATAMODEM_VERSION "\(.*\)"/\1/p' include/datamodem/version.h)
+          if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but version.h says $ver"; exit 1
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          prerelease=
+          case "$GITHUB_REF_NAME" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            --title "datamodem ${GITHUB_REF_NAME#v}" $prerelease *

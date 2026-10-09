@@ -26,6 +26,10 @@ option(DATAMODEM_VENDOR_V22BIS "Build V.22bis from the vendored, patched spandsp
 # and rejects a far end using the top of the range V.42 permits.
 # third_party/spandsp-v42 holds the one-line fix.
 option(DATAMODEM_VENDOR_V42 "Build V.42 from the vendored, patched spandsp source" ON)
+# Release builds link spandsp, pjproject and the OpenSSL beneath it from
+# static archives, so the binary runs where none of them is installed.
+# scripts/build-deps.sh builds them; point CMAKE_PREFIX_PATH at its prefix.
+option(DATAMODEM_STATIC_DEPS "Link spandsp, pjproject and OpenSSL statically" OFF)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SPANDSP REQUIRED IMPORTED_TARGET spandsp)
@@ -37,7 +41,9 @@ pkg_check_modules(PJPROJECT REQUIRED IMPORTED_TARGET libpjproject)
 pkg_check_modules(TIFF REQUIRED libtiff-4)
 
 find_package(Threads REQUIRED)
-find_package(OpenSSL)
+if(NOT DATAMODEM_STATIC_DEPS)
+  find_package(OpenSSL)
+endif()
 
 # libpjproject.pc lists only the pj* libraries; the codecs and SRTP that
 # pjproject bundles sit beside them as static archives and still have to be
@@ -152,6 +158,17 @@ target_link_libraries(datamodem PRIVATE
   PkgConfig::SPANDSP
   Threads::Threads
 )
+if(DATAMODEM_STATIC_DEPS)
+  # Everything libpjproject.pc keeps in Libs.private: the bundled codecs and
+  # SRTP, OpenSSL, and the platform's own libraries (ALSA on Linux). The
+  # prefix holds only archives, so -lssl and -lcrypto find those.
+  target_link_directories(datamodem PRIVATE ${PJPROJECT_STATIC_LIBRARY_DIRS})
+  target_link_libraries(datamodem PRIVATE ${PJPROJECT_STATIC_LIBRARIES})
+  if(CYGWIN)
+    # Leaves cygwin1.dll as the one DLL the binary needs.
+    target_link_options(datamodem PRIVATE -static-libgcc)
+  endif()
+endif()
 if(NOT APPLE)
   # v32.c is our own signal processing, not spandsp's; glibc keeps libm apart.
   target_link_libraries(datamodem PRIVATE m)
@@ -177,8 +194,9 @@ if(DATAMODEM_HARDENING)
     -fno-strict-aliasing          # spandsp and pjsip both type-pun
     $<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>
   )
-  if(NOT APPLE)
-    # PIE plus full RELRO; the macOS toolchain does both by default.
+  if(NOT APPLE AND NOT CYGWIN)
+    # PIE plus full RELRO; the macOS toolchain does both by default, and
+    # neither applies to a Windows executable.
     target_compile_options(datamodem PRIVATE -fPIE)
     target_link_options(datamodem PRIVATE -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack)
   endif()
