@@ -80,7 +80,7 @@ cmake --build build
 That is what `.github/workflows/release.yml` does on macOS, Linux and
 Cygwin for every push and pull request. Pushing a tag that matches
 `include/datamodem/version.h`, such as `v1.0.0`, publishes the four builds
-as a GitHub release.
+as a GitHub release, with the source of the libraries they carry.
 
 ## Using it
 
@@ -470,3 +470,15 @@ delay and dropouts on the selftest's line, are described in
 | 6 | answered, but the link never carried data - never trained, or `--v42 require` and the far end does not do V.42 |
 | 7 | a deadline was hit |
 | 8 | internal error |
+
+## Licence
+
+datamodem is free software under the GNU General Public License, version 3
+or (at your option) any later version; see [LICENSE](LICENSE).
+
+The release binaries have pjproject (GPLv2 or later), spandsp (LGPLv2.1) and
+OpenSSL (Apache 2.0) linked in, and only the GPLv3 covers all three, so the
+binaries are GPLv3. Each archive carries those licences under `licenses/`.
+Every release has the source tarballs of those three libraries attached, as
+it has the source of the `cygwin1.dll` in the Windows zip (Cygwin, LGPLv3);
+[scripts/build-deps.sh](scripts/build-deps.sh) is how they are built.

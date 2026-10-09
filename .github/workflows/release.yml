@@ -89,6 +89,7 @@ jobs:
           if otool -L build/datamodem | tail -n +2 | grep -vE '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
             echo "::error::linked against a library macOS does not ship"; exit 1
           fi
+          scripts/check-codecs.sh build/datamodem
 
       - name: Package
         id: package
@@ -102,7 +103,7 @@ jobs:
           mkdir -p "dist/$name"
           cmake --install build --prefix "$RUNNER_TEMP/install" --strip
           cp "$RUNNER_TEMP/install/bin/datamodem" "dist/$name/"
-          cp README.md examples/datamodem.conf "dist/$name/"
+          cp LICENSE README.md examples/datamodem.conf "dist/$name/"
           cp -R deps/share/licenses "dist/$name/licenses"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "file=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
@@ -201,6 +202,7 @@ jobs:
           if [ "$(printf '%s\n' "$need" 2.28 | sort -V | tail -1)" != 2.28 ]; then
             echo "::error::needs glibc $need, newer than 2.28"; exit 1
           fi
+          scripts/check-codecs.sh build/datamodem
 
       - name: Package
         id: package
@@ -214,7 +216,7 @@ jobs:
           mkdir -p "dist/$name"
           cmake --install build --prefix "$RUNNER_TEMP/install" --strip
           cp "$RUNNER_TEMP/install/bin/datamodem" "dist/$name/"
-          cp README.md examples/datamodem.conf "dist/$name/"
+          cp LICENSE README.md examples/datamodem.conf "dist/$name/"
           cp -R deps/share/licenses "dist/$name/licenses"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "file=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
@@ -400,6 +402,7 @@ jobs:
           if cygcheck build/datamodem.exe | grep -iE '\\(ws2_32|wsock32)\.dll$'; then
             echo "::error::links Winsock directly"; exit 1
           fi
+          scripts/check-codecs.sh build/datamodem.exe
 
       - name: Package
         id: package
@@ -413,24 +416,53 @@ jobs:
           mkdir -p "dist/$name"
           strip -o "dist/$name/datamodem.exe" build/datamodem.exe
           cp /usr/bin/cygwin1.dll "dist/$name/"
-          cp README.md examples/datamodem.conf "dist/$name/"
+          cp LICENSE README.md examples/datamodem.conf "dist/$name/"
           cp -R deps/share/licenses "dist/$name/licenses"
           mkdir -p "dist/$name/licenses/cygwin"
           find /usr/share/doc -maxdepth 2 -ipath '*cygwin*' \( -iname 'COPYING*' -o -iname '*LICENSE*' \) \
             -exec cp {} "dist/$name/licenses/cygwin/" \;
+          cp packaging/windows/COPYING.LGPLv3 "dist/$name/licenses/cygwin/"
           ls -l "dist/$name/licenses/cygwin"
+          cygver=$(cygcheck -cd cygwin | awk '$1 == "cygwin" { print $2 }')
           cat > "dist/$name/licenses/cygwin/SOURCE.txt" <<EOF
-          cygwin1.dll is Cygwin $(uname -r), under the LGPLv3.
-          Its source is at https://cygwin.com/git/?p=newlib-cygwin.git
+          cygwin1.dll is Cygwin $cygver, under the LGPLv3 (COPYING.LGPLv3,
+          which adds to the GPLv3 in COPYING). Its source, cygwin-$cygver-src.tar.xz,
+          is attached to the same release as this zip.
           EOF
           (cd dist && zip -qr "$name.zip" "$name")
           echo "file=dist/$name.zip" >> "$GITHUB_OUTPUT"
+          echo "cygver=$cygver" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v7
         with:
           name: windows-x86_64
           path: ${{ steps.package.outputs.file }}
           if-no-files-found: error
+
+      # The source of the cygwin1.dll in the zip, which the LGPL asks the
+      # release to carry: from the mirror it was installed from, checked
+      # against that mirror's package list.
+      - name: Fetch Cygwin's source
+        id: cygwin-source
+        env:
+          CYGVER: ${{ steps.package.outputs.cygver }}
+        run: |
+          mirror=https://mirrors.kernel.org/sourceware/cygwin
+          file=cygwin-$CYGVER-src.tar.xz
+          curl -fsSL --retry 3 "$mirror/x86_64/setup.ini" -o "$RUNNER_TEMP/setup.ini"
+          want=$(awk -v f="x86_64/release/cygwin/$file" '$1 == "source:" && $2 == f { print $4 }' "$RUNNER_TEMP/setup.ini")
+          [ -n "$want" ] || { echo "::error::$file is not in the mirror's setup.ini"; exit 1; }
+          mkdir -p cygwin-source
+          curl -fsSL --retry 3 "$mirror/x86_64/release/cygwin/$file" -o "cygwin-source/$file"
+          echo "$want  cygwin-source/$file" | sha512sum -c
+          echo "file=cygwin-source/$file" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64-cygwin-source
+          path: ${{ steps.cygwin-source.outputs.file }}
+          if-no-files-found: error
+          compression-level: 0
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -452,6 +484,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # The GPL asks that a binary's source go with it: datamodem's is the
+      # tag, and its dependencies' are attached beside the builds.
+      - name: Fetch the dependencies' source
+        run: scripts/build-deps.sh --sources dist
 
       - name: Publish
         env:
