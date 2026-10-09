@@ -6,6 +6,12 @@
 #   scripts/build-deps.sh <prefix>
 #   cmake -S . -B build -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH=<prefix>
 #
+#   scripts/build-deps.sh --sources <dir>
+#
+# The second form only fetches the three source tarballs, checked, into
+# <dir>: the release attaches them, as the GPL asks of a binary built
+# from them.
+#
 # Static archives only: with no shared library in the prefix, the linker has
 # nothing to choose but the archive. Each library leaves a stamp in the
 # prefix when it is installed, and a rerun skips the ones already there. Sources are fetched by checksum into
@@ -15,6 +21,7 @@ set -eu
 
 OPENSSL_VERSION=3.5.9
 OPENSSL_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+OPENSSL_URL=https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz
 # soft-switch.org no longer serves the 0.0.6 tarball. Debian's orig tarball
 # is the same release less some test images, under a stable URL.
 SPANDSP_VERSION=0.0.6
@@ -22,14 +29,25 @@ SPANDSP_URL=https://deb.debian.org/debian/pool/main/s/spandsp/spandsp_0.0.6+dfsg
 SPANDSP_SHA256=3dcdc611b8a119f1f26540d05e6279c4c1e5cd576271f6d45df431359fc190f9
 PJPROJECT_VERSION=2.17
 PJPROJECT_SHA256=065fe06c06788d97c35f563796d59f00ce52fe9558a52d7b490a042a966facce
+PJPROJECT_URL=https://github.com/pjsip/pjproject/archive/refs/tags/$PJPROJECT_VERSION.tar.gz
 
-if [ $# -ne 1 ]; then
-    echo "usage: $0 <prefix>" >&2
+usage() {
+    echo "usage: $0 <prefix> | $0 --sources <dir>" >&2
     exit 2
+}
+SOURCES_ONLY=
+if [ "${1:-}" = --sources ]; then
+    SOURCES_ONLY=1
+    shift
 fi
+[ $# -eq 1 ] || usage
 mkdir -p "$1"
 PREFIX=$(cd "$1" && pwd)
-DL=${DEPS_DOWNLOADS:-$(dirname "$PREFIX")/deps-src}
+if [ -n "$SOURCES_ONLY" ]; then
+    DL=$PREFIX
+else
+    DL=${DEPS_DOWNLOADS:-$(dirname "$PREFIX")/deps-src}
+fi
 mkdir -p "$DL"
 DL=$(cd "$DL" && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/datamodem-deps.XXXXXX")
@@ -73,6 +91,13 @@ fetch() {
     fi
 }
 
+if [ -n "$SOURCES_ONLY" ]; then
+    fetch "$OPENSSL_URL" "openssl-$OPENSSL_VERSION.tar.gz" "$OPENSSL_SHA256"
+    fetch "$SPANDSP_URL" "spandsp-$SPANDSP_VERSION.tar.xz" "$SPANDSP_SHA256"
+    fetch "$PJPROJECT_URL" "pjproject-$PJPROJECT_VERSION.tar.gz" "$PJPROJECT_SHA256"
+    exit 0
+fi
+
 # unpack <file> <name> - into $WORK/<name>, printing that directory
 unpack() {
     mkdir "$WORK/$2"
@@ -90,8 +115,7 @@ built() {
 if built openssl "$OPENSSL_VERSION"; then
     echo "==> OpenSSL $OPENSSL_VERSION already built"
 else
-fetch "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz" \
-    "openssl-$OPENSSL_VERSION.tar.gz" "$OPENSSL_SHA256"
+fetch "$OPENSSL_URL" "openssl-$OPENSSL_VERSION.tar.gz" "$OPENSSL_SHA256"
 src=$(unpack "openssl-$OPENSSL_VERSION.tar.gz" openssl)
 echo "==> building OpenSSL $OPENSSL_VERSION"
 (
@@ -108,8 +132,7 @@ touch "$PREFIX/.built-openssl-$OPENSSL_VERSION"
 fi
 
 # --- spandsp --------------------------------------------------------------
-fetch "https://github.com/pjsip/pjproject/archive/refs/tags/$PJPROJECT_VERSION.tar.gz" \
-    "pjproject-$PJPROJECT_VERSION.tar.gz" "$PJPROJECT_SHA256"
+fetch "$PJPROJECT_URL" "pjproject-$PJPROJECT_VERSION.tar.gz" "$PJPROJECT_SHA256"
 pjsrc=$(unpack "pjproject-$PJPROJECT_VERSION.tar.gz" pjproject)
 if built spandsp "$SPANDSP_VERSION"; then
     echo "==> spandsp $SPANDSP_VERSION already built"
@@ -167,12 +190,17 @@ echo "==> building pjproject $PJPROJECT_VERSION"
     # Audio and SIP only. Everything optional that would otherwise be
     # autodetected - and so differ from one build host to the next - is off,
     # and TLS is OpenSSL's, as in the Homebrew build datamodem was tested on.
+    # So are the codecs: datamodem offers G.711 alone, and the others bring
+    # licences of their own (G.722.1's, Polycom's, with patent terms).
     ./configure --prefix="$PREFIX" --libdir="$PREFIX/lib" \
         --disable-shared --disable-pjsua2 --disable-video --disable-libyuv \
         --disable-libwebrtc --disable-sdl --disable-ffmpeg --disable-v4l2 \
         --disable-openh264 --disable-vpx --disable-opencore-amr --disable-silk \
         --disable-opus --disable-bcg729 --disable-lyra --disable-upnp \
         --disable-libuuid --disable-darwin-ssl --with-ssl="$PREFIX" \
+        --disable-l16-codec --disable-gsm-codec --disable-g722-codec \
+        --disable-g7221-codec --disable-speex-codec --disable-ilbc-codec \
+        --disable-speex-aec --disable-libsrtp \
         >"$WORK/pjproject.log" 2>&1 || { tail -50 "$WORK/pjproject.log"; exit 1; }
     make dep >>"$WORK/pjproject.log" 2>&1 || { tail -50 "$WORK/pjproject.log"; exit 1; }
     make -j"$JOBS" lib >>"$WORK/pjproject.log" 2>&1 || { tail -50 "$WORK/pjproject.log"; exit 1; }
