@@ -39,7 +39,7 @@ How it works, and everything learned building it, is in
 
 [Releases](https://github.com/billsimon/datamodem/releases) carry ready-built
 binaries for macOS on Apple Silicon (11 or later), Linux on x86_64 and arm64
-(glibc 2.35 or later: Debian 12, Ubuntu 22.04, RHEL 10 and anything since),
+(glibc 2.34 or later: Debian 12, Ubuntu 22.04, RHEL 9 and anything since),
 and Windows on x86_64. Each is one self-contained program; unpack it and run
 it.
 

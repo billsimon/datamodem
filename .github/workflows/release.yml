@@ -34,8 +34,8 @@ jobs:
           - target: macos-arm64
             runner: macos-15
           # 22.04 rather than latest: the binary needs the glibc it was
-          # built against or newer, and 2.35 covers Debian 12, Ubuntu 22.04,
-          # RHEL 10 and anything since.
+          # built against (in practice 2.34) or newer, which covers Debian
+          # 12, Ubuntu 22.04, RHEL 9 and anything since.
           - target: linux-x86_64
             runner: ubuntu-22.04
           - target: linux-arm64
@@ -50,7 +50,6 @@ jobs:
 
       - name: Install build tools
         run: |
-          echo "CI_LOG=$RUNNER_TEMP/ci.log" >> "$GITHUB_ENV"
           if [ "$RUNNER_OS" = macOS ]; then
             brew install libtiff pkgconf
           else
@@ -72,7 +71,7 @@ jobs:
         id: deps
         run: |
           echo "before=$(ls deps/.built-* 2>/dev/null | wc -l)" >> "$GITHUB_OUTPUT"
-          DEPS_DOWNLOADS=$RUNNER_TEMP/deps-src scripts/build-deps.sh deps 2>&1 | tee -a "$CI_LOG"
+          DEPS_DOWNLOADS=$RUNNER_TEMP/deps-src scripts/build-deps.sh deps
 
       - name: Note what was built
         id: built
@@ -91,21 +90,17 @@ jobs:
       - name: Build
         run: |
           export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-          {
-            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-              -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
-            cmake --build build --parallel
-          } 2>&1 | tee -a "$CI_LOG"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
+          cmake --build build --parallel
 
       - name: Test
         run: |
-          {
-            ctest --test-dir build --output-on-failure
-            build/datamodem version
-            for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
-              build/datamodem selftest --modulation $m --no-step-down
-            done
-          } 2>&1 | tee -a "$CI_LOG"
+          ctest --test-dir build --output-on-failure
+          build/datamodem version
+          for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
+            build/datamodem selftest --modulation $m --no-step-down
+          done
 
       - name: Check what the binary links against
         run: |
@@ -140,18 +135,6 @@ jobs:
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "file=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
-      # The tail of whatever failed, as an annotation: readable from the
-      # run's summary page and the checks API without fetching raw logs.
-      - name: Report failure
-        if: failure()
-        run: |
-          [ -f "$CI_LOG" ] || exit 0
-          # An annotation holds about 4 KB, and a step may make ten.
-          tail -c 36000 "$CI_LOG" | tr -d '\r' | split -b 3900 - "$CI_LOG.part."
-          for f in "$CI_LOG".part.*; do
-            echo "::error title=Output, ${f##*.}::$(sed -e 's/%/%25/g' "$f" | awk 'BEGIN{ORS="%0A"} {print}')"
-          done
-
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
@@ -168,7 +151,6 @@ jobs:
       # A login shell, for Cygwin's PATH alone, that stays in the checkout.
       CYGWIN_NOWINPATH: '1'
       CHERE_INVOKING: '1'
-      CI_LOG: /tmp/ci.log
     steps:
       - name: Keep line endings as committed
         shell: pwsh
@@ -197,7 +179,7 @@ jobs:
         id: deps
         run: |
           echo "before=$(ls deps/.built-* 2>/dev/null | wc -l)" >> "$GITHUB_OUTPUT"
-          DEPS_DOWNLOADS=$(cygpath "$RUNNER_TEMP")/deps-src scripts/build-deps.sh deps 2>&1 | tee -a "$CI_LOG"
+          DEPS_DOWNLOADS=$(cygpath "$RUNNER_TEMP")/deps-src scripts/build-deps.sh deps
 
       - name: Note what was built
         id: built
@@ -221,21 +203,17 @@ jobs:
 
       - name: Build
         run: |
-          {
-            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-              -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
-            cmake --build build --parallel
-          } 2>&1 | tee -a "$CI_LOG"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
+          cmake --build build --parallel
 
       - name: Test
         run: |
-          {
-            ctest --test-dir build --output-on-failure
-            build/datamodem version
-            for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
-              build/datamodem selftest --modulation $m --no-step-down
-            done
-          } 2>&1 | tee -a "$CI_LOG"
+          ctest --test-dir build --output-on-failure
+          build/datamodem version
+          for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
+            build/datamodem selftest --modulation $m --no-step-down
+          done
 
       - name: Check what the binary links against
         run: |
@@ -269,18 +247,6 @@ jobs:
           EOF
           (cd dist && zip -qr "$name.zip" "$name")
           echo "file=dist/$name.zip" >> "$GITHUB_OUTPUT"
-
-      # The tail of whatever failed, as an annotation: readable from the
-      # run's summary page and the checks API without fetching raw logs.
-      - name: Report failure
-        if: failure()
-        run: |
-          [ -f "$CI_LOG" ] || exit 0
-          # An annotation holds about 4 KB, and a step may make ten.
-          tail -c 36000 "$CI_LOG" | tr -d '\r' | split -b 3900 - "$CI_LOG.part."
-          for f in "$CI_LOG".part.*; do
-            echo "::error title=Output, ${f##*.}::$(sed -e 's/%/%25/g' "$f" | awk 'BEGIN{ORS="%0A"} {print}')"
-          done
 
       - uses: actions/upload-artifact@v7
         with:
