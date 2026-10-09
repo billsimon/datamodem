@@ -166,17 +166,25 @@ target_link_libraries(datamodem PRIVATE
 )
 if(DATAMODEM_STATIC_DEPS)
   # Everything libpjproject.pc keeps in Libs.private: the bundled codecs and
-  # SRTP, OpenSSL, and the platform's own libraries (ALSA on Linux). The
-  # prefix holds only archives, so -lssl and -lcrypto find those.
+  # SRTP, OpenSSL, and the platform's own libraries. The prefix holds only
+  # archives, so -lssl and -lcrypto find those.
+  set(_pj_static_libs ${PJPROJECT_STATIC_LIBRARIES})
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND "asound" IN_LIST _pj_static_libs)
+    # But not ALSA: src/alsa_shim.c stands in for libasound and loads it only
+    # for --speaker, so the binary runs where ALSA isn't installed.
+    list(REMOVE_ITEM _pj_static_libs asound)
+    target_sources(datamodem PRIVATE src/alsa_shim.c)
+    target_compile_definitions(datamodem PRIVATE DATAMODEM_ALSA_SHIM=1)
+  endif()
   target_link_directories(datamodem PRIVATE ${PJPROJECT_STATIC_LIBRARY_DIRS})
-  target_link_libraries(datamodem PRIVATE ${PJPROJECT_STATIC_LIBRARIES})
+  target_link_libraries(datamodem PRIVATE ${_pj_static_libs})
   if(CYGWIN)
     # Leaves cygwin1.dll as the one DLL the binary needs.
     target_link_options(datamodem PRIVATE -static-libgcc)
   endif()
 endif()
-# sip.c reaches for libjack at run time, if it is there; glibc before 2.34
-# keeps dlopen() in libdl.
+# sip.c reaches for libjack at run time, if it is there, and alsa_shim.c for
+# libasound; glibc before 2.34 keeps dlopen() in libdl.
 target_link_libraries(datamodem PRIVATE ${CMAKE_DL_LIBS})
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # libpjproject.pc names libstdc++ and more that nothing here calls. Debian's

@@ -16,6 +16,9 @@
 #ifdef __linux__
 #include <dlfcn.h>
 #endif
+#ifdef DATAMODEM_ALSA_SHIM
+#include "datamodem/alsa_shim.h"
+#endif
 
 #define DM_CLOCK_RATE 8000
 #define DM_PTIME_MS 20
@@ -957,7 +960,19 @@ int dm_sip_start(const dm_config_t *cfg)
     char proxy_uri[DM_STR_MAX];
 
     g.cfg = *cfg;
+#ifdef DATAMODEM_ALSA_SHIM
+    /* Only --speaker needs a sound device. Without it ALSA stays unloaded,
+     * pjmedia finds no devices, and nothing gets probed. */
+    if (cfg->speaker)
+    {
+        if (dm_alsa_load())
+            quiet_jack();
+        else
+            DM_WARN("sip", "speaker: ALSA (libasound.so.2) is not installed; there is no sound device to play through");
+    }
+#else
     quiet_jack();
+#endif
 
     /* pjsua_create() logs before pjsua_init() installs log_cfg.cb, so claim
      * pjlib's writer first - otherwise those first lines land on the user's

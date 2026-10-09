@@ -43,8 +43,9 @@ binaries for macOS on Apple Silicon (11 or later), Linux on x86_64 and arm64
 and Windows on x86_64. Each is one self-contained program; unpack it and run
 it.
 
-- **Linux**: it needs ALSA's `libasound.so.2`, which desktop distributions
-  install anyway; on a server, `apt install libasound2` or the equivalent.
+- **Linux**: nothing beyond glibc. `--speaker` alone uses ALSA's
+  `libasound.so.2`, which desktop distributions install anyway; without it,
+  datamodem says so and carries on silently.
 - **macOS**: the binary is not notarized, so if a browser downloaded it,
   `xattr -d com.apple.quarantine datamodem` before the first run.
 - **Windows**: it is built with Cygwin, and `cygwin1.dll` has to stay in the
