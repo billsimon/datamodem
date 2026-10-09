@@ -7,7 +7,8 @@
 #   cmake -S . -B build -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH=<prefix>
 #
 # Static archives only: with no shared library in the prefix, the linker has
-# nothing to choose but the archive. Sources are fetched by checksum into
+# nothing to choose but the archive. Each library leaves a stamp in the
+# prefix when it is installed, and a rerun skips the ones already there. Sources are fetched by checksum into
 # $DEPS_DOWNLOADS (default <prefix>/../deps-src). Needs a C compiler, make,
 # perl, pkg-config and libtiff's headers; on Linux, ALSA's.
 set -eu
@@ -74,8 +75,16 @@ unpack() {
     echo "$WORK/$2"
 }
 
+# built <name> <version> - whether a previous run already installed it
+built() {
+    [ -f "$PREFIX/.built-$1-$2" ]
+}
+
 # --- OpenSSL --------------------------------------------------------------
 # pjproject's TLS transport (--transport tls) is built on it.
+if built openssl "$OPENSSL_VERSION"; then
+    echo "==> OpenSSL $OPENSSL_VERSION already built"
+else
 fetch "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz" \
     "openssl-$OPENSSL_VERSION.tar.gz" "$OPENSSL_SHA256"
 src=$(unpack "openssl-$OPENSSL_VERSION.tar.gz" openssl)
@@ -90,11 +99,16 @@ echo "==> building OpenSSL $OPENSSL_VERSION"
     mkdir -p "$PREFIX/share/licenses/openssl"
     cp LICENSE.txt "$PREFIX/share/licenses/openssl/"
 )
+touch "$PREFIX/.built-openssl-$OPENSSL_VERSION"
+fi
 
 # --- spandsp --------------------------------------------------------------
 fetch "https://github.com/pjsip/pjproject/archive/refs/tags/$PJPROJECT_VERSION.tar.gz" \
     "pjproject-$PJPROJECT_VERSION.tar.gz" "$PJPROJECT_SHA256"
 pjsrc=$(unpack "pjproject-$PJPROJECT_VERSION.tar.gz" pjproject)
+if built spandsp "$SPANDSP_VERSION"; then
+    echo "==> spandsp $SPANDSP_VERSION already built"
+else
 fetch "$SPANDSP_URL" "spandsp-$SPANDSP_VERSION.tar.xz" "$SPANDSP_SHA256"
 src=$(unpack "spandsp-$SPANDSP_VERSION.tar.xz" spandsp)
 echo "==> building spandsp $SPANDSP_VERSION"
@@ -116,8 +130,13 @@ echo "==> building spandsp $SPANDSP_VERSION"
     mkdir -p "$PREFIX/share/licenses/spandsp"
     cp COPYING "$PREFIX/share/licenses/spandsp/"
 )
+touch "$PREFIX/.built-spandsp-$SPANDSP_VERSION"
+fi
 
 # --- pjproject ------------------------------------------------------------
+if built pjproject "$PJPROJECT_VERSION"; then
+    echo "==> pjproject $PJPROJECT_VERSION already built"
+else
 echo "==> building pjproject $PJPROJECT_VERSION"
 (
     cd "$pjsrc"
@@ -127,6 +146,9 @@ echo "==> building pjproject $PJPROJECT_VERSION"
         # includes pjsua.h. Cygwin is POSIX enough to build it as a Unix.
         sed -i -e 's/\*mingw\* | \*cygw\* | \*win32\* | \*w32\* )/*mingw* | *win32* | *w32* )/' \
                -e 's/\*cygwin\* | \*mingw\*)/*mingw*)/' aconfigure
+        # Cygwin's pthread_key_t is a pointer, which pjlib keeps in a long
+        # (lossless: both are 64 bits). GCC 14 made that and its kin errors.
+        export CFLAGS="$CFLAGS -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration"
     fi
     # Audio and SIP only. Everything optional that would otherwise be
     # autodetected - and so differ from one build host to the next - is off,
@@ -145,6 +167,8 @@ echo "==> building pjproject $PJPROJECT_VERSION"
     mkdir -p "$PREFIX/share/licenses/pjproject"
     cp COPYING "$PREFIX/share/licenses/pjproject/"
 )
+touch "$PREFIX/.built-pjproject-$PJPROJECT_VERSION"
+fi
 
 # Belt and braces: the point of this prefix is that nothing in it is shared.
 find "$PREFIX/lib" \( -name '*.so*' -o -name '*.dylib' -o -name '*.dll*' \) -print -delete

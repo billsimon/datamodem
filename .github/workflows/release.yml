@@ -11,7 +11,7 @@ name: Release builds
 
 on:
   push:
-    branches: [main, release-builds, release-builds-diag]  # TEMP
+    branches: [main, release-builds]  # TEMP: release-builds
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -58,25 +58,35 @@ jobs:
             sudo apt-get install -y --no-install-recommends libtiff-dev libasound2-dev pkg-config
           fi
 
+      # Restored from the newest run that built any of them; the script
+      # skips whatever is already there and builds the rest, and what it
+      # built is saved even if a later step fails.
       - name: Restore dependencies
-        id: deps
         uses: actions/cache/restore@v6
         with:
           path: deps
-          key: deps-${{ matrix.target }}-${{ hashFiles('scripts/build-deps.sh') }}
+          key: deps-${{ matrix.target }}-${{ hashFiles('scripts/build-deps.sh') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: deps-${{ matrix.target }}-${{ hashFiles('scripts/build-deps.sh') }}-
 
       - name: Build dependencies
-        if: steps.deps.outputs.cache-hit != 'true'
-        run: DEPS_DOWNLOADS=$RUNNER_TEMP/deps-src scripts/build-deps.sh deps 2>&1 | tee -a "$CI_LOG"
+        id: deps
+        run: |
+          echo "before=$(ls deps/.built-* 2>/dev/null | wc -l)" >> "$GITHUB_OUTPUT"
+          DEPS_DOWNLOADS=$RUNNER_TEMP/deps-src scripts/build-deps.sh deps 2>&1 | tee -a "$CI_LOG"
 
-      # Saved now rather than at the end, so a later failure doesn't throw
-      # away a dependency build that took most of the run.
+      - name: Note what was built
+        id: built
+        if: always()
+        run: |
+          after=$(ls deps/.built-* 2>/dev/null | wc -l)
+          [ "$after" -gt "${{ steps.deps.outputs.before || 0 }}" ] && echo "new=true" >> "$GITHUB_OUTPUT" || true
+
       - name: Save dependencies
-        if: steps.deps.outputs.cache-hit != 'true'
+        if: always() && steps.built.outputs.new == 'true'
         uses: actions/cache/save@v6
         with:
           path: deps
-          key: ${{ steps.deps.outputs.cache-primary-key }}
+          key: deps-${{ matrix.target }}-${{ hashFiles('scripts/build-deps.sh') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Build
         run: |
@@ -96,16 +106,6 @@ jobs:
               build/datamodem selftest --modulation $m --no-step-down
             done
           } 2>&1 | tee -a "$CI_LOG"
-
-      - name: TEMP diagnose v32bis
-        if: failure() && matrix.target == 'linux-x86_64'
-        run: |
-          sudo apt-get install -y --no-install-recommends valgrind >/dev/null
-          : > "$CI_LOG"
-          valgrind --num-callers=6 --error-limit=no build/datamodem selftest --modulation v32bis --no-step-down 2>&1 |
-            grep -E '^==[0-9]+== ' | grep -vE 'Copyright|Command|Using Valgrind|^==[0-9]+== $' | head -60 >> "$CI_LOG" || true
-          build/datamodem selftest --modulation v32bis --no-step-down --log-level debug 2>&1 |
-            grep -vE '^\s*$' | tail -90 | cut -c1-200 >> "$CI_LOG" || true
 
       - name: Check what the binary links against
         run: |
@@ -183,25 +183,35 @@ jobs:
             gcc-core gcc-g++ make cmake pkg-config perl curl tar xz zip file
             libtiff-devel
 
+      # Restored from the newest run that built any of them; the script
+      # skips whatever is already there and builds the rest, and what it
+      # built is saved even if a later step fails.
       - name: Restore dependencies
-        id: deps
         uses: actions/cache/restore@v6
         with:
           path: deps
-          key: deps-windows-x86_64-${{ hashFiles('scripts/build-deps.sh') }}
+          key: deps-windows-x86_64-${{ hashFiles('scripts/build-deps.sh') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: deps-windows-x86_64-${{ hashFiles('scripts/build-deps.sh') }}-
 
       - name: Build dependencies
-        if: steps.deps.outputs.cache-hit != 'true'
-        run: DEPS_DOWNLOADS=$(cygpath "$RUNNER_TEMP")/deps-src scripts/build-deps.sh deps 2>&1 | tee -a "$CI_LOG"
+        id: deps
+        run: |
+          echo "before=$(ls deps/.built-* 2>/dev/null | wc -l)" >> "$GITHUB_OUTPUT"
+          DEPS_DOWNLOADS=$(cygpath "$RUNNER_TEMP")/deps-src scripts/build-deps.sh deps 2>&1 | tee -a "$CI_LOG"
 
-      # Saved now rather than at the end, so a later failure doesn't throw
-      # away a dependency build that took most of the run.
+      - name: Note what was built
+        id: built
+        if: always()
+        run: |
+          after=$(ls deps/.built-* 2>/dev/null | wc -l)
+          [ "$after" -gt "${{ steps.deps.outputs.before || 0 }}" ] && echo "new=true" >> "$GITHUB_OUTPUT" || true
+
       - name: Save dependencies
-        if: steps.deps.outputs.cache-hit != 'true'
+        if: always() && steps.built.outputs.new == 'true'
         uses: actions/cache/save@v6
         with:
           path: deps
-          key: ${{ steps.deps.outputs.cache-primary-key }}
+          key: deps-windows-x86_64-${{ hashFiles('scripts/build-deps.sh') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Build
         run: |
