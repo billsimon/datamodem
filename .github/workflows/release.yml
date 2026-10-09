@@ -167,7 +167,7 @@ jobs:
         with:
           install-dir: C:\cygwin
           packages: >-
-            gcc-core make cmake pkg-config perl curl tar xz zip file
+            gcc-core gcc-g++ make cmake pkg-config perl curl tar xz zip file
             libtiff-devel
 
       - name: Restore dependencies

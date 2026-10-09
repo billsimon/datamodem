@@ -6,6 +6,12 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Strict C11 hides everything POSIX and XSI from glibc's and newlib's headers
+# - sigaction, ptsname, M_PI - where macOS's show it regardless. Ask for it.
+if(NOT APPLE)
+  add_compile_definitions(_GNU_SOURCE)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
