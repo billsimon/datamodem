@@ -380,12 +380,14 @@ jobs:
         run: |
           # Through pjsua's startup to a registration that fails: exit 4.
           status=0
-          build/datamodem answer --server 127.0.0.1 --username ci --password ci --reg-timeout 1 \
-            </dev/null >/dev/null 2>startup.err || status=$?
+          build/datamodem answer --server 127.0.0.1 --username ci --password ci --reg-timeout 1 --speaker \
+            --log-level debug --pjsip-log-level 4 </dev/null >/dev/null 2>startup.err || status=$?
           cat startup.err
           [ "$status" -eq 4 ] || { echo "::error::expected exit 4, got $status"; exit 1; }
           # A transport that fails to start exits 4 as well.
           grep -q 'listening on udp' startup.err
+          # The runner has no sound card, but --speaker needs the backend.
+          grep -q 'WMME initialized' startup.err || { echo "::error::no WMME sound backend"; exit 1; }
 
       - name: Check what the binary links against
         run: |

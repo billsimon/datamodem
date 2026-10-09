@@ -326,7 +326,8 @@ static void call_destroy(dm_call_t *c)
  * with Teams installed, Teams's virtual device, which nobody hears. So ask
  * the system, and find its device by name; elsewhere, or if that fails, the
  * first device that plays, which is where pjmedia's Core Audio and ALSA
- * backends list the default. */
+ * backends list the default, and where WMME lists Windows' Sound Mapper,
+ * which follows it. */
 static pjmedia_aud_dev_index default_output_device(pjmedia_aud_dev_info *info)
 {
     char want[sizeof(info->name)] = "";

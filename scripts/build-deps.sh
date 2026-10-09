@@ -146,19 +146,23 @@ echo "==> building pjproject $PJPROJECT_VERSION"
 (
     cd "$pjsrc"
     if [ "$OS" = cygwin ]; then
-        # pjproject takes Cygwin for Win32 - winsock, Win32 threads, WMME -
-        # and Win32's headers then fight Cygwin's in everything that
-        # includes pjsua.h. Cygwin is POSIX enough to build it as a Unix.
-        sed -i -e 's/\*mingw\* | \*cygw\* | \*win32\* | \*w32\* )/*mingw* | *win32* | *w32* )/' \
-               -e 's/\*cygwin\* | \*mingw\*)/*mingw*)/' aconfigure
+        # pjproject takes Cygwin for Win32 - winsock, Win32 threads - and
+        # Win32's headers then fight Cygwin's in everything that includes
+        # pjsua.h. Cygwin is POSIX enough to build it as a Unix. The one
+        # Win32 part kept is the sound device: WMME, Windows' waveOut,
+        # which only its own file sees, and which is all Cygwin has.
+        sed -i -e 's/\*mingw\* | \*cygw\* | \*win32\* | \*w32\* )/*mingw* | *win32* | *w32* )/' aconfigure
         # Cygwin's pthread_key_t is a pointer, which pjlib keeps in a long
         # (lossless: both are 64 bits). GCC 14 made that and its kin errors.
         export CFLAGS="$CFLAGS -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration"
+        # WMME can ask COM for device names longer than waveOut's 31
+        # characters; datamodem has no use for them, and so no use for COM.
+        CFLAGS="$CFLAGS -DPJMEDIA_WMME_DEV_USE_MMDEVICE_API=0"
         # configure links Winsock and friends wherever it finds them, and
         # Cygwin has their import libraries. Winsock's socket() would then
         # win over Cygwin's, and fail: nothing ever calls WSAStartup().
-        export ac_cv_lib_wsock32_puts=no ac_cv_lib_ws2_32_puts=no \
-            ac_cv_lib_ole32_puts=no ac_cv_lib_winmm_puts=no
+        # winmm, WMME's, stays.
+        export ac_cv_lib_wsock32_puts=no ac_cv_lib_ws2_32_puts=no ac_cv_lib_ole32_puts=no
     fi
     # Audio and SIP only. Everything optional that would otherwise be
     # autodetected - and so differ from one build host to the next - is off,
