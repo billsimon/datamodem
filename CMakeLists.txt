@@ -1,10 +1,16 @@
 cmake_minimum_required(VERSION 3.16)
-project(datamodem VERSION 0.1.0 LANGUAGES C)
+project(datamodem VERSION 1.0.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Strict C11 hides everything POSIX and XSI from glibc's and newlib's headers
+# - sigaction, ptsname, M_PI - where macOS's show it regardless. Ask for it.
+if(NOT APPLE)
+  add_compile_definitions(_GNU_SOURCE)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
@@ -26,6 +32,10 @@ option(DATAMODEM_VENDOR_V22BIS "Build V.22bis from the vendored, patched spandsp
 # and rejects a far end using the top of the range V.42 permits.
 # third_party/spandsp-v42 holds the one-line fix.
 option(DATAMODEM_VENDOR_V42 "Build V.42 from the vendored, patched spandsp source" ON)
+# Release builds link spandsp, pjproject and the OpenSSL beneath it from
+# static archives, so the binary runs where none of them is installed.
+# scripts/build-deps.sh builds them; point CMAKE_PREFIX_PATH at its prefix.
+option(DATAMODEM_STATIC_DEPS "Link spandsp, pjproject and OpenSSL statically" OFF)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SPANDSP REQUIRED IMPORTED_TARGET spandsp)
@@ -37,7 +47,9 @@ pkg_check_modules(PJPROJECT REQUIRED IMPORTED_TARGET libpjproject)
 pkg_check_modules(TIFF REQUIRED libtiff-4)
 
 find_package(Threads REQUIRED)
-find_package(OpenSSL)
+if(NOT DATAMODEM_STATIC_DEPS)
+  find_package(OpenSSL)
+endif()
 
 # libpjproject.pc lists only the pj* libraries; the codecs and SRTP that
 # pjproject bundles sit beside them as static archives and still have to be
@@ -152,6 +164,34 @@ target_link_libraries(datamodem PRIVATE
   PkgConfig::SPANDSP
   Threads::Threads
 )
+if(DATAMODEM_STATIC_DEPS)
+  # Everything libpjproject.pc keeps in Libs.private: the bundled codecs and
+  # SRTP, OpenSSL, and the platform's own libraries. The prefix holds only
+  # archives, so -lssl and -lcrypto find those.
+  set(_pj_static_libs ${PJPROJECT_STATIC_LIBRARIES})
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND "asound" IN_LIST _pj_static_libs)
+    # But not ALSA: src/alsa_shim.c stands in for libasound and loads it only
+    # for --speaker, so the binary runs where ALSA isn't installed.
+    list(REMOVE_ITEM _pj_static_libs asound)
+    target_sources(datamodem PRIVATE src/alsa_shim.c)
+    target_compile_definitions(datamodem PRIVATE DATAMODEM_ALSA_SHIM=1)
+  endif()
+  target_link_directories(datamodem PRIVATE ${PJPROJECT_STATIC_LIBRARY_DIRS})
+  target_link_libraries(datamodem PRIVATE ${_pj_static_libs})
+  if(CYGWIN)
+    # Leaves cygwin1.dll as the one DLL the binary needs.
+    target_link_options(datamodem PRIVATE -static-libgcc)
+  endif()
+endif()
+# sip.c reaches for libjack at run time, if it is there, and alsa_shim.c for
+# libasound; glibc before 2.34 keeps dlopen() in libdl.
+target_link_libraries(datamodem PRIVATE ${CMAKE_DL_LIBS})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # libpjproject.pc names libstdc++ and more that nothing here calls. Debian's
+  # and Ubuntu's linkers drop those by default; RHEL's would make the binary
+  # require them.
+  target_link_options(datamodem PRIVATE -Wl,--as-needed)
+endif()
 if(NOT APPLE)
   # v32.c is our own signal processing, not spandsp's; glibc keeps libm apart.
   target_link_libraries(datamodem PRIVATE m)
@@ -177,8 +217,9 @@ if(DATAMODEM_HARDENING)
     -fno-strict-aliasing          # spandsp and pjsip both type-pun
     $<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>
   )
-  if(NOT APPLE)
-    # PIE plus full RELRO; the macOS toolchain does both by default.
+  if(NOT APPLE AND NOT CYGWIN)
+    # PIE plus full RELRO; the macOS toolchain does both by default, and
+    # neither applies to a Windows executable.
     target_compile_options(datamodem PRIVATE -fPIE)
     target_link_options(datamodem PRIVATE -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack)
   endif()
