@@ -178,6 +178,12 @@ endif()
 # sip.c reaches for libjack at run time, if it is there; glibc before 2.34
 # keeps dlopen() in libdl.
 target_link_libraries(datamodem PRIVATE ${CMAKE_DL_LIBS})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # libpjproject.pc names libstdc++ and more that nothing here calls. Debian's
+  # and Ubuntu's linkers drop those by default; RHEL's would make the binary
+  # require them.
+  target_link_options(datamodem PRIVATE -Wl,--as-needed)
+endif()
 if(NOT APPLE)
   # v32.c is our own signal processing, not spandsp's; glibc keeps libm apart.
   target_link_libraries(datamodem PRIVATE m)
