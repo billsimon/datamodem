@@ -44,6 +44,11 @@ esac
 
 JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
 export CFLAGS="${CFLAGS:--O2}"
+# datamodem links as a PIE on Linux. Ubuntu's GCC makes everything
+# position-independent anyway; RHEL's, and the manylinux image's, do not.
+if [ "$OS" = linux ]; then
+    CFLAGS="$CFLAGS -fPIC"
+fi
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
 sha256() {
