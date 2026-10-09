@@ -11,7 +11,7 @@ name: Release builds
 
 on:
   push:
-    branches: [main, release-builds]  # TEMP: release-builds
+    branches: [main]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
