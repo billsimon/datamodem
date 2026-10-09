@@ -154,6 +154,11 @@ echo "==> building pjproject $PJPROJECT_VERSION"
         # Cygwin's pthread_key_t is a pointer, which pjlib keeps in a long
         # (lossless: both are 64 bits). GCC 14 made that and its kin errors.
         export CFLAGS="$CFLAGS -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration"
+        # configure links Winsock and friends wherever it finds them, and
+        # Cygwin has their import libraries. Winsock's socket() would then
+        # win over Cygwin's, and fail: nothing ever calls WSAStartup().
+        export ac_cv_lib_wsock32_puts=no ac_cv_lib_ws2_32_puts=no \
+            ac_cv_lib_ole32_puts=no ac_cv_lib_winmm_puts=no
     fi
     # Audio and SIP only. Everything optional that would otherwise be
     # autodetected - and so differ from one build host to the next - is off,
