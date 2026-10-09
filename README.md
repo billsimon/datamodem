@@ -35,6 +35,21 @@ stream. It speaks:
 How it works, and everything learned building it, is in
 [DEVNOTES.md](DEVNOTES.md).
 
+## Installing
+
+[Releases](https://github.com/billsimon/datamodem/releases) carry ready-built
+binaries for macOS on Apple Silicon (11 or later), Linux on x86_64 and arm64
+(glibc 2.35 or later: Debian 12, Ubuntu 22.04, RHEL 10 and anything since),
+and Windows on x86_64. Each is one self-contained program; unpack it and run
+it.
+
+- **Linux**: it needs ALSA's `libasound.so.2`, which desktop distributions
+  install anyway; on a server, `apt install libasound2` or the equivalent.
+- **macOS**: the binary is not notarized, so if a browser downloaded it,
+  `xattr -d com.apple.quarantine datamodem` before the first run.
+- **Windows**: it is built with Cygwin, and `cygwin1.dll` has to stay in the
+  same folder as `datamodem.exe`. Run it from Windows Terminal or any console.
+
 ## Building
 
 ```
@@ -50,6 +65,21 @@ The build also compiles patched copies of spandsp's V.22bis and V.42 from
 carries nothing, and the packaged V.42 cannot establish a link with a real
 modem; [DEVNOTES.md](DEVNOTES.md) says why. `-DDATAMODEM_VENDOR_V22BIS=OFF`
 and `-DDATAMODEM_VENDOR_V42=OFF` use the system library's instead.
+
+A release build links spandsp, pjproject and OpenSSL statically, from
+archives that `scripts/build-deps.sh` builds from pinned sources:
+
+```
+scripts/build-deps.sh deps
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH=$PWD/deps
+cmake --build build
+```
+
+That is what `.github/workflows/release.yml` does on macOS, Linux and
+Cygwin for every push and pull request. Pushing a tag that matches
+`include/datamodem/version.h`, such as `v0.1.0`, publishes the four builds
+as a GitHub release.
 
 ## Using it
 

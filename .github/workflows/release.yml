@@ -40,8 +40,12 @@ jobs:
             runner: ubuntu-22.04
           - target: linux-arm64
             runner: ubuntu-22.04-arm
+    defaults:
+      run:
+        shell: bash
     env:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
+      CI_LOG: ${{ runner.temp }}/ci.log
     steps:
       - uses: actions/checkout@v7
 
@@ -56,29 +60,42 @@ jobs:
 
       - name: Restore dependencies
         id: deps
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: deps
           key: deps-${{ matrix.target }}-${{ hashFiles('scripts/build-deps.sh') }}
 
       - name: Build dependencies
         if: steps.deps.outputs.cache-hit != 'true'
-        run: DEPS_DOWNLOADS=$RUNNER_TEMP/deps-src scripts/build-deps.sh deps
+        run: DEPS_DOWNLOADS=$RUNNER_TEMP/deps-src scripts/build-deps.sh deps 2>&1 | tee -a "$CI_LOG"
+
+      # Saved now rather than at the end, so a later failure doesn't throw
+      # away a dependency build that took most of the run.
+      - name: Save dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: deps
+          key: ${{ steps.deps.outputs.cache-primary-key }}
 
       - name: Build
         run: |
           export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-            -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
-          cmake --build build --parallel
+          {
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+              -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
+            cmake --build build --parallel
+          } 2>&1 | tee -a "$CI_LOG"
 
       - name: Test
         run: |
-          ctest --test-dir build --output-on-failure
-          build/datamodem version
-          for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
-            build/datamodem selftest --modulation $m --no-step-down
-          done
+          {
+            ctest --test-dir build --output-on-failure
+            build/datamodem version
+            for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
+              build/datamodem selftest --modulation $m --no-step-down
+            done
+          } 2>&1 | tee -a "$CI_LOG"
 
       - name: Check what the binary links against
         run: |
@@ -113,6 +130,15 @@ jobs:
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "file=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
+      # The tail of whatever failed, as an annotation: readable from the
+      # run's summary page and the checks API without fetching raw logs.
+      - name: Report failure
+        if: failure()
+        run: |
+          [ -f "$CI_LOG" ] || exit 0
+          tail -n 80 "$CI_LOG" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS="%0A"} {print}' > "$CI_LOG.tail"
+          echo "::error title=Last lines of output::$(cat "$CI_LOG.tail")"
+
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
@@ -129,6 +155,7 @@ jobs:
       # A login shell, for Cygwin's PATH alone, that stays in the checkout.
       CYGWIN_NOWINPATH: '1'
       CHERE_INVOKING: '1'
+      CI_LOG: /tmp/ci.log
     steps:
       - name: Keep line endings as committed
         shell: pwsh
@@ -145,29 +172,42 @@ jobs:
 
       - name: Restore dependencies
         id: deps
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: deps
           key: deps-windows-x86_64-${{ hashFiles('scripts/build-deps.sh') }}
 
       - name: Build dependencies
         if: steps.deps.outputs.cache-hit != 'true'
-        run: DEPS_DOWNLOADS=$(cygpath "$RUNNER_TEMP")/deps-src scripts/build-deps.sh deps
+        run: DEPS_DOWNLOADS=$(cygpath "$RUNNER_TEMP")/deps-src scripts/build-deps.sh deps 2>&1 | tee -a "$CI_LOG"
+
+      # Saved now rather than at the end, so a later failure doesn't throw
+      # away a dependency build that took most of the run.
+      - name: Save dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: deps
+          key: ${{ steps.deps.outputs.cache-primary-key }}
 
       - name: Build
         run: |
           export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-            -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
-          cmake --build build --parallel
+          {
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+              -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
+            cmake --build build --parallel
+          } 2>&1 | tee -a "$CI_LOG"
 
       - name: Test
         run: |
-          ctest --test-dir build --output-on-failure
-          build/datamodem version
-          for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
-            build/datamodem selftest --modulation $m --no-step-down
-          done
+          {
+            ctest --test-dir build --output-on-failure
+            build/datamodem version
+            for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
+              build/datamodem selftest --modulation $m --no-step-down
+            done
+          } 2>&1 | tee -a "$CI_LOG"
 
       - name: Check what the binary links against
         run: |
@@ -201,6 +241,15 @@ jobs:
           EOF
           (cd dist && zip -qr "$name.zip" "$name")
           echo "file=dist/$name.zip" >> "$GITHUB_OUTPUT"
+
+      # The tail of whatever failed, as an annotation: readable from the
+      # run's summary page and the checks API without fetching raw logs.
+      - name: Report failure
+        if: failure()
+        run: |
+          [ -f "$CI_LOG" ] || exit 0
+          tail -n 80 "$CI_LOG" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS="%0A"} {print}' > "$CI_LOG.tail"
+          echo "::error title=Last lines of output::$(cat "$CI_LOG.tail")"
 
       - uses: actions/upload-artifact@v7
         with:
