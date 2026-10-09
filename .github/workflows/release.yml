@@ -109,8 +109,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y --no-install-recommends libasound2-plugins alsa-utils >/dev/null
-          if ! aplay -D jack -d 1 -t raw /dev/null 2>&1 | grep -qi jack; then
-            echo "::warning::libjack was silent for aplay too; this check proves nothing here"
+          # Debian ships the plugin's config but leaves it to be enabled.
+          sudo mkdir -p /etc/alsa/conf.d
+          sudo ln -sf /usr/share/alsa/alsa.conf.d/50-jack.conf /etc/alsa/conf.d/
+          aplay -D jack -d 1 -t raw /dev/null >aplay.err 2>&1 || true
+          if ! grep -qi 'jack server' aplay.err; then
+            echo "::error::libjack was silent for aplay too, so this check would prove nothing: $(head -c 600 aplay.err | tr '\n' ' ')"
+            exit 1
           fi
           status=0
           build/datamodem answer --server 127.0.0.1 --username ci --password ci --reg-timeout 1 \
