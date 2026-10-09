@@ -4,8 +4,8 @@
 #
 # spandsp, pjproject and OpenSSL are built from source by
 # scripts/build-deps.sh and linked statically, so each binary needs only
-# what the OS provides: macOS's frameworks, glibc and ALSA on Linux, and
-# cygwin1.dll (shipped beside it) on Windows. They are cached until that
+# what the OS provides: macOS's frameworks, glibc 2.28+ and ALSA on Linux,
+# and cygwin1.dll (shipped beside it) on Windows. They are cached until that
 # script changes.
 name: Release builds
 
@@ -24,38 +24,19 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  unix:
+  macos:
     name: ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-15
     strategy:
-      fail-fast: false
       matrix:
-        include:
-          - target: macos-arm64
-            runner: macos-15
-          # 22.04 rather than latest: the binary needs the glibc it was
-          # built against (in practice 2.34) or newer, which covers Debian
-          # 12, Ubuntu 22.04, RHEL 9 and anything since.
-          - target: linux-x86_64
-            runner: ubuntu-22.04
-          - target: linux-arm64
-            runner: ubuntu-22.04-arm
-    defaults:
-      run:
-        shell: bash
+        target: [macos-arm64]
     env:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@v7
 
       - name: Install build tools
-        run: |
-          if [ "$RUNNER_OS" = macOS ]; then
-            brew install libtiff pkgconf
-          else
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends libtiff-dev libasound2-dev pkg-config
-          fi
+        run: brew install libtiff pkgconf
 
       # Restored from the newest run that built any of them; the script
       # skips whatever is already there and builds the rest, and what it
@@ -102,48 +83,11 @@ jobs:
             build/datamodem selftest --modulation $m --no-step-down
           done
 
-      # Where ALSA has the JACK plugin and no JACK server runs, libjack
-      # complains on stderr whenever anything opens ALSA's "jack" PCM - and
-      # pjmedia opens every PCM at startup. datamodem keeps libjack quiet.
-      - name: Check startup is quiet under ALSA's JACK plugin
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get install -y --no-install-recommends libasound2-plugins alsa-utils >/dev/null
-          # Debian ships the plugin's config but leaves it to be enabled.
-          sudo mkdir -p /etc/alsa/conf.d
-          sudo ln -sf /usr/share/alsa/alsa.conf.d/50-jack.conf /etc/alsa/conf.d/
-          aplay -D jack -d 1 -t raw /dev/null >aplay.err 2>&1 || true
-          # pjmedia probes the PCMs ALSA lists as hints; jack has to be one.
-          aplay -L | grep -qx jack || { echo "::error::ALSA lists no jack PCM"; exit 1; }
-          if ! grep -qi 'jack server' aplay.err; then
-            echo "::error::libjack was silent for aplay too, so this check would prove nothing: $(head -c 600 aplay.err | tr '\n' ' ')"
-            exit 1
-          fi
-          status=0
-          build/datamodem answer --server 127.0.0.1 --username ci --password ci --reg-timeout 1 \
-            </dev/null >/dev/null 2>startup.err || status=$?
-          cat startup.err
-          if [ "$status" -ne 4 ]; then
-            echo "::error::expected exit 4 with no registrar there, got $status"; exit 1
-          fi
-          if grep -i jack startup.err; then
-            echo "::error::libjack spoke during startup"; exit 1
-          fi
-
       - name: Check what the binary links against
         run: |
-          if [ "$RUNNER_OS" = macOS ]; then
-            otool -L build/datamodem
-            if otool -L build/datamodem | tail -n +2 | grep -vE '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
-              echo "::error::linked against a library macOS does not ship"; exit 1
-            fi
-          else
-            readelf -d build/datamodem | grep NEEDED
-            if readelf -d build/datamodem | grep NEEDED |
-                grep -vE '\[(libc|libm|libpthread|libdl|librt|libasound)\.so\.[0-9]+\]|\[ld-linux[^]]*\]'; then
-              echo "::error::linked against a library outside glibc and ALSA"; exit 1
-            fi
-            echo "needs glibc $(objdump -T build/datamodem | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)"
+          otool -L build/datamodem
+          if otool -L build/datamodem | tail -n +2 | grep -vE '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
+            echo "::error::linked against a library macOS does not ship"; exit 1
           fi
 
       - name: Package
@@ -168,6 +112,173 @@ jobs:
           name: ${{ matrix.target }}
           path: ${{ steps.package.outputs.file }}
           if-no-files-found: error
+
+  # Built in the manylinux_2_28 image - AlmaLinux 8 with a current GCC - so
+  # the binary asks for nothing newer than glibc 2.28: RHEL 8, Debian 10,
+  # Ubuntu 20.04 and everything since.
+  linux:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}:${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+            arch: x86_64
+            image: '2026.10.03-1'
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+            image: '2026.10.03-1'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: |
+          dnf install -y libtiff-devel alsa-lib-devel pkgconf-pkg-config perl xz
+          command -v cmake >/dev/null || dnf install -y cmake
+          gcc --version | head -1
+          cmake --version | head -1
+          # The checkout belongs to the runner's user, not the container's root.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Restored from the newest run that built any of them; the script
+      # skips whatever is already there and builds the rest, and what it
+      # built is saved even if a later step fails.
+      - name: Restore dependencies
+        uses: actions/cache/restore@v6
+        with:
+          path: deps
+          key: deps-${{ matrix.target }}-manylinux_2_28-${{ matrix.image }}-${{ hashFiles('scripts/build-deps.sh') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: deps-${{ matrix.target }}-manylinux_2_28-${{ matrix.image }}-${{ hashFiles('scripts/build-deps.sh') }}-
+
+      - name: Build dependencies
+        id: deps
+        run: |
+          echo "before=$(ls deps/.built-* 2>/dev/null | wc -l)" >> "$GITHUB_OUTPUT"
+          DEPS_DOWNLOADS=$RUNNER_TEMP/deps-src scripts/build-deps.sh deps
+
+      - name: Note what was built
+        id: built
+        if: always()
+        run: |
+          after=$(ls deps/.built-* 2>/dev/null | wc -l)
+          [ "$after" -gt "${{ steps.deps.outputs.before || 0 }}" ] && echo "new=true" >> "$GITHUB_OUTPUT" || true
+
+      - name: Save dependencies
+        if: always() && steps.built.outputs.new == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: deps
+          key: deps-${{ matrix.target }}-manylinux_2_28-${{ matrix.image }}-${{ hashFiles('scripts/build-deps.sh') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Build
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DDATAMODEM_STATIC_DEPS=ON -DCMAKE_PREFIX_PATH="$PWD/deps"
+          cmake --build build --parallel
+
+      - name: Test
+        run: |
+          ctest --test-dir build --output-on-failure
+          build/datamodem version
+          for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
+            build/datamodem selftest --modulation $m --no-step-down
+          done
+
+      - name: Check what the binary links against
+        run: |
+          readelf -d build/datamodem | grep NEEDED
+          if readelf -d build/datamodem | grep NEEDED |
+              grep -vE '\[(libc|libm|libpthread|libdl|librt|libasound)\.so\.[0-9]+\]|\[ld-linux[^]]*\]'; then
+            echo "::error::linked against a library outside glibc and ALSA"; exit 1
+          fi
+          need=$(objdump -T build/datamodem | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "needs glibc $need"
+          if [ "$(printf '%s\n' "$need" 2.28 | sort -V | tail -1)" != 2.28 ]; then
+            echo "::error::needs glibc $need, newer than 2.28"; exit 1
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          ver=$(sed -n 's/^#define DATAMODEM_VERSION "\(.*\)"/\1/p' include/datamodem/version.h)
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *) ver="$ver-dev.${GITHUB_SHA:0:7}" ;;
+          esac
+          name=datamodem-$ver-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cmake --install build --prefix "$RUNNER_TEMP/install" --strip
+          cp "$RUNNER_TEMP/install/bin/datamodem" "dist/$name/"
+          cp README.md examples/datamodem.conf "dist/$name/"
+          cp -R deps/share/licenses "dist/$name/licenses"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "file=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.package.outputs.file }}
+          if-no-files-found: error
+
+  # The packaged binary, on a stock Ubuntu rather than the image it was built
+  # in - and with ALSA's JACK plugin enabled and no JACK server running. That
+  # has libjack complain whenever anything opens ALSA's "jack" PCM, and
+  # pjmedia opens every PCM at startup; datamodem keeps libjack quiet.
+  linux-check:
+    name: ${{ matrix.target }} on Ubuntu
+    needs: linux
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.target }}
+
+      - name: Unpack
+        run: |
+          tar xzf datamodem-*.tar.gz
+          ln -s datamodem-*/datamodem .
+          ./datamodem version
+          for m in v34 v32bis v22bis v21; do
+            ./datamodem selftest --modulation $m --no-step-down >/dev/null
+          done
+
+      - name: Check startup is quiet under ALSA's JACK plugin
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2t64 libasound2-plugins alsa-utils >/dev/null
+          # Debian ships the plugin's config but leaves it to be enabled.
+          sudo mkdir -p /etc/alsa/conf.d
+          sudo ln -sf /usr/share/alsa/alsa.conf.d/50-jack.conf /etc/alsa/conf.d/
+          # pjmedia probes the PCMs ALSA lists as hints; jack has to be one,
+          # and opening it has to make libjack talk, or this proves nothing.
+          aplay -L | grep -qx jack || { echo "::error::ALSA lists no jack PCM"; exit 1; }
+          aplay -D jack -d 1 -t raw /dev/null >aplay.err 2>&1 || true
+          if ! grep -qi 'jack server' aplay.err; then
+            echo "::error::libjack was silent for aplay too: $(head -c 600 aplay.err | tr '\n' ' ')"; exit 1
+          fi
+          status=0
+          ./datamodem answer --server 127.0.0.1 --username ci --password ci --reg-timeout 1 \
+            </dev/null >/dev/null 2>startup.err || status=$?
+          cat startup.err
+          if [ "$status" -ne 4 ]; then
+            echo "::error::expected exit 4 with no registrar there, got $status"; exit 1
+          fi
+          if grep -i jack startup.err; then
+            echo "::error::libjack spoke during startup"; exit 1
+          fi
 
   windows:
     name: windows-x86_64
@@ -284,7 +395,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [unix, windows]
+    needs: [macos, linux, linux-check, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
