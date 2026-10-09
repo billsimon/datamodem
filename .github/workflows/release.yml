@@ -113,6 +113,8 @@ jobs:
           sudo mkdir -p /etc/alsa/conf.d
           sudo ln -sf /usr/share/alsa/alsa.conf.d/50-jack.conf /etc/alsa/conf.d/
           aplay -D jack -d 1 -t raw /dev/null >aplay.err 2>&1 || true
+          # pjmedia probes the PCMs ALSA lists as hints; jack has to be one.
+          aplay -L | grep -qx jack || { echo "::error::ALSA lists no jack PCM"; exit 1; }
           if ! grep -qi 'jack server' aplay.err; then
             echo "::error::libjack was silent for aplay too, so this check would prove nothing: $(head -c 600 aplay.err | tr '\n' ' ')"
             exit 1
