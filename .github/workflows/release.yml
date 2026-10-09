@@ -450,10 +450,11 @@ jobs:
           mirror=https://mirrors.kernel.org/sourceware/cygwin
           file=cygwin-$CYGVER-src.tar.xz
           curl -fsSL --retry 3 "$mirror/x86_64/setup.ini" -o "$RUNNER_TEMP/setup.ini"
-          want=$(awk -v f="x86_64/release/cygwin/$file" '$1 == "source:" && $2 == f { print $4 }' "$RUNNER_TEMP/setup.ini")
-          [ -n "$want" ] || { echo "::error::$file is not in the mirror's setup.ini"; exit 1; }
+          path=src/release/cygwin/$file
+          want=$(awk -v f="$path" '$1 == "source:" && $2 == f { print $4; exit }' "$RUNNER_TEMP/setup.ini")
+          [ -n "$want" ] || { echo "::error::$path is not in the mirror's setup.ini"; exit 1; }
           mkdir -p cygwin-source
-          curl -fsSL --retry 3 "$mirror/x86_64/release/cygwin/$file" -o "cygwin-source/$file"
+          curl -fsSL --retry 3 "$mirror/$path" -o "cygwin-source/$file"
           echo "$want  cygwin-source/$file" | sha512sum -c
           echo "file=cygwin-source/$file" >> "$GITHUB_OUTPUT"
 
