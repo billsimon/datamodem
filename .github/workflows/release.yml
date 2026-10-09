@@ -11,7 +11,7 @@ name: Release builds
 
 on:
   push:
-    branches: [main]
+    branches: [main, release-builds]  # TEMP: release-builds
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -101,6 +101,27 @@ jobs:
           for m in v34 v32bis v32 v22bis v22 v23 v21 bell103; do
             build/datamodem selftest --modulation $m --no-step-down
           done
+
+      # Where ALSA has the JACK plugin and no JACK server runs, libjack
+      # complains on stderr whenever anything opens ALSA's "jack" PCM - and
+      # pjmedia opens every PCM at startup. datamodem keeps libjack quiet.
+      - name: Check startup is quiet under ALSA's JACK plugin
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y --no-install-recommends libasound2-plugins alsa-utils >/dev/null
+          if ! aplay -D jack -d 1 -t raw /dev/null 2>&1 | grep -qi jack; then
+            echo "::warning::libjack was silent for aplay too; this check proves nothing here"
+          fi
+          status=0
+          build/datamodem answer --server 127.0.0.1 --username ci --password ci --reg-timeout 1 \
+            </dev/null >/dev/null 2>startup.err || status=$?
+          cat startup.err
+          if [ "$status" -ne 4 ]; then
+            echo "::error::expected exit 4 with no registrar there, got $status"; exit 1
+          fi
+          if grep -i jack startup.err; then
+            echo "::error::libjack spoke during startup"; exit 1
+          fi
 
       - name: Check what the binary links against
         run: |

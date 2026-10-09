@@ -13,6 +13,9 @@
 #ifdef __APPLE__
 #include <CoreAudio/CoreAudio.h>
 #endif
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 
 #define DM_CLOCK_RATE 8000
 #define DM_PTIME_MS 20
@@ -900,6 +903,45 @@ static void tune_codecs(const dm_config_t *cfg)
             want_pcma ? "PCMA" : "PCMU");
 }
 
+/* pjsua_init() has pjmedia's ALSA backend open every PCM ALSA knows of, to
+ * see what each can do, whether or not --speaker will ever want one. Where
+ * ALSA has the JACK plugin one of them is "jack", and libjack, finding no
+ * JACK server, tries to start one and then says it couldn't - a dozen lines
+ * on stderr, on every start, over the user's terminal. pjmedia silences
+ * ALSA's own complaints while it probes, but libjack has its own. So load
+ * libjack first, if it is there, and give it nothing to say them with; ALSA's
+ * plugin then gets the same, already loaded, copy. */
+#ifdef __linux__
+static void jack_say_nothing(const char *msg)
+{
+    (void) msg;
+}
+
+static void quiet_jack(void)
+{
+    typedef void (*jack_msg_fn)(const char *);
+    typedef void (*jack_set_fn)(jack_msg_fn);
+    void *jack;
+    jack_set_fn set;
+
+    setenv("JACK_NO_START_SERVER", "1", 0);
+    jack = dlopen("libjack.so.0", RTLD_LAZY | RTLD_GLOBAL);
+    if (jack == NULL)
+        return;
+    /* Never closed: the callbacks have to outlive the probe. */
+    set = (jack_set_fn) dlsym(jack, "jack_set_error_function");
+    if (set != NULL)
+        set(&jack_say_nothing);
+    set = (jack_set_fn) dlsym(jack, "jack_set_info_function");
+    if (set != NULL)
+        set(&jack_say_nothing);
+}
+#else
+static void quiet_jack(void)
+{
+}
+#endif
+
 int dm_sip_start(const dm_config_t *cfg)
 {
     pjsua_config ua_cfg;
@@ -915,6 +957,7 @@ int dm_sip_start(const dm_config_t *cfg)
     char proxy_uri[DM_STR_MAX];
 
     g.cfg = *cfg;
+    quiet_jack();
 
     /* pjsua_create() logs before pjsua_init() installs log_cfg.cb, so claim
      * pjlib's writer first - otherwise those first lines land on the user's

@@ -175,6 +175,9 @@ if(DATAMODEM_STATIC_DEPS)
     target_link_options(datamodem PRIVATE -static-libgcc)
   endif()
 endif()
+# sip.c reaches for libjack at run time, if it is there; glibc before 2.34
+# keeps dlopen() in libdl.
+target_link_libraries(datamodem PRIVATE ${CMAKE_DL_LIBS})
 if(NOT APPLE)
   # v32.c is our own signal processing, not spandsp's; glibc keeps libm apart.
   target_link_libraries(datamodem PRIVATE m)
