@@ -45,12 +45,12 @@ jobs:
         shell: bash
     env:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
-      CI_LOG: ${{ runner.temp }}/ci.log
     steps:
       - uses: actions/checkout@v7
 
       - name: Install build tools
         run: |
+          echo "CI_LOG=$RUNNER_TEMP/ci.log" >> "$GITHUB_ENV"
           if [ "$RUNNER_OS" = macOS ]; then
             brew install libtiff pkgconf
           else
