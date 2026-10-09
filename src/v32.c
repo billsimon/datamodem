@@ -900,11 +900,15 @@ static cf_t tx_word_symbol(dm_v32_t *v, uint16_t word)
     tx_t *t = &v->tx;
     int b1 = (word >> (15 - t->wbit)) & 1;
     int b2 = (word >> (14 - t->wbit)) & 1;
-    int q;
+    int q1;
+    int q2;
 
     t->wbit += 2;
-    q = (scramble(&t->scr, v->scr_tap, b1) << 1) | scramble(&t->scr, v->scr_tap, b2);
-    t->y = TABLE1[q][t->y];
+    /* Two statements: the scrambler is stateful, and C leaves the order of
+     * the operands of | unspecified. GCC on x86_64 scrambles b2 first. */
+    q1 = scramble(&t->scr, v->scr_tap, b1);
+    q2 = scramble(&t->scr, v->scr_tap, b2);
+    t->y = TABLE1[(q1 << 1) | q2][t->y];
     return v->abcd[QUAD_OF_Y[t->y]];
 }
 
@@ -1975,11 +1979,15 @@ static void symbol_out(dm_v32_t *v)
     {
         int q = slice4(v, u);
         int qq = v->inv1[Y_OF_QUAD[r->prev_q]][Y_OF_QUAD[q]];
+        int b1;
+        int b2;
 
         track(v, w, norm, vout, u, v->abcd[q]);
         r->prev_q = q;
-        rate_dibit(v, descramble(&r->dscr, v->dscr_tap, qq >> 1),
-                   descramble(&r->dscr, v->dscr_tap, qq & 1));
+        /* In order: as arguments, C would leave it to the compiler. */
+        b1 = descramble(&r->dscr, v->dscr_tap, qq >> 1);
+        b2 = descramble(&r->dscr, v->dscr_tap, qq & 1);
+        rate_dibit(v, b1, b2);
         break;
     }
 

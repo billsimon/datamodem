@@ -11,7 +11,7 @@ name: Release builds
 
 on:
   push:
-    branches: [main, release-builds]  # TEMP: release-builds
+    branches: [main, release-builds, release-builds-diag]  # TEMP
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -97,6 +97,16 @@ jobs:
             done
           } 2>&1 | tee -a "$CI_LOG"
 
+      - name: TEMP diagnose v32bis
+        if: failure() && matrix.target == 'linux-x86_64'
+        run: |
+          sudo apt-get install -y --no-install-recommends valgrind >/dev/null
+          : > "$CI_LOG"
+          valgrind --num-callers=6 --error-limit=no build/datamodem selftest --modulation v32bis --no-step-down 2>&1 |
+            grep -E '^==[0-9]+== ' | grep -vE 'Copyright|Command|Using Valgrind|^==[0-9]+== $' | head -60 >> "$CI_LOG" || true
+          build/datamodem selftest --modulation v32bis --no-step-down --log-level debug 2>&1 |
+            grep -vE '^\s*$' | tail -90 | cut -c1-200 >> "$CI_LOG" || true
+
       - name: Check what the binary links against
         run: |
           if [ "$RUNNER_OS" = macOS ]; then
@@ -136,8 +146,11 @@ jobs:
         if: failure()
         run: |
           [ -f "$CI_LOG" ] || exit 0
-          tail -n 80 "$CI_LOG" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS="%0A"} {print}' > "$CI_LOG.tail"
-          echo "::error title=Last lines of output::$(cat "$CI_LOG.tail")"
+          # An annotation holds about 4 KB, and a step may make ten.
+          tail -c 36000 "$CI_LOG" | tr -d '\r' | split -b 3900 - "$CI_LOG.part."
+          for f in "$CI_LOG".part.*; do
+            echo "::error title=Output, ${f##*.}::$(sed -e 's/%/%25/g' "$f" | awk 'BEGIN{ORS="%0A"} {print}')"
+          done
 
       - uses: actions/upload-artifact@v7
         with:
@@ -248,8 +261,11 @@ jobs:
         if: failure()
         run: |
           [ -f "$CI_LOG" ] || exit 0
-          tail -n 80 "$CI_LOG" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS="%0A"} {print}' > "$CI_LOG.tail"
-          echo "::error title=Last lines of output::$(cat "$CI_LOG.tail")"
+          # An annotation holds about 4 KB, and a step may make ten.
+          tail -c 36000 "$CI_LOG" | tr -d '\r' | split -b 3900 - "$CI_LOG.part."
+          for f in "$CI_LOG".part.*; do
+            echo "::error title=Output, ${f##*.}::$(sed -e 's/%/%25/g' "$f" | awk 'BEGIN{ORS="%0A"} {print}')"
+          done
 
       - uses: actions/upload-artifact@v7
         with:
