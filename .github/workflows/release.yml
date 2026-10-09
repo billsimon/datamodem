@@ -263,13 +263,14 @@ jobs:
           for speaker in "" --speaker; do
             status=0
             ./datamodem answer --server 127.0.0.1 --username ci --password ci --reg-timeout 1 $speaker \
-              </dev/null >/dev/null 2>startup.err || status=$?
-            cat startup.err
+              </dev/null >/dev/null 2>/tmp/startup.err || status=$?
+            cat /tmp/startup.err
             [ "$status" -eq 4 ] || { echo "expected exit 4 ($speaker), got $status"; exit 1; }
           done
-          grep -q 'ALSA (libasound.so.2) is not installed' startup.err
+          grep -q 'ALSA (libasound.so.2) is not installed' /tmp/startup.err
           EOF
-          docker run --rm -v "$PWD:/w" -w /w debian:buster-slim sh check.sh
+          # Read-only, so nothing in the checkout ends up owned by root.
+          docker run --rm -v "$PWD:/w:ro" -w /w debian:buster-slim sh check.sh
 
       - name: Check startup is quiet under ALSA's JACK plugin
         run: |
