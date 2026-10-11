@@ -1,5 +1,6 @@
 #include "datamodem/build_info.h"
 #include "datamodem/config.h"
+#include "datamodem/hayes.h"
 #include "datamodem/log.h"
 #include "datamodem/modem.h"
 #include "datamodem/session.h"
@@ -12,6 +13,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -54,7 +56,7 @@ static int run_session(const dm_config_t *cfg, dm_modem_t *modem)
         return DM_EXIT_INTERNAL;
     }
 
-    rc = dm_session_run(cfg, modem, &g_stop, &sr);
+    rc = dm_session_run(cfg, modem, &g_stop, NULL, &sr);
 
     dm_tty_restore();
     if (dm_term_active())
@@ -83,15 +85,27 @@ static int cmd_dial(const dm_config_t *cfg)
     rc = dm_sip_start(cfg);
     if (rc != DM_EXIT_OK)
     {
+        if (dm_tty_is_line())
+            dm_tty_result("%s", dm_hayes_dial_failure(rc, 0));
         dm_modem_destroy(modem);
         return rc;
     }
 
     rc = dm_sip_dial(cfg, cfg->to, modem, &g_stop);
     if (rc == DM_EXIT_OK)
+    {
         rc = run_session(cfg, modem);
+    }
     else
-        dm_sip_hangup(NULL);
+    {
+        dm_call_result_t cr;
+
+        dm_sip_hangup(&cr);
+        /* Said on the line, as a modem would, for the terminal program on
+         * the other end of it - unless that program is what stopped us. */
+        if (dm_tty_is_line() && g_stop == 0)
+            dm_tty_result("%s", dm_hayes_dial_failure(rc, cr.sip_status));
+    }
 
     dm_sip_stop();
     dm_modem_destroy(modem);
@@ -221,6 +235,20 @@ int main(int argc, char *argv[])
     install_signal_handlers();
     dm_modem_init_logging(&cfg);
 
+    if (cfg.stdio)
+    {
+        dm_tty_set_line(true);
+        /* Under a terminal program stderr is usually the same terminal as
+         * stdout, and anything said there lands in the far end's screen.
+         * Errors still get through, being why a call failed; the rest of
+         * the log is for --log-file. */
+        if (cfg.log_file[0] == '\0' && isatty(STDERR_FILENO))
+            dm_log_set_terminal_floor(DM_LOG_ERROR);
+        /* Typing while it dials is typing at nothing, and should not be
+         * echoed onto the screen; ctrl-c still abandons the call. */
+        dm_tty_quiet();
+    }
+
     /* An interactive call takes the screen from here, so that everything
      * from registering onwards is on the status line rather than scrolling
      * past. */
@@ -241,6 +269,9 @@ int main(int argc, char *argv[])
         break;
     case DM_CMD_ANSWER:
         rc = cmd_answer(&cfg);
+        break;
+    case DM_CMD_MODEM:
+        rc = dm_hayes_run(&cfg, &g_stop);
         break;
     default:
         dm_usage();

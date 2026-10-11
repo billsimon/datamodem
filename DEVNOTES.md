@@ -58,6 +58,8 @@ problem first and the fix after it; the fix is in the code in every case.
   20 ms of modem output and pushes 20 ms of the far end back in.
 - `session.c` — the loop that joins the terminal to the modem, the escape
   detector and the AT interpreter.
+- `hayes.c` — `datamodem modem`: a Hayes modem on a serial port, its command
+  state and control lines; see "Terminal programs" below.
 - `term.c` — the full screen: an ANSI-BBS emulator the far end's bytes are
   fed through, so that only what it draws reaches the terminal, CP437 and
   UTF-8 decoding, the status line, and the plain-output sanitizer for when
@@ -1067,6 +1069,62 @@ treating what arrives as data, waits four seconds, and only then reports
 `NO CARRIER`. A retrain inside that window is logged and the session carries
 on.
 
+## Terminal programs
+
+A BBS terminal program - SyncTERM, the one this was built against - wants the
+line and nothing else: it renders the far end's screen and runs the file
+transfers itself. There are two ways to give it one, because there are two
+ways such a program reaches anything that is not a network socket.
+
+**`--stdio`** is for a program that runs a command and talks to its stdin and
+stdout, which is SyncTERM's Shell connection. It is a pty there, so everything
+that keys off `isatty()` - the full screen, the filter that keeps a far end's
+escape sequences off a real terminal, result codes going to stderr when stdout
+is redirected - has to be told the terminal is not a person's. `dm_tty_set_line()`
+is that switch. The result codes go on the line, since that is where a
+terminal program looks for a modem's words; the log does not, apart from
+errors, because stderr is the same pty. Before the call, quiet mode keeps
+typing off the screen and turns `OPOST` off too, or the pty's `ONLCR` makes
+every result code `CR CR LF`.
+
+SyncTERM's Shell connection on Windows is ConPTY, which is a console emulator
+rather than a pipe: it renders what passes through into a screen buffer and
+sends a VT description of that screen on, so bytes are not preserved and
+`--stdio` cannot work there.
+
+**`datamodem modem`** is for a program that wants a modem on a serial port,
+which on Windows means one end of a com0com pair. `hayes.c` opens the port and
+`dup2()`s it onto stdin and stdout, so the session - which talks to stdin and
+stdout - runs on it unchanged. Its own state is the command line: AT commands
+are parsed as a Hayes did, waiting for `A`, then `T` or `/`, then everything to
+S3, with chained commands and everything else that init strings for other
+modems send accepted and ignored. Result codes all go through one hook, the
+session's included, so that `V`, `Q` and `X` apply to every one.
+
+The control lines follow com0com's default wiring - `cts=rrts dsr=rdtr
+dcd=rdtr`, in `com0com.h` - which is also a null-modem cable's: our DTR is the
+terminal's DCD and DSR, and its DTR is our DSR. So `&C1` drives DTR with the
+carrier, and the session asks `dtr_dropped()` each pass, which reports a fall
+from high to low once; a DTR that was never raised never hangs anything up.
+While `ATD` waits in `dm_sip_dial()`, a thread watches the port, and a
+keystroke or DTR falling abandons the call through the stop flag, as on a
+Hayes. The port's flow control defaults to none, not the `&K3` a real modem
+has: SyncTERM on Windows drops RTS when its own flow control is off, and a
+modem honouring CTS would then never answer. com0com does not lose data
+without it - with its overrun emulation off, which is the default, a writer
+waits for the reader.
+
+SyncTERM's Modem connection is strict about what it reads back, and
+`scripts/modem-test.py` reads the way it does: control characters before a
+line are skipped, a line ends at CR, one containing what was just sent is the
+echo, and the next line must contain `OK` - or, after `ATDT`, `CONNECT`, within
+60 seconds. Anything else is a failure, which is why `RINGING` is said under
+`--stdio` and never on the port.
+
+A pty has no modem-control lines (`TIOCMGET` and `TIOCMBIS` are `ENOTTY`), so
+the tests cannot cover DCD or DTR, and SyncTERM's Modem connection refuses a
+pty outright: it raises DTR before anything else and gives up when that fails.
+
 ## Testing
 
 ```
@@ -1076,6 +1134,8 @@ on.
 ./scripts/exec-test.sh                        # answering for a program, three calls
 ./scripts/exec-tty-test.sh                    # the same on a pseudo-terminal (--exec-tty)
 ./scripts/pty-test.py                         # the same, on a real terminal
+./scripts/stdio-test.py                       # --stdio on a pty, as SyncTERM's Shell runs it
+./scripts/modem-test.py                       # datamodem modem, dialled as SyncTERM's Modem does
 ```
 
 The last three take flags for the link layer, so the same call can be driven

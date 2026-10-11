@@ -36,10 +36,24 @@ typedef struct
 
 const char *dm_session_end_name(dm_session_end_t reason);
 
+/* What a session on a serial port (`datamodem modem`) does with the port's
+ * control lines: carrier() is told when the link is up and when it has gone,
+ * to raise or drop DCD; dtr_dropped() says, once, that the terminal program
+ * has dropped DTR since it was last asked. That hangs up, as AT&D2 - or
+ * escapes to command mode, as AT&D1, with dtr_escapes. */
+typedef struct
+{
+    void (*carrier)(void *user, bool up);
+    bool (*dtr_dropped)(void *user);
+    bool dtr_escapes;
+    void *user;
+} dm_session_port_t;
+
 /* Runs the session until it ends. The call must already be up and the modem
- * attached to it. Returns a dm_exit_code_t and always fills result. */
+ * attached to it; port is NULL but on a serial port. Returns a
+ * dm_exit_code_t and always fills result. */
 int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomic_t *stop,
-                   dm_session_result_t *result);
+                   const dm_session_port_t *port, dm_session_result_t *result);
 
 /* ----------------------------------------------------------- escape detector
  *

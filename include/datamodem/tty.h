@@ -50,4 +50,24 @@ bool dm_tty_control(const void *data, size_t len);
  * while raw. Goes to the control stream. */
 void dm_tty_message(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+/* The local side is a serial line to a terminal program rather than a
+ * person's terminal: --stdio, and the port `datamodem modem` is a modem on.
+ * What came off the line goes to stdout byte for byte, terminal or not, and
+ * the result codes go there too, because a terminal program expects the
+ * modem's words on the line it reads. With progress, call progress -
+ * RINGING - is said there as well; a program that scripts the AT
+ * conversation would take that for a failed call, so `modem` does not. */
+void dm_tty_set_line(bool progress);
+bool dm_tty_is_line(void);
+
+/* Call progress, such as RINGING: on the line when it asked for it,
+ * nowhere otherwise. */
+void dm_tty_progress(const char *code);
+
+/* A result code: OK, ERROR, CONNECT 14400, NO CARRIER. Said as
+ * dm_tty_message() says anything, unless a hook is set: a modem with its own
+ * V, Q and X settings words the codes itself. */
+void dm_tty_result(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void dm_tty_set_result_hook(void (*hook)(const char *code));
+
 #endif /* DATAMODEM_TTY_H */

@@ -29,6 +29,7 @@ typedef enum
     DM_CMD_DIAL,
     DM_CMD_ANSWER,
     DM_CMD_SELFTEST,
+    DM_CMD_MODEM,
     DM_CMD_VERSION,
     DM_CMD_HELP
 } dm_command_t;
@@ -103,6 +104,8 @@ typedef struct
     int escape_key;                /* immediate local escape, -1 = disabled */
     bool local_echo;               /* echo typed characters locally (ATE1) */
     bool tui;                      /* full screen with a status line, when interactive */
+    bool stdio;                    /* stdin and stdout are a serial line to a terminal program,
+                                    * byte for byte, even when they are a terminal */
     char charset[16];              /* the far end's 8-bit characters: cp437 | utf8 | ascii */
     int connect_timeout_s;         /* SIP: ringing until answered */
     int answer_timeout_s;          /* `answer`: how long to wait for a call, 0 = forever */
@@ -113,6 +116,11 @@ typedef struct
     bool exec_tty;                 /* ...on a pseudo-terminal rather than a pipe */
     int calls;                     /* `answer`: calls to take before exiting, 0 = no limit */
     bool hangup_on_eof;            /* clear the call once input ends and is sent */
+
+    /* `modem`: the serial port a terminal program reaches us on */
+    char port[DM_STR_MAX];         /* device path; COMn under Cygwin */
+    int port_speed;                /* the port's own rate, not the line's */
+    char port_flow[16];            /* none | rtscts: factory &K */
     /* Logging */
     dm_log_level_t log_level;
     bool log_json;

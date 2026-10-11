@@ -81,6 +81,7 @@ configure_file(include/datamodem/build_info.h.in
 add_executable(datamodem
   src/main.c
   src/config.c
+  src/hayes.c
   src/log.c
   src/modem.c
   src/ring.c
