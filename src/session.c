@@ -647,7 +647,7 @@ static bool command_mode_byte(dm_session_t *s, unsigned char c)
     }
     if (c == 0x04) /* ctrl-D: give up on the call */
     {
-        dm_tty_message("");
+        dm_tty_message("%s", "");
         finish(s, DM_END_HANGUP);
         return false;
     }
