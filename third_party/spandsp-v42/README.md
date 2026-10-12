@@ -310,6 +310,24 @@ would have been after it. Anything else that arrives then - damaged frames
 especially, since this is the receiver framing ODP and line noise - is
 dropped without being counted as an FCS error.
 
+### 13. The per-context state was never given back
+
+What patches 8, 10 and 11 remember per context lives in a table of eight
+slots beside spandsp's state, keyed by the context's address, and a slot was
+taken on a context's first lookup and never released. After eight V.42 links
+in one process every slot was taken for good: each later link was put in
+slot 0, reset whenever a different link looked itself up, so two links at
+once wiped each other's XID outcome - V.42bis went unused and T401 fell back
+to 1 s. A context allocated where a freed one had been found that one's slot
+as it stood, with its highest N(S) and its discarded-while-busy flag.
+
+datamodem itself runs one link at a time, so it met only the second of
+those; a program running the engine for many lines at once - an Asterisk
+module does - met the first after its eighth call. `v42_free()` now gives the
+slot back and `v42_init()` clears any left at its address.
+`dm_v42_xid_slots_in_use()` reports how many are taken, for
+`tests/v42_test.c`.
+
 ### The test hook
 
 `dm_v42_refuse_sabme` makes the answering end refuse that many SABMEs with

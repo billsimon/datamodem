@@ -265,8 +265,20 @@ add_executable(utiltest tests/util_test.c src/util.c)
 target_include_directories(utiltest PRIVATE src include)
 target_compile_options(utiltest PRIVATE -Wall -Wextra -Wno-unused-parameter -Wshadow)
 add_test(NAME util COMMAND utiltest)
+
+# The vendored V.42's per-context state, given back as each link is freed.
+if(DATAMODEM_VENDOR_V42)
+  add_executable(v42test tests/v42_test.c "${V42_DIR}/v42.c")
+  target_include_directories(v42test PRIVATE ${TIFF_INCLUDE_DIRS})
+  target_compile_options(v42test PRIVATE -Wall -Wextra -Wno-unused-parameter -Wshadow)
+  target_link_libraries(v42test PRIVATE PkgConfig::SPANDSP)
+  if(NOT APPLE)
+    target_link_libraries(v42test PRIVATE m)
+  endif()
+  add_test(NAME v42 COMMAND v42test)
+endif()
 install(TARGETS datamodem RUNTIME DESTINATION bin)
 install(FILES examples/datamodem.conf DESTINATION share/datamodem/examples)
 install(PROGRAMS scripts/loopback-test.sh scripts/escape-test.sh scripts/pty-test.py scripts/exec-test.sh
-        scripts/exec-tty-test.sh
+        scripts/exec-tty-test.sh scripts/async-answer-test.sh
         DESTINATION share/datamodem/scripts)

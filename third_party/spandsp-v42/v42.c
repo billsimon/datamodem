@@ -273,7 +273,8 @@ static __inline__ int set_param(int param, int value, int def)
 /* datamodem: the outcome of the XID exchange, per V.42 context. spandsp has
    nowhere in its own state to keep it - the v42_update_config() that would
    have applied it is commented out - and selftest runs two contexts in one
-   process, so a single global will not do. */
+   process, so a single global will not do. A slot is taken by a context's
+   first lookup and given back when it is freed - see dm_xid_release(). */
 #define DM_XID_SLOTS 8
 static struct
 {
@@ -314,6 +315,36 @@ static int dm_xid_slot(const v42_state_t *s)
 static int *dm_xid_flag(const v42_state_t *s)
 {
     return &dm_xid[dm_xid_slot(s)].done;
+}
+
+/* datamodem: forget a context. Slots were once never given back, so after
+   eight V.42 links in one process - answer --calls 0 gets there, and a
+   program running the engine for many lines at once much sooner - every
+   slot was taken for good, and from then on every link shared slot 0 with
+   whichever other link had looked itself up last, each wiping the other's
+   XID outcome, and V.42bis went unused. And a context allocated where a
+   freed one had been took over its slot as it stood: patch 11's highest
+   N(S) and patch 10's discarded-while-busy flag from the call before. */
+static void dm_xid_release(const v42_state_t *s)
+{
+    for (int i = 0; i < DM_XID_SLOTS; i++)
+    {
+        if (dm_xid[i].s == s)
+            dm_xid[i].s = NULL;
+    }
+}
+
+/* datamodem: test hook - how many contexts hold a slot. */
+int dm_v42_xid_slots_in_use(void)
+{
+    int n = 0;
+
+    for (int i = 0; i < DM_XID_SLOTS; i++)
+    {
+        if (dm_xid[i].s != NULL)
+            n++;
+    }
+    return n;
 }
 
 /* datamodem: T401 for this context. V.42 means it to exceed the time from
@@ -2121,6 +2152,7 @@ SPAN_DECLARE(v42_state_t *) v42_init(v42_state_t *ss,
             return NULL;
     }
     memset(ss, 0, sizeof(*ss));
+    dm_xid_release(ss);
 
     s = &ss->lapm;
     ss->calling_party = calling_party;
@@ -2172,6 +2204,7 @@ SPAN_DECLARE(int) v42_release(v42_state_t *s)
 SPAN_DECLARE(int) v42_free(v42_state_t *s)
 {
     v42_release(s);
+    dm_xid_release(s);
     free(s);
     return 0;
 }

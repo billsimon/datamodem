@@ -358,6 +358,7 @@ struct dm_modem
     bool fsk_confirmed;        /* the far end's FSK tone has been heard, not just energy */
     bool fsk_announced;        /* calling: carrier up before the far end's, see hunt_heard() */
     long long fsk_mark_from;   /* calling: when our own carrier went out, -1 = not yet */
+    long long answer_hold_until; /* answering: mark until then, with no V.42, see tx_get_bit() */
     size_t tx_limit;           /* DM_TX_SECONDS of the current line rate, in bytes */
     int bit_rate;
     unsigned retrains;
@@ -1832,6 +1833,17 @@ static int v42_detect_tail_bit(v42_state_t *v)
     return bit;
 }
 
+/* An answering modem is connected before the calling one is listening.
+ * Over FSK it connects the moment it hears the caller's carrier, which the
+ * caller - ours, see DM_FSK_MARK_MS, and real ones - holds half a second or
+ * more before it takes data; over V.22 and V.22bis the caller finishes
+ * training most of half a second after it. A BBS that greets at once lost
+ * the start of its banner to that: "OME TO" for "WELCOME TO" over Bell 103,
+ * all but "BBS" over V.22bis. Over V.42 nothing is lost, as LAPM is up only
+ * once both ends are; with no V.42, the answering modem holds mark this long
+ * after connecting before it sends what it was given. */
+#define DM_ANSWER_HOLD_MS 1000
+
 static int tx_get_bit(void *user)
 {
     dm_modem_t *m = user;
@@ -1842,6 +1854,11 @@ static int tx_get_bit(void *user)
      * else - V.42's ODP especially - is mistaken for something else by a
      * far end still working out what we are. */
     if (is_fsk(m->mod) && !m->connected)
+        return 1;
+    /* Answering with no V.42 to resend it, what we say first would be lost
+     * to a caller that is not yet listening - see DM_ANSWER_HOLD_MS. It
+     * waits in the queue meanwhile. */
+    if (m->samples < m->answer_hold_until && (m->v42 == NULL || m->v42_fell_back))
         return 1;
     /* Detection has given up on the far end, and a fall back to async is
      * moments away: mark, rather than the HDLC flags LAPM would idle with,
@@ -1931,6 +1948,8 @@ static void note_connected(dm_modem_t *m)
     {
         m->connect_ms = dm_now_ms();
         m->last_rx_ms = m->connect_ms;
+        if (!m->calling)
+            m->answer_hold_until = m->samples + (long long) DM_ANSWER_HOLD_MS * DM_SAMPLE_RATE / 1000;
         /* The clock on the V.42 handshake starts now: before the carrier
          * there was nobody to handshake with. And so do its timers - this is
          * the first moment the line rate is a fact rather than an offer. */
@@ -2867,6 +2886,7 @@ static void step_now(dm_modem_t *m)
     m->fsk_confirmed = m->switch_confirmed;
     m->fsk_announced = false;
     m->fsk_mark_from = -1;
+    m->answer_hold_until = 0;
     listen_reset(&m->listen);
     if (!create_pump(m, m->calling && is_v32(to)))
     {
@@ -3293,6 +3313,7 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     set_modulation(m, m->mod);
     m->hunting = can_step_down(m);
     m->fsk_mark_from = -1;
+    m->answer_hold_until = 0;
     m->window = (m->mod == DM_MOD_V34) ? -1 : cycle_index(m->mod);
     m->window_left = window_samples(m, m->mod);
     m->phase = DM_PHASE_IDLE;

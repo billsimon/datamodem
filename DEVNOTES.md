@@ -179,6 +179,17 @@ minute. A calling FSK modem holds its own carrier at mark for half a second
 plus the path before it passes data, so the answerer is listening when the
 first character arrives.
 
+The answering one is connected the moment it hears that carrier, so the
+caller is the one not yet listening when the answerer has something to say
+first - a BBS's banner. V.22 and V.22bis are the same way round: the caller
+finishes training most of half a second after the answerer. Over V.42 that
+costs nothing, since LAPM comes up only once both ends are. With no V.42
+there is nothing to send it again, and Bell 103 callers received "OME TO THE
+TEST BBS" for "WELCOME TO", V.23 ones "EST BBS", V.22bis ones "BBS". So an
+answering modem with no V.42 holds mark for a second after it connects
+before it sends anything; what it was given waits in the queue.
+`scripts/async-answer-test.sh` checks it.
+
 A calling Bell 103 or V.23 modem goes on air before it has heard the
 answering carrier: on hearing an answer tone (2100 Hz) or USB1 (2250 Hz) it
 raises its own mark, though it still connects only once it has heard the far
@@ -1074,6 +1085,7 @@ on.
 ./scripts/loopback-test.sh                    # a real call over real RTP
 ./scripts/escape-test.sh                      # +++ over a real call
 ./scripts/exec-test.sh                        # answering for a program, three calls
+./scripts/async-answer-test.sh                # a banner said at once, over direct async
 ./scripts/exec-tty-test.sh                    # the same on a pseudo-terminal (--exec-tty)
 ./scripts/pty-test.py                         # the same, on a real terminal
 ```
