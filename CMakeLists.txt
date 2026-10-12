@@ -280,5 +280,5 @@ endif()
 install(TARGETS datamodem RUNTIME DESTINATION bin)
 install(FILES examples/datamodem.conf DESTINATION share/datamodem/examples)
 install(PROGRAMS scripts/loopback-test.sh scripts/escape-test.sh scripts/pty-test.py scripts/exec-test.sh
-        scripts/exec-tty-test.sh
+        scripts/exec-tty-test.sh scripts/async-answer-test.sh
         DESTINATION share/datamodem/scripts)
