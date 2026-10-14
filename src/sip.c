@@ -991,7 +991,10 @@ int dm_sip_start(const dm_config_t *cfg)
     g.started = true;
 
     pjsua_config_default(&ua_cfg);
-    ua_cfg.max_calls = 2;
+    /* One call at a time, but a call given up on before the far end said
+     * anything keeps its slot until the INVITE times out (32 s): a modem or
+     * listener dialling one unreachable number after another needs a few. */
+    ua_cfg.max_calls = 4;
     ua_cfg.cb.on_call_state = &on_call_state;
     ua_cfg.cb.on_call_media_state = &on_call_media_state;
     ua_cfg.cb.on_incoming_call = &on_incoming_call;

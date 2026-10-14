@@ -30,6 +30,7 @@ typedef enum
     DM_CMD_ANSWER,
     DM_CMD_SELFTEST,
     DM_CMD_MODEM,
+    DM_CMD_RLOGIN,
     DM_CMD_VERSION,
     DM_CMD_HELP
 } dm_command_t;
@@ -121,6 +122,10 @@ typedef struct
     char port[DM_STR_MAX];         /* device path; COMn under Cygwin */
     int port_speed;                /* the port's own rate, not the line's */
     char port_flow[16];            /* none | rtscts: factory &K */
+
+    /* `rlogin-listen`: where a terminal program's RLogin connection finds us */
+    char rlogin_bind[DM_STR_MAX];  /* the address to listen on */
+    int rlogin_port;
     /* Logging */
     dm_log_level_t log_level;
     bool log_json;

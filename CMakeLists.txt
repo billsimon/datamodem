@@ -82,6 +82,7 @@ add_executable(datamodem
   src/main.c
   src/config.c
   src/hayes.c
+  src/rlogin.c
   src/log.c
   src/modem.c
   src/ring.c

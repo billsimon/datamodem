@@ -166,6 +166,12 @@ static const opt_def_t OPTS[] = {
             "none | rtscts, the port's flow control until AT&K changes it (default "
             "none)"),
 
+    /* rlogin-listen */
+    STR_OPT("rlogin-bind", rlogin_bind,
+            "the address to take RLogin connections on (default 127.0.0.1: this machine "
+            "only)"),
+    INT_OPT("rlogin-port", rlogin_port, 1, 65535, "the port to take them on (default 513)"),
+
     /* Logging */
     {"log-level", OPT_LOGLEVEL, offsetof(dm_config_t, log_level), 0, 0, 0,
      "error | warn | info | debug | trace (default info)"},
@@ -243,10 +249,11 @@ void dm_config_defaults(dm_config_t *cfg)
     cfg->port_speed = 115200;
     /* Not RTS/CTS, though a real modem's factory setting is: a terminal
      * program set to no flow control drops RTS, and a modem that waits on it
-     * then never says anything. A virtual null-modem such as com0com holds
-     * the sender back by itself; a real cable at a port speed well above the
-     * line rate seldom needs more. */
+     * then never says anything. A port speed well above the line rate
+     * seldom needs more. */
     snprintf(cfg->port_flow, sizeof(cfg->port_flow), "%s", "none");
+    snprintf(cfg->rlogin_bind, sizeof(cfg->rlogin_bind), "%s", "127.0.0.1");
+    cfg->rlogin_port = 513;
 
     cfg->log_level = DM_LOG_INFO;
     cfg->pjsip_log_level = -1;
@@ -500,6 +507,8 @@ static bool command_from_string(const char *s, dm_command_t *out)
         *out = DM_CMD_SELFTEST;
     else if (strcmp(s, "modem") == 0)
         *out = DM_CMD_MODEM;
+    else if (strcmp(s, "rlogin-listen") == 0)
+        *out = DM_CMD_RLOGIN;
     else if (strcmp(s, "version") == 0 || strcmp(s, "--version") == 0 || strcmp(s, "-V") == 0)
         *out = DM_CMD_VERSION;
     else if (strcmp(s, "help") == 0 || strcmp(s, "--help") == 0 || strcmp(s, "-h") == 0)
@@ -693,9 +702,10 @@ int dm_config_parse_args(dm_config_t *cfg, int argc, char *const argv[])
      * terminal is ours only for the log. */
     if (cfg->exec[0] != '\0' || (cfg->command == DM_CMD_ANSWER && cfg->calls != 1))
         cfg->tui = false;
-    /* Under a terminal program, or on a serial port, the terminal at the far
-     * end of stdout is that program's: it draws the far end's screen itself. */
-    if (cfg->stdio || cfg->command == DM_CMD_MODEM)
+    /* Under a terminal program, on a serial port or on a terminal program's
+     * connection, the line is that program's: it draws the far end's screen
+     * itself. */
+    if (cfg->stdio || cfg->command == DM_CMD_MODEM || cfg->command == DM_CMD_RLOGIN)
         cfg->tui = false;
     free(longopts);
     return DM_EXIT_OK;
@@ -703,7 +713,7 @@ int dm_config_parse_args(dm_config_t *cfg, int argc, char *const argv[])
 
 static bool needs_sip(dm_command_t cmd)
 {
-    return cmd == DM_CMD_DIAL || cmd == DM_CMD_ANSWER || cmd == DM_CMD_MODEM;
+    return cmd == DM_CMD_DIAL || cmd == DM_CMD_ANSWER || cmd == DM_CMD_MODEM || cmd == DM_CMD_RLOGIN;
 }
 
 bool dm_config_validate(const dm_config_t *cfg, char *err, size_t err_len)
@@ -797,6 +807,12 @@ bool dm_config_validate(const dm_config_t *cfg, char *err, size_t err_len)
             return false;
         }
     }
+    if (cfg->command == DM_CMD_RLOGIN && (cfg->exec[0] != '\0' || cfg->stdio))
+    {
+        snprintf(err, err_len, "the line is the terminal program's connection: --exec and --stdio do "
+                               "not apply");
+        return false;
+    }
     if (strcasecmp(cfg->port_flow, "none") != 0 && strcasecmp(cfg->port_flow, "rtscts") != 0)
     {
         snprintf(err, err_len, "--port-flow must be none or rtscts");
@@ -843,6 +859,7 @@ static const struct
     {"escape-char", "Terminal"},
     {"connect-timeout", "Calls"},
     {"port", "Being a modem on a serial port (datamodem modem)"},
+    {"rlogin-bind", "Dialling for a terminal program over RLogin (datamodem rlogin-listen)"},
     {"log-level", "Logging"},
 };
 
@@ -935,6 +952,8 @@ void dm_usage(void)
            "  datamodem selftest [options]      loop two modems back to back, no SIP\n"
            "  datamodem modem --port <device>   be a Hayes modem on a serial port, for a\n"
            "                                    terminal program to dial with ATD\n"
+           "  datamodem rlogin-listen [options] dial the number in each RLogin connection's\n"
+           "                                    user name - SyncTERM's RLogin connection\n"
            "  datamodem version\n\n");
     printf("While connected, your terminal is the serial port: every keystroke goes out on\n"
            "the line, and everything the remote system sends lands on stdout. Escape back to\n"
@@ -945,10 +964,10 @@ void dm_usage(void)
            "  datamodem 5551234 --log-file dm.log  keeps the terminal clean\n\n");
     printf("Under a terminal program - SyncTERM's Shell connection, say - --stdio makes\n"
            "stdin and stdout the line itself, byte for byte, and the program draws the\n"
-           "far end's screen. Where a program wants a modem on a serial port instead,\n"
-           "datamodem modem is one: AT commands, ATD to dial, CONNECT, DCD and DTR.\n"
-           "On Windows the port is one end of a com0com virtual null-modem pair, which\n"
-           "has to be installed first (see the README); the terminal opens the other.\n\n");
+           "far end's screen. On Windows, where that cannot work, rlogin-listen takes\n"
+           "SyncTERM's RLogin connections instead: each one dials the number in its user\n"
+           "name, and the connection is the line. For a modem on a real serial port,\n"
+           "datamodem modem is one: AT commands, ATD to dial, CONNECT, DCD and DTR.\n\n");
     printf("Modulations: v34 (33600 down to 2400), v32bis (14400 down to 4800), v32\n"
            "(9600/4800), v22bis (2400), v22 (1200), v23 (1200 down / 75 up), v21 and\n"
            "bell103 (300). The default is v34, which probes the line and picks its own\n"
@@ -978,6 +997,7 @@ void dm_usage(void)
            "  datamodem answer --server sip.example.com --username 1001 --password ...\n\n"
            "  datamodem selftest --modulation v32bis\n\n"
            "  datamodem 5551234 --config ~/.datamodem.conf --stdio      (SyncTERM: Shell)\n\n"
-           "  datamodem modem --port COM4 --config datamodem.conf      (SyncTERM: Modem)\n\n");
+           "  datamodem rlogin-listen --config datamodem.conf          (SyncTERM: RLogin)\n\n"
+           "  datamodem modem --port /dev/ttyUSB0 --config datamodem.conf    (a serial port)\n\n");
     print_options();
 }

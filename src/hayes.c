@@ -217,8 +217,8 @@ static int com_cmp(const void *a, const void *b)
     return atoi((const char *) a + 3) - atoi((const char *) b + 3);
 }
 
-/* The COM ports Windows has, as "COM8, COM9", from the same registry key
- * every Windows program looks in - com0com's pairs are there too. */
+/* The COM ports Windows has, as "COM3, COM4", from the same registry key
+ * every Windows program looks in. */
 static void windows_ports(char *out, size_t out_len)
 {
     static const char key[] = "/proc/registry/HKEY_LOCAL_MACHINE/HARDWARE/DEVICEMAP/SERIALCOMM";
@@ -270,8 +270,8 @@ static void say_cannot_open(const char *name, const char *path, int err)
     if (ports[0] != '\0')
         DM_ERROR("modem", "the serial ports Windows has: %s", ports);
     else
-        DM_ERROR("modem", "Windows has no serial ports; for a terminal program, make a com0com "
-                          "pair such as COM8 and COM9 (see the README)");
+        DM_ERROR("modem", "Windows has no serial ports; for SyncTERM, datamodem rlogin-listen needs "
+                          "none (see the README)");
 #else
     (void) name;
     DM_ERROR("modem", "cannot open %s: %s", path, strerror(err));
@@ -559,14 +559,11 @@ static void dial(hayes_t *h, const char *number)
     }
 }
 
-/* ATD, and whatever follows it on the line: the number, the way a dialling
- * directory has it - "1 (555) 123-4567", "9W5551234" - or a SIP URI as it
- * stands. What made sense to a telephone exchange - tone or pulse, wait for
- * dial tone, pause, flash - means nothing to a SIP trunk and is dropped. */
+/* ATD, and whatever follows it on the line: T or P, then the number, as
+ * dm_hayes_number() takes it - or L for the last one again. */
 static void dial_command(hayes_t *h, const char *s)
 {
     char number[DM_STR_MAX];
-    size_t n = 0;
 
     while (*s == 'T' || *s == 't' || *s == 'P' || *s == 'p')
         s++;
@@ -580,35 +577,44 @@ static void dial_command(hayes_t *h, const char *s)
         }
         snprintf(number, sizeof(number), "%s", h->last_number);
     }
-    else if (strncasecmp(s, "sip:", 4) == 0 || strncasecmp(s, "sips:", 5) == 0)
-    {
-        snprintf(number, sizeof(number), "%s", s);
-        n = strlen(number);
-        while (n > 0 && number[n - 1] == ';')
-            number[--n] = '\0';
-    }
     else if ((*s == 'S' || *s == 's') && (s[1] == '\0' || s[1] == '=' || isdigit((unsigned char) s[1])))
     {
         say("ERROR"); /* ATDS: there are no stored numbers */
         return;
     }
-    else
-    {
-        for (; *s != '\0' && n + 1 < sizeof(number); s++)
-        {
-            if (strchr("TtPpWw,;@!-()./", *s) != NULL)
-                continue;
-            if (isalnum((unsigned char) *s) || *s == '+' || *s == '*' || *s == '#')
-                number[n++] = *s;
-        }
-        number[n] = '\0';
-    }
-    if (number[0] == '\0')
+    else if (!dm_hayes_number(s, number, sizeof(number)))
     {
         say("ERROR");
         return;
     }
     dial(h, number);
+}
+
+bool dm_hayes_number(const char *s, char *out, size_t out_len)
+{
+    size_t n = 0;
+
+    if (out_len == 0)
+        return false;
+    if (strncasecmp(s, "sip:", 4) == 0 || strncasecmp(s, "sips:", 5) == 0)
+    {
+        snprintf(out, out_len, "%s", s);
+        n = strlen(out);
+        while (n > 0 && (out[n - 1] == ';' || out[n - 1] == ' '))
+            out[--n] = '\0';
+    }
+    else
+    {
+        for (; *s != '\0' && n + 1 < out_len; s++)
+        {
+            if (strchr("TtPpWw,;@!-()./", *s) != NULL)
+                continue;
+            if (isalnum((unsigned char) *s) || *s == '+' || *s == '*' || *s == '#')
+                out[n++] = *s;
+        }
+        out[n] = '\0';
+    }
+    return out[0] != '\0';
 }
 
 /* -------------------------------------------------------- the commands */

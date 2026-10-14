@@ -3,6 +3,7 @@
 #include "datamodem/hayes.h"
 #include "datamodem/log.h"
 #include "datamodem/modem.h"
+#include "datamodem/rlogin.h"
 #include "datamodem/session.h"
 #include "datamodem/sip.h"
 #include "datamodem/term.h"
@@ -272,6 +273,9 @@ int main(int argc, char *argv[])
         break;
     case DM_CMD_MODEM:
         rc = dm_hayes_run(&cfg, &g_stop);
+        break;
+    case DM_CMD_RLOGIN:
+        rc = dm_rlogin_run(&cfg, &g_stop);
         break;
     default:
         dm_usage();

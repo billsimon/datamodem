@@ -89,6 +89,7 @@ datamodem <number> [options]       dial it and hand over the terminal
 datamodem dial <number> [options]  the same thing, spelled out
 datamodem answer [options]         answer one inbound call and do the same
 datamodem selftest [options]       loop two modems back to back, no SIP
+datamodem rlogin-listen [options]  dial the number in each RLogin connection's user name
 datamodem modem --port <device>    be a Hayes modem on a serial port
 datamodem version
 ```
@@ -287,13 +288,12 @@ range.
 ## With SyncTERM, or any other terminal program
 
 A BBS terminal program draws ANSI, CP437 and RIP itself, and runs ZMODEM
-itself; what it needs from datamodem is the line, byte for byte. There are two
-ways to hand it over. On Linux and macOS, the terminal program runs datamodem
-and talks to its stdin and stdout. On Windows, datamodem is a modem on a
-virtual serial port, and the terminal program dials it with AT commands the way
-it would dial any modem - which means installing
-[com0com](https://com0com.sourceforge.net), a free virtual null-modem driver,
-first (see below).
+itself; what it needs from datamodem is the line, byte for byte. On Linux and
+macOS, the terminal program runs datamodem and talks to its stdin and stdout.
+On Windows, datamodem runs on its own and the terminal program connects to it
+over RLogin, with the number to dial as the user name. And for a terminal
+program on a real serial port, datamodem is a modem at the other end of the
+cable, dialled with AT commands like any other.
 
 ### On Linux and macOS: `--stdio`
 
@@ -328,43 +328,64 @@ command line. A number can be a SIP URI too: `datamodem sip:bbs@pbx.example.com
 SyncTERM's Shell connection on Windows runs the command under ConPTY, a console
 emulator that rewrites what passes through it - CP437 arrives as UTF-8, escape
 sequences it does not know are dropped, and binary file transfers break - so on
-Windows use the modem instead.
+Windows use `rlogin-listen` instead.
 
-### On Windows, or anywhere with a serial port: `datamodem modem`
+### On Windows: `datamodem rlogin-listen`
 
 ```
-datamodem modem --port COM8 --config datamodem.conf
+datamodem rlogin-listen --config datamodem.conf
 ```
 
-`datamodem modem` is a Hayes modem on a serial port. It answers AT commands,
-`ATD` dials over SIP, it says `CONNECT` when the modems have trained, and from
-then on the port is the line until the call ends, when it says `NO CARRIER` and
-goes back to waiting for commands - call after call, until it is stopped.
+`datamodem rlogin-listen` waits for SyncTERM's RLogin connections, and each one
+dials the number in its user name. It says `RINGING` and then `CONNECT 33600
+V.42/V.42bis` - or `BUSY`, `NO ANSWER`, `NO DIALTONE` or `NO CARRIER` - on the
+connection, as `--stdio` does, and from then on the connection is the line,
+byte for byte, ZMODEM included. Closing the connection hangs up, and the far
+end hanging up closes it. It runs until it is stopped, one call at a time; a
+connection that arrives while a call is up is told so and closed. Nothing has
+to be installed: leave it running in a window of its own.
 
-**On Windows this needs com0com installed first.** Windows has no serial
-ports to spare, so datamodem and the terminal program each open one end of a
-[com0com](https://com0com.sourceforge.net) virtual null-modem pair - a cable
-between two COM ports that exist only in software:
+In SyncTERM, each BBS is a directory entry with:
 
-1. Install com0com - on 64-bit Windows, the signed build
-   (`com0com-2.2.2.0-x64-fre-signed.zip`), which Windows will load without
-   test-signing - and create a pair, from its `setupc` command prompt:
-   `install PortName=COM8 PortName=COM9`. A pair it made for itself is called
-   `CNCA0` and `CNCB0`, names that only Windows programs can open; rename it
-   with `change CNCA0 PortName=COM8` and `change CNCB0 PortName=COM9`.
-2. Run `datamodem modem --port COM8` with your SIP settings. Under Cygwin, COM8
-   is `/dev/ttyS7`; either name works.
-3. In SyncTERM, under **Program Settings**: **Modem/Comm Device** `COM9`; leave
-   **Modem Init String** (`AT&F&C1&D2`) and **Modem Dial String** (`ATDT`) as
-   they are.
-4. Each BBS is a directory entry with **Connection Type** **Modem** and its
-   phone number - or a SIP URI - as the **Address**.
+| | |
+|---|---|
+| **Connection Type** | `RLogin` |
+| **Address** | `localhost` |
+| **Username** | the BBS's number - `5551234`, `1 (555) 123-4567` - or a SIP URI |
 
-The same works on Linux and macOS with a real serial port and a null-modem
-cable, or with anything else that wants a modem on a tty.
+The password is not used. SyncTERM keeps at most 30 characters of a user name,
+so for a SIP URI longer than that choose **RLogin Reversed** instead and put it
+in **Password**, which holds 128. Either way the number is dialled as `ATD`
+dials one: punctuation and spaces dropped, a SIP URI as it stands.
 
-**The control lines** go the way a null-modem cable takes them, and the way
-com0com wires them by default: datamodem's DTR is the terminal's DCD (and DSR),
+It listens on 127.0.0.1, so only programs on the same machine can reach it.
+`--rlogin-bind` changes that - but anyone who can reach it can make calls on
+your SIP account. The port is RLogin's own, 513; `--rlogin-port` picks another,
+which then goes in each entry's address too (`localhost:5513`). It works on
+Linux and macOS as well, where a port below 1024 may need root, though
+`--stdio` needs nothing running.
+
+### On a serial port: `datamodem modem`
+
+```
+datamodem modem --port /dev/ttyUSB0 --config datamodem.conf
+```
+
+`datamodem modem` is a Hayes modem on a serial port, for a terminal program at
+the other end of a null-modem cable - or anything else that wants a modem on a
+tty. It answers AT commands, `ATD` dials over SIP, it says `CONNECT` when the
+modems have trained, and from then on the port is the line until the call
+ends, when it says `NO CARRIER` and goes back to waiting for commands - call
+after call, until it is stopped. On Windows the port is `COM3` or the like;
+under Cygwin COM3 is also `/dev/ttyS2`, and either name works.
+
+In SyncTERM, set **Modem/Comm Device** under **Program Settings** to the port
+at its end of the cable, and leave **Modem Init String** (`AT&F&C1&D2`) and
+**Modem Dial String** (`ATDT`) as they are. Each BBS is then a directory entry
+with **Connection Type** **Modem** and its phone number - or a SIP URI - as the
+**Address**.
+
+**The control lines** go the way a null-modem cable takes them: datamodem's DTR is the terminal's DCD (and DSR),
 and the terminal's DTR arrives as datamodem's DSR. So DCD is up while there is
 a carrier (`AT&C1`, or always with `AT&C0`), and the terminal dropping DTR
 hangs up (`AT&D2`; `&D0` ignores it, `&D1` escapes to command mode, `&D3` hangs
@@ -373,9 +394,8 @@ works, with `+++` and `ATH` the way to hang up.
 
 **Flow control** on the port is off by default (`--port-flow rtscts`, or
 `AT&K3`, turns RTS/CTS on). A terminal program set to no flow control drops
-RTS, and a modem waiting on it would never say anything; com0com holds a
-sender back by itself, and a real port at 115200 runs well ahead of the
-fastest line. `--port-speed` sets the port's rate, which is not the line's.
+RTS, and a modem waiting on it would never say anything; a port at 115200 runs
+well ahead of the fastest line. `--port-speed` sets the port's rate, which is not the line's.
 
 **The commands** are the ones terminal programs send, and enough of the rest
 that an init string written for some other modem still gets `OK`:
@@ -559,6 +579,7 @@ what each end offered, every V.42 frame - so the log says where it stopped.
 ./build/datamodem selftest                    # two modems in memory, no SIP
 ./scripts/loopback-test.sh                    # a real call over real RTP on loopback
 ./scripts/stdio-test.py                       # --stdio, as a terminal program runs it
+./scripts/rlogin-test.py                      # rlogin-listen, connected to as SyncTERM's RLogin does
 ./scripts/modem-test.py                       # datamodem modem, as a terminal program dials it
 ctest --test-dir build                        # unit tests
 ```
