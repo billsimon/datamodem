@@ -946,7 +946,9 @@ void dm_usage(void)
     printf("Under a terminal program - SyncTERM's Shell connection, say - --stdio makes\n"
            "stdin and stdout the line itself, byte for byte, and the program draws the\n"
            "far end's screen. Where a program wants a modem on a serial port instead,\n"
-           "datamodem modem is one: AT commands, ATD to dial, CONNECT, DCD and DTR.\n\n");
+           "datamodem modem is one: AT commands, ATD to dial, CONNECT, DCD and DTR.\n"
+           "On Windows the port is one end of a com0com virtual null-modem pair, which\n"
+           "has to be installed first (see the README); the terminal opens the other.\n\n");
     printf("Modulations: v34 (33600 down to 2400), v32bis (14400 down to 4800), v32\n"
            "(9600/4800), v22bis (2400), v22 (1200), v23 (1200 down / 75 up), v21 and\n"
            "bell103 (300). The default is v34, which probes the line and picks its own\n"

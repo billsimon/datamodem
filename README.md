@@ -291,7 +291,9 @@ itself; what it needs from datamodem is the line, byte for byte. There are two
 ways to hand it over. On Linux and macOS, the terminal program runs datamodem
 and talks to its stdin and stdout. On Windows, datamodem is a modem on a
 virtual serial port, and the terminal program dials it with AT commands the way
-it would dial any modem.
+it would dial any modem - which means installing
+[com0com](https://com0com.sourceforge.net), a free virtual null-modem driver,
+first (see below).
 
 ### On Linux and macOS: `--stdio`
 
@@ -339,11 +341,17 @@ datamodem modem --port COM8 --config datamodem.conf
 then on the port is the line until the call ends, when it says `NO CARRIER` and
 goes back to waiting for commands - call after call, until it is stopped.
 
-On Windows the serial port is one end of a [com0com](https://com0com.sourceforge.net)
-virtual null-modem pair, and the terminal program opens the other end:
+**On Windows this needs com0com installed first.** Windows has no serial
+ports to spare, so datamodem and the terminal program each open one end of a
+[com0com](https://com0com.sourceforge.net) virtual null-modem pair - a cable
+between two COM ports that exist only in software:
 
-1. Install com0com and create a pair, from its `setupc` command prompt:
-   `install PortName=COM8 PortName=COM9`.
+1. Install com0com - on 64-bit Windows, the signed build
+   (`com0com-2.2.2.0-x64-fre-signed.zip`), which Windows will load without
+   test-signing - and create a pair, from its `setupc` command prompt:
+   `install PortName=COM8 PortName=COM9`. A pair it made for itself is called
+   `CNCA0` and `CNCB0`, names that only Windows programs can open; rename it
+   with `change CNCA0 PortName=COM8` and `change CNCB0 PortName=COM9`.
 2. Run `datamodem modem --port COM8` with your SIP settings. Under Cygwin, COM8
    is `/dev/ttyS7`; either name works.
 3. In SyncTERM, under **Program Settings**: **Modem/Comm Device** `COM9`; leave
