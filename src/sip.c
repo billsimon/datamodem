@@ -1,6 +1,7 @@
 #include "datamodem/sip.h"
 #include "datamodem/log.h"
 #include "datamodem/term.h"
+#include "datamodem/tty.h"
 #include "datamodem/util.h"
 
 #include <pthread.h>
@@ -990,7 +991,10 @@ int dm_sip_start(const dm_config_t *cfg)
     g.started = true;
 
     pjsua_config_default(&ua_cfg);
-    ua_cfg.max_calls = 2;
+    /* One call at a time, but a call given up on before the far end said
+     * anything keeps its slot until the INVITE times out (32 s): a modem or
+     * listener dialling one unreachable number after another needs a few. */
+    ua_cfg.max_calls = 4;
     ua_cfg.cb.on_call_state = &on_call_state;
     ua_cfg.cb.on_call_media_state = &on_call_media_state;
     ua_cfg.cb.on_incoming_call = &on_incoming_call;
@@ -1256,6 +1260,7 @@ int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem, volat
     pjsua_call_id call_id = PJSUA_INVALID_ID;
     pj_status_t status;
     int64_t deadline;
+    bool rang = false;
 
     if (call_view().exists)
     {
@@ -1334,6 +1339,11 @@ int dm_sip_dial(const dm_config_t *cfg, const char *to, dm_modem_t *modem, volat
              * it, so give that a moment to show up before deciding there is
              * none - or the speaker chirps ringing tone over the top of it. */
             speaker_on();
+            if (!rang)
+            {
+                rang = true;
+                dm_tty_progress("RINGING");
+            }
             if (v.media_active || v.answered)
                 ringback(false);
             else if (dm_now_ms() - v.ringing_ms >= 250)

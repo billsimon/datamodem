@@ -16,6 +16,9 @@ static struct termios g_saved;
 static bool g_saved_valid = false;
 static volatile sig_atomic_t g_raw = 0;
 static bool g_registered = false;
+static bool g_line = false;
+static bool g_progress = false;
+static void (*g_result_hook)(const char *code) = NULL;
 
 bool dm_tty_is_interactive(void)
 {
@@ -57,6 +60,10 @@ void dm_tty_quiet(void)
      * screen; signals still work, so ctrl-c still stops a call that is
      * dialling. */
     q.c_lflag &= (tcflag_t) ~(ICANON | ECHO);
+    /* On a line, our result codes say CR LF themselves, as a modem's do, and
+     * must not arrive as CR CR LF. */
+    if (g_line)
+        q.c_oflag &= (tcflag_t) ~OPOST;
     q.c_cc[VMIN] = 1;
     q.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSANOW, &q) == 0)
@@ -96,9 +103,10 @@ bool dm_tty_raw(char *err, size_t err_len)
         return false;
     }
     g_raw = 1;
-    /* With the screen ours, anything typed while the call was being set up
-     * was typed at nothing; a modem would not have sent it either. */
-    if (dm_term_active())
+    /* With the screen ours, or a terminal program's, anything typed while
+     * the call was being set up was typed at nothing; a modem would not
+     * have sent it either. */
+    if (dm_term_active() || g_line)
         tcflush(STDIN_FILENO, TCIFLUSH);
     return true;
 }
@@ -136,9 +144,21 @@ bool dm_tty_write_raw(const void *data, size_t len)
     return write_all(STDOUT_FILENO, data, len);
 }
 
+void dm_tty_set_line(bool progress)
+{
+    g_line = true;
+    g_progress = progress;
+}
+
+bool dm_tty_is_line(void)
+{
+    return g_line;
+}
+
 /* What the far end sent. Into the emulated screen when it is ours; made safe
  * to print when stdout is a terminal anyway; and untouched when it is a file
- * or a pipe, which wants exactly what came off the line. */
+ * or a pipe, which wants exactly what came off the line - or when it is a
+ * line to a terminal program, which draws the far end's screen itself. */
 bool dm_tty_write(const void *data, size_t len)
 {
     static int is_tty = -1;
@@ -150,7 +170,7 @@ bool dm_tty_write(const void *data, size_t len)
     }
     if (is_tty < 0)
         is_tty = isatty(STDOUT_FILENO);
-    if (is_tty)
+    if (is_tty && !g_line)
     {
         const unsigned char *p = data;
 
@@ -177,7 +197,7 @@ static int control_fd(void)
     static int fd = -1;
 
     if (fd < 0)
-        fd = isatty(STDOUT_FILENO) ? STDOUT_FILENO : STDERR_FILENO;
+        fd = (g_line || isatty(STDOUT_FILENO)) ? STDOUT_FILENO : STDERR_FILENO;
     return fd;
 }
 
@@ -217,4 +237,29 @@ void dm_tty_message(const char *fmt, ...)
         dm_tty_control(buf, (size_t) n);
         dm_tty_control("\r\n", 2);
     }
+}
+
+void dm_tty_progress(const char *code)
+{
+    if (g_progress)
+        dm_tty_result("%s", code);
+}
+
+void dm_tty_set_result_hook(void (*hook)(const char *code))
+{
+    g_result_hook = hook;
+}
+
+void dm_tty_result(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (g_result_hook != NULL)
+        g_result_hook(buf);
+    else
+        dm_tty_message("%s", buf);
 }

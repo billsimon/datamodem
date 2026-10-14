@@ -473,7 +473,7 @@ static void enter_command_mode(dm_session_t *s)
     s->command_mode = true;
     s->cmdlen = 0;
     dm_tty_control("\r\n", 2);
-    dm_tty_message("OK");
+    dm_tty_result("OK");
     DM_DEBUG("session", "escaped to command mode");
 }
 
@@ -487,7 +487,7 @@ static void return_online(dm_session_t *s)
     /* Restart the guard timer, or a "+++" typed straight after ATO would see
      * the silence that the command-mode conversation left behind. */
     dm_escape_init(&s->esc, s->cfg->escape_char, s->cfg->escape_guard_ms);
-    dm_tty_message("CONNECT %d", st.bit_rate);
+    dm_tty_result("CONNECT %d", st.bit_rate);
 }
 
 static bool set_s_register(dm_session_t *s, const char *arg)
@@ -558,20 +558,20 @@ static bool run_at_command(dm_session_t *s, char *line)
 
     if (strncasecmp(p, "AT", 2) != 0)
     {
-        dm_tty_message("ERROR");
+        dm_tty_result("ERROR");
         return true;
     }
     p += 2;
 
     if (*p == '\0')
     {
-        dm_tty_message("OK");
+        dm_tty_result("OK");
         return true;
     }
 
     if (strcasecmp(p, "H") == 0 || strcasecmp(p, "H0") == 0 || strcasecmp(p, "Z") == 0)
     {
-        dm_tty_message("OK");
+        dm_tty_result("OK");
         finish(s, DM_END_HANGUP);
         return false;
     }
@@ -579,7 +579,7 @@ static bool run_at_command(dm_session_t *s, char *line)
     {
         if (!dm_modem_connected(s->modem))
         {
-            dm_tty_message("NO CARRIER");
+            dm_tty_result("NO CARRIER");
             finish(s, DM_END_NO_CARRIER);
             return false;
         }
@@ -589,27 +589,27 @@ static bool run_at_command(dm_session_t *s, char *line)
     if (toupper((unsigned char) p[0]) == 'I' && (p[1] == '\0' || isdigit((unsigned char) p[1])))
     {
         print_info(s);
-        dm_tty_message("OK");
+        dm_tty_result("OK");
         return true;
     }
     if (strcasecmp(p, "&V") == 0)
     {
         print_settings(s);
-        dm_tty_message("OK");
+        dm_tty_result("OK");
         return true;
     }
     if (strcasecmp(p, "E0") == 0 || strcasecmp(p, "E1") == 0)
     {
         s->local_echo = (p[1] == '1');
-        dm_tty_message("OK");
+        dm_tty_result("OK");
         return true;
     }
     if (toupper((unsigned char) p[0]) == 'S')
     {
         if (set_s_register(s, p + 1))
-            dm_tty_message("OK");
+            dm_tty_result("OK");
         else
-            dm_tty_message("ERROR");
+            dm_tty_result("ERROR");
         return true;
     }
     if (strcasecmp(p, "?") == 0 || strcasecmp(p, "HELP") == 0)
@@ -617,11 +617,11 @@ static bool run_at_command(dm_session_t *s, char *line)
         dm_tty_message("ATO   return to the call      ATH   hang up");
         dm_tty_message("ATI   session info            AT&V  settings");
         dm_tty_message("ATE0/ATE1  local echo         ATS2=n ATS12=n  escape char / guard ms");
-        dm_tty_message("OK");
+        dm_tty_result("OK");
         return true;
     }
 
-    dm_tty_message("ERROR");
+    dm_tty_result("ERROR");
     return true;
 }
 
@@ -647,7 +647,7 @@ static bool command_mode_byte(dm_session_t *s, unsigned char c)
     }
     if (c == 0x04) /* ctrl-D: give up on the call */
     {
-        dm_tty_message("");
+        dm_tty_message("%s", "");
         finish(s, DM_END_HANGUP);
         return false;
     }
@@ -1121,7 +1121,7 @@ static int exit_code_for(dm_session_end_t reason, bool ever_connected)
 }
 
 int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomic_t *stop,
-                   dm_session_result_t *result)
+                   const dm_session_port_t *port, dm_session_result_t *result)
 {
     dm_session_t s;
     dm_modem_status_t st;
@@ -1251,6 +1251,20 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
 
         drain_wake(&s);
 
+        /* The terminal program dropping DTR is AT&D's business: a hangup,
+         * or - &D1 - the escape sequence without the typing. */
+        if (port != NULL && port->dtr_dropped(port->user))
+        {
+            if (!port->dtr_escapes)
+            {
+                DM_INFO("session", "the terminal dropped DTR; hanging up");
+                finish(&s, DM_END_HANGUP);
+                break;
+            }
+            if (!s.command_mode && s.connected_ms != 0)
+                enter_command_mode(&s);
+        }
+
         /* The escape sequence completes on silence, so it can only be
          * noticed here rather than on a keystroke. */
         if (!s.command_mode && dm_escape_tick(&s.esc, now, held, &held_len))
@@ -1282,9 +1296,11 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
             s.connected_ms = now;
             result->bit_rate = st.bit_rate;
             if (strcmp(st.protocol, "async") == 0)
-                dm_tty_message("CONNECT %d", st.bit_rate);
+                dm_tty_result("CONNECT %d", st.bit_rate);
             else
-                dm_tty_message("CONNECT %d %s", st.bit_rate, st.protocol);
+                dm_tty_result("CONNECT %d %s", st.bit_rate, st.protocol);
+            if (port != NULL)
+                port->carrier(port->user, true);
             dm_log_event(DM_LOG_INFO, "session", "connected",
                          "rate=%d modulation=%s protocol=%s train_ms=%" PRId64, st.bit_rate,
                          st.modulation, st.protocol, now - s.started_ms);
@@ -1343,7 +1359,7 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
 
         if (s.connected_ms == 0 && now > train_deadline)
         {
-            dm_tty_message("NO CARRIER");
+            dm_tty_result("NO CARRIER");
             DM_ERROR("session", "the modems did not train within %ds (phase: %s)", cfg->train_timeout_s,
                      st.phase_text);
             finish(&s, DM_END_TRAIN_FAILED);
@@ -1352,14 +1368,14 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
 
         if (st.carrier_lost)
         {
-            dm_tty_message("NO CARRIER");
+            dm_tty_result("NO CARRIER");
             finish(&s, DM_END_NO_CARRIER);
             break;
         }
 
         if (dm_sip_call_ended())
         {
-            dm_tty_message("NO CARRIER");
+            dm_tty_result("NO CARRIER");
             DM_INFO("session", "the call was cleared by the far end");
             finish(&s, DM_END_REMOTE_CLEARED);
             break;
@@ -1370,7 +1386,7 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
             int64_t since = dm_sip_since_rtp_ms();
             if (since >= 0 && since > (int64_t) cfg->media_timeout_s * 1000)
             {
-                dm_tty_message("NO CARRIER");
+                dm_tty_result("NO CARRIER");
                 DM_ERROR("session", "no RTP from the far end for %ds - check the media path",
                          cfg->media_timeout_s);
                 finish(&s, DM_END_TIMEOUT);
@@ -1388,7 +1404,7 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
          * call. */
         if (cfg->max_retrains > 0 && st.retrains >= (unsigned) cfg->max_retrains)
         {
-            dm_tty_message("NO CARRIER");
+            dm_tty_result("NO CARRIER");
             if (st.train_stage != NULL)
                 /* V.32 and V.34 agree their rates explicitly, so the ends cannot
                  * disagree about it the way V.22bis's can; and each retrain
@@ -1503,7 +1519,9 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
     result->bit_rate = st.bit_rate;
 
     dm_format_duration(result->connected_ms, dur, sizeof(dur));
-    if (s.connected_ms != 0)
+    /* Not on a line to a terminal program: a modem says NO CARRIER and
+     * nothing more, and anything else lands in what it reads as data. */
+    if (s.connected_ms != 0 && !dm_tty_is_line())
         dm_tty_message("%s after %s, %" PRIu64 " bytes sent, %" PRIu64 " bytes received",
                        dm_session_end_name(s.reason), dur, result->bytes_tx, result->bytes_rx);
 

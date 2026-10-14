@@ -89,6 +89,8 @@ datamodem <number> [options]       dial it and hand over the terminal
 datamodem dial <number> [options]  the same thing, spelled out
 datamodem answer [options]         answer one inbound call and do the same
 datamodem selftest [options]       loop two modems back to back, no SIP
+datamodem rlogin-listen [options]  dial the number in each RLogin connection's user name
+datamodem modem --port <device>    be a Hayes modem on a serial port
 datamodem version
 ```
 
@@ -283,6 +285,141 @@ at a time; a call that arrives during another gets `486 Busy Here`. More lines
 means more datamodems, each with its own SIP account, `--local-port` and RTP
 range.
 
+## With SyncTERM, or any other terminal program
+
+A BBS terminal program draws ANSI, CP437 and RIP itself, and runs ZMODEM
+itself; what it needs from datamodem is the line, byte for byte. On Linux and
+macOS, the terminal program runs datamodem and talks to its stdin and stdout.
+On Windows, datamodem runs on its own and the terminal program connects to it
+over RLogin, with the number to dial as the user name. And for a terminal
+program on a real serial port, datamodem is a modem at the other end of the
+cable, dialled with AT commands like any other.
+
+### On Linux and macOS: `--stdio`
+
+```
+datamodem 5551234 --config ~/.datamodem.conf --stdio
+```
+
+`--stdio` makes stdin and stdout the line, even when they are a terminal: no
+full screen, no status line and no filtering, so what the far end sends
+reaches the terminal program exactly as sent and what it types reaches the far
+end exactly as typed. The modem's own words go on the line as a modem's would:
+`RINGING` while it rings, then `CONNECT 33600 V.42/V.42bis` - or `BUSY`,
+`NO ANSWER`, `NO DIALTONE` (no SIP registration or transport) or
+`NO CARRIER` - and `NO CARRIER` when the call ends. The log stays off the
+line: errors still appear, being why a call failed, and the rest goes to
+`--log-file`. Hanging up is SIGHUP, or the terminal going away, which is how a
+terminal program disconnects; `+++` still works too.
+
+In SyncTERM, each BBS is a directory entry with **Connection Type** set to
+**Shell** and the command as its **Address**:
+
+```
+datamodem 5551234 --config ~/.datamodem.conf --stdio
+```
+
+SyncTERM keeps at most 64 characters of an address, so put the SIP account,
+and anything else every call shares, in the config file - or in
+`DATAMODEM_*` variables in SyncTERM's environment - rather than on the
+command line. A number can be a SIP URI too: `datamodem sip:bbs@pbx.example.com
+--config ~/.datamodem.conf --stdio`.
+
+SyncTERM's Shell connection on Windows runs the command under ConPTY, a console
+emulator that rewrites what passes through it - CP437 arrives as UTF-8, escape
+sequences it does not know are dropped, and binary file transfers break - so on
+Windows use `rlogin-listen` instead.
+
+### On Windows: `datamodem rlogin-listen`
+
+```
+datamodem rlogin-listen --config datamodem.conf
+```
+
+`datamodem rlogin-listen` waits for SyncTERM's RLogin connections, and each one
+dials the number in its user name. It says `RINGING` and then `CONNECT 33600
+V.42/V.42bis` - or `BUSY`, `NO ANSWER`, `NO DIALTONE` or `NO CARRIER` - on the
+connection, as `--stdio` does, and from then on the connection is the line,
+byte for byte, ZMODEM included. Closing the connection hangs up, and the far
+end hanging up closes it. It runs until it is stopped, one call at a time; a
+connection that arrives while a call is up is told so and closed. Nothing has
+to be installed: leave it running in a window of its own.
+
+In SyncTERM, each BBS is a directory entry with:
+
+| | |
+|---|---|
+| **Connection Type** | `RLogin` |
+| **Address** | `localhost` |
+| **Username** | the BBS's number - `5551234`, `1 (555) 123-4567` - or a SIP URI |
+
+The password is not used. SyncTERM keeps at most 30 characters of a user name,
+so for a SIP URI longer than that choose **RLogin Reversed** instead and put it
+in **Password**, which holds 128. Either way the number is dialled as `ATD`
+dials one: punctuation and spaces dropped, a SIP URI as it stands.
+
+It listens on 127.0.0.1, so only programs on the same machine can reach it.
+`--rlogin-bind` changes that - but anyone who can reach it can make calls on
+your SIP account. The port is RLogin's own, 513; `--rlogin-port` picks another,
+which then goes in each entry's address too (`localhost:5513`). It works on
+Linux and macOS as well, where a port below 1024 may need root, though
+`--stdio` needs nothing running.
+
+### On a serial port: `datamodem modem`
+
+```
+datamodem modem --port /dev/ttyUSB0 --config datamodem.conf
+```
+
+`datamodem modem` is a Hayes modem on a serial port, for a terminal program at
+the other end of a null-modem cable - or anything else that wants a modem on a
+tty. It answers AT commands, `ATD` dials over SIP, it says `CONNECT` when the
+modems have trained, and from then on the port is the line until the call
+ends, when it says `NO CARRIER` and goes back to waiting for commands - call
+after call, until it is stopped. On Windows the port is `COM3` or the like;
+under Cygwin COM3 is also `/dev/ttyS2`, and either name works.
+
+In SyncTERM, set **Modem/Comm Device** under **Program Settings** to the port
+at its end of the cable, and leave **Modem Init String** (`AT&F&C1&D2`) and
+**Modem Dial String** (`ATDT`) as they are. Each BBS is then a directory entry
+with **Connection Type** **Modem** and its phone number - or a SIP URI - as the
+**Address**.
+
+**The control lines** go the way a null-modem cable takes them: datamodem's DTR is the terminal's DCD (and DSR),
+and the terminal's DTR arrives as datamodem's DSR. So DCD is up while there is
+a carrier (`AT&C1`, or always with `AT&C0`), and the terminal dropping DTR
+hangs up (`AT&D2`; `&D0` ignores it, `&D1` escapes to command mode, `&D3` hangs
+up and resets). A port without control lines - a pty, a three-wire cable - still
+works, with `+++` and `ATH` the way to hang up.
+
+**Flow control** on the port is off by default (`--port-flow rtscts`, or
+`AT&K3`, turns RTS/CTS on). A terminal program set to no flow control drops
+RTS, and a modem waiting on it would never say anything; a port at 115200 runs
+well ahead of the fastest line. `--port-speed` sets the port's rate, which is not the line's.
+
+**The commands** are the ones terminal programs send, and enough of the rest
+that an init string written for some other modem still gets `OK`:
+
+| | |
+|---|---|
+| `ATD` *number* | dial; tone, pulse, pauses, dashes, spaces and brackets are dropped, so a dialling directory's `1 (555) 123-4567` dials 15551234567. A SIP URI is dialled as it stands. A keystroke while it rings abandons the call |
+| `ATDL` | dial the last number again |
+| `A/` | repeat the last command |
+| `ATH`, `ATZ`, `AT&F` | hang up; reset to the factory settings |
+| `ATE`, `ATQ`, `ATV`, `ATX` | command echo, quiet, words or numbers, which result codes (`X4`: all of them) |
+| `AT&C`, `AT&D`, `AT&K` | DCD, DTR, flow control, as above |
+| `ATS`*n*`=`*v*, `ATS`*n*`?` | registers; S2 is the escape character, S3, S4 and S5 the CR, LF and backspace, and S12 the escape guard time - in milliseconds, as `--escape-guard-ms` |
+| `ATI`, `AT&V` | the version; the settings |
+| `ATB`, `ATL`, `ATM`, `ATN`, `AT\N`, `AT%C`, `AT+...`, `AT&W`, ... | accepted, and change nothing: stepping down, V.42 and V.42bis are already what a modem's factory settings give, and `--speaker` is the speaker |
+
+There is no `ATA`: answering calls is `datamodem answer`. And `+++` with `ATO`,
+`ATH` and `ATI` work during a call as they do in the terminal.
+
+SyncTERM gives a modem 60 seconds from `ATDT` to `CONNECT`, ringing included.
+A BBS that answers in a few rings and a V.34 connection, which trains in ten
+to fifteen seconds, fit with plenty to spare; a far end that lets it ring for
+most of a minute does not.
+
 ## Modulations
 
 | `--modulation` | Standard | Rate | Calling end transmits | Answering end transmits |
@@ -441,6 +578,9 @@ what each end offered, every V.42 frame - so the log says where it stopped.
 ```
 ./build/datamodem selftest                    # two modems in memory, no SIP
 ./scripts/loopback-test.sh                    # a real call over real RTP on loopback
+./scripts/stdio-test.py                       # --stdio, as a terminal program runs it
+./scripts/rlogin-test.py                      # rlogin-listen, connected to as SyncTERM's RLogin does
+./scripts/modem-test.py                       # datamodem modem, as a terminal program dials it
 ctest --test-dir build                        # unit tests
 ```
 
