@@ -7,6 +7,7 @@
 #include "datamodem/version.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -210,6 +211,73 @@ static void port_path(const char *name, char *out, size_t out_len)
     snprintf(out, out_len, "%s", name);
 }
 
+#ifdef __CYGWIN__
+static int com_cmp(const void *a, const void *b)
+{
+    return atoi((const char *) a + 3) - atoi((const char *) b + 3);
+}
+
+/* The COM ports Windows has, as "COM8, COM9", from the same registry key
+ * every Windows program looks in - com0com's pairs are there too. */
+static void windows_ports(char *out, size_t out_len)
+{
+    static const char key[] = "/proc/registry/HKEY_LOCAL_MACHINE/HARDWARE/DEVICEMAP/SERIALCOMM";
+    char names[64][16];
+    size_t n = 0;
+    struct dirent *e;
+    DIR *d;
+
+    out[0] = '\0';
+    d = opendir(key);
+    if (d == NULL)
+        return;
+    while ((e = readdir(d)) != NULL && n < 64)
+    {
+        char file[512];
+        FILE *f;
+        size_t len;
+
+        if (e->d_name[0] == '.')
+            continue;
+        snprintf(file, sizeof(file), "%s/%s", key, e->d_name);
+        f = fopen(file, "rb");
+        if (f == NULL)
+            continue;
+        len = fread(names[n], 1, sizeof(names[n]) - 1, f);
+        fclose(f);
+        names[n][len] = '\0';
+        names[n][strcspn(names[n], "\r\n")] = '\0';
+        if (strncasecmp(names[n], "COM", 3) == 0)
+            n++;
+    }
+    closedir(d);
+    qsort(names, n, sizeof(names[0]), com_cmp);
+    for (size_t i = 0; i < n; i++)
+        snprintf(out + strlen(out), out_len - strlen(out), "%s%s", i ? ", " : "", names[i]);
+}
+#endif
+
+static void say_cannot_open(const char *name, const char *path, int err)
+{
+#ifdef __CYGWIN__
+    char ports[256];
+
+    windows_ports(ports, sizeof(ports));
+    if (strcmp(name, path) != 0)
+        DM_ERROR("modem", "cannot open %s (%s): %s", name, path, strerror(err));
+    else
+        DM_ERROR("modem", "cannot open %s: %s", path, strerror(err));
+    if (ports[0] != '\0')
+        DM_ERROR("modem", "the serial ports Windows has: %s", ports);
+    else
+        DM_ERROR("modem", "Windows has no serial ports; for a terminal program, make a com0com "
+                          "pair such as COM8 and COM9 (see the README)");
+#else
+    (void) name;
+    DM_ERROR("modem", "cannot open %s: %s", path, strerror(err));
+#endif
+}
+
 static int open_port(const dm_config_t *cfg, const char *path)
 {
     struct termios t;
@@ -226,7 +294,7 @@ static int open_port(const dm_config_t *cfg, const char *path)
     fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0)
     {
-        DM_ERROR("modem", "cannot open %s: %s", path, strerror(errno));
+        say_cannot_open(cfg->port, path, errno);
         return -1;
     }
     if (!isatty(fd) || tcgetattr(fd, &t) != 0)
