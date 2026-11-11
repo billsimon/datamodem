@@ -8,7 +8,7 @@
 #
 #   scripts/retrain-test.sh [path/to/datamodem]
 #
-# Takes about half a minute.
+# Takes about twenty seconds.
 set -uo pipefail
 
 BIN=${1:-build/datamodem}
@@ -88,6 +88,16 @@ case_ "V.32 bis: a step up that does not hold" v32bis \
     "+14400 did not hold - the far end asked for less" \
     "-; retraining \\("
 
+# Back up after a step down, one rate at a time: each has to hold before
+# the next is asked for. The hook takes the call to 4800; the answerer then
+# holds 14400 back, the far end having asked for less.
+case_ "V.32 bis: back up a rate at a time" v32bis \
+    DATAMODEM_V32_RENEGOTIATE=5:4800 DATAMODEM_SELFTEST_LINE=ulaw,delay=100 DATAMODEM_SELFTEST_BYTES=150000 -- \
+    "+asking the far end to change to 7200" \
+    "+asking the far end to change to 9600" \
+    "+asking the far end to change to 12000" \
+    "-; retraining \\("
+
 # A fifth of a second of silence from the far end - a dropout on its line,
 # which arrives as audio rather than lost packets - is ridden out with no
 # retrain, as V.34 always has. It used to wreck the equaliser.
@@ -114,6 +124,16 @@ case_ "V.34: dropouts no rate survives" v34 \
     "+; retraining \\(" \
     "-did not hold" \
     "-renegotiating"
+
+# A bad patch six minutes in - so not held against 33600 - meets the
+# renegotiation's TRN, which settles both ways at 26400. V.34 used to stay
+# there to the end of the call; it comes back a rate at a time.
+case_ "V.34: back up a rate at a time" v34 \
+    DATAMODEM_SELFTEST_LINE=ulaw,delay=100,fade=4/400/-45 DATAMODEM_SELFTEST_BYTES=2700000 -- \
+    "+rates changed without a retrain: 26400 bit/s out, 26400 in" \
+    "+asking the far end to change rate \(to 28800" \
+    "+asking the far end to change rate \(to 31200" \
+    "-; retraining \\("
 
 # A far end that retrains whenever its reception is poor, at whatever rate
 # training gives it, as the one did that a BBS hung up on after four of

@@ -389,6 +389,11 @@ struct dm_v34
     int trained_rx, trained_tx;   /* what the last start-up or retrain settled on */
     int rn_prev_tx, rn_prev_rx;   /* the rates as a renegotiation started */
     int rx_limit_seen, tx_limit_seen; /* the limits in force at the last look, for when they lift */
+    int tx_step;                  /* while a renegotiation after a limit lifted: the most to offer out, 0 = no cap */
+    long long up_since;           /* reception good enough for the next rate up since then, 0 if not */
+    long long up_next;            /* no asking for more before then */
+    double up_backoff;            /* seconds, doubled each time asking for more got nothing */
+    int up_from;                  /* our receive rate when we asked for more, 0 if we have not */
 };
 
 /* ------------------------------------------------------------- helpers */
@@ -1961,6 +1966,8 @@ static void build_mp(dm_v34_t *v, bool ack)
     int lim = rate_ceiling(&v->tx_failed, v->n);
     int rx = v->want_rx;
 
+    if (v->tx_step > 0 && (lim == 0 || v->tx_step < lim))
+        lim = v->tx_step;
     if (lim > 0 && lim < my_tx_max)
         my_tx_max = (lim < lowest_rate(v->sr_tx)) ? lowest_rate(v->sr_tx) : lim;
 
@@ -2221,6 +2228,14 @@ static void go_data(dm_v34_t *v)
                 v->rate_rx, v->snr_db, v->tag);
         /* Less of our transmitter, and not because our own MP said so: the
          * far end's reception would not bear what it had. */
+        v->tx_step = 0;
+        v->up_since = 0;
+        if (v->up_from > 0 && v->rate_rx <= v->up_from && v->up_backoff > 0.0)
+            v->up_backoff = (v->up_backoff * 2.0 > 600.0) ? 600.0 : v->up_backoff * 2.0;
+        else
+            v->up_backoff = 30.0;
+        v->up_next = v->n + (long long) (v->up_backoff * 8000.0);
+        v->up_from = 0;
         if (v->rate_tx < v->rn_prev_tx && (lim == 0 || lim >= v->rn_prev_tx))
             rate_failed(v, false, v->rn_prev_tx, v->tx_since, true, "the far end asked for less");
         if (v->rate_tx != v->rn_prev_tx)
@@ -2230,6 +2245,10 @@ static void go_data(dm_v34_t *v)
         emit(v, DM_V34_RATE_CHANGED);
         return;
     }
+    v->tx_step = 0;
+    v->up_since = 0;
+    v->up_next = v->n + MS(10000);
+    v->up_from = 0;
     v->rx_since = v->tx_since = v->n;
     v->trained_rx = v->rate_rx;
     v->trained_tx = v->rate_tx;
@@ -2578,6 +2597,7 @@ static void restart_phase2(dm_v34_t *v, bool initiate, const char *why)
     v->tx_in_data = v->rx_in_data = false;
     v->tx_data = false;
     v->renegotiating = false;
+    v->tx_step = 0;
     v->rate_tx = v->rate_rx = 0;
     v->have_mp = v->far_ack = v->far_e = false;
     /* 10.1.3.9: the coefficients are zero until the first MP of Phase 4. */
@@ -3087,18 +3107,63 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             }
 
             /* A limit has lifted that was holding a direction back: one
-             * renegotiation lets both ends find their rate again, which
-             * nothing else would until the next failure. */
+             * renegotiation lets that direction come back up, which nothing
+             * else would until the next failure - one rate, and no more, as
+             * V.32 bis steps up: the measurement at one rate says less about
+             * each rate beyond it, and the rate that failed soonest is
+             * usually the one at the top. The next lift, or the next
+             * retrain, may go further. */
             {
                 int rl = dm_rate_memory_limit(&v->rx_failed, n);
                 int tl = dm_rate_memory_limit(&v->tx_failed, n);
-                bool lifted = (v->rx_limit_seen > 0 && rl == 0 && v->rate_rx >= v->rx_limit_seen - 2400) ||
-                              (v->tx_limit_seen > 0 && tl == 0 && v->rate_tx >= v->tx_limit_seen - 2400);
+                bool rx_lifted = v->rx_limit_seen > 0 && rl == 0 && v->rate_rx >= v->rx_limit_seen - 2400;
+                bool tx_lifted = v->tx_limit_seen > 0 && tl == 0 && v->rate_tx >= v->tx_limit_seen - 2400;
 
                 v->rx_limit_seen = rl;
                 v->tx_limit_seen = tl;
-                if (lifted && rn_begin(v, 0, "a rate held back after a failure may be tried again"))
-                    return;
+                if (rx_lifted || tx_lifted)
+                {
+                    v->tx_step = tx_lifted ? v->rate_tx + 2400 : v->rate_tx;
+                    if (rn_begin(v, rx_lifted ? v->rate_rx + 2400 : v->rate_rx,
+                                 "a rate held back after a failure may be tried again"))
+                        return;
+                    v->tx_step = 0;
+                }
+            }
+
+            /* And back up when reception has been good enough for the next
+             * rate in for ten seconds, with a dB to spare: after a step down
+             * that a bad patch called for and that has passed, or a
+             * renegotiation whose TRN met the bad patch. One rate at a time,
+             * as V.32 bis does, and the far end may come up one in the same
+             * exchange if its own reception says so. Without this a V.34 call
+             * that once stepped down stayed down to the end. An attempt that
+             * gets nothing waits twice as long before the next. */
+            {
+                int up = v->rate_rx + 2400;
+                int lim = rate_ceiling(&v->rx_failed, n);
+
+                if (v->plain_recovery || up > V34_SR_MAX_RATE[v->sr_rx] || up > v->max_rate ||
+                    (lim > 0 && up > lim) || snr < rate_needs_db(up, v->sr_rx) + 1.0f)
+                {
+                    v->up_since = 0;
+                }
+                else if (v->up_since == 0)
+                {
+                    v->up_since = n;
+                }
+                else if (n - v->up_since > MS(10000) && n >= v->up_next)
+                {
+                    char why[96];
+
+                    snprintf(why, sizeof(why), "reception is good enough for %d bit/s in (%.1f dB SNR)", up, snr);
+                    v->tx_step = v->rate_tx + 2400;
+                    v->up_from = v->rate_rx;
+                    if (rn_begin(v, up, why))
+                        return;
+                    v->tx_step = 0;
+                    v->up_from = 0;
+                }
             }
         }
         break;

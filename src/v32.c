@@ -2418,21 +2418,35 @@ static unsigned rn_set_upto(const dm_v32_t *v, int want)
 }
 
 /* The best coding our receiver would bear now, by the SNR it has in data,
- * and that has not failed recently. In data, that is the SNR now; once the
- * far end's preamble and rate signal have started arriving it is the SNR
- * they interrupted, because the slicer's error on them is no measure of
- * anything - it reads 10 dB low on a clean line, and turned down every
- * step up the far end asked for that came near the margin. */
+ * that has not failed recently, and no more than one rate above the one in
+ * use. In data, the SNR is the SNR now; once the far end's preamble and
+ * rate signal have started arriving it is the SNR they interrupted, because
+ * the slicer's error on them is no measure of anything - it reads 10 dB low
+ * on a clean line, and turned down every step up the far end asked for that
+ * came near the margin.
+ *
+ * One rate at a time, up, whoever asks (R4 or R5): SNR at one rate is only
+ * an estimate of how the next will do, and less of one for each rate
+ * beyond. On a production call whose hold on 12000 lifted, the step went
+ * straight from 9600 to 14400 - the rate that had failed soonest. Each rate
+ * now has to hold, and wait out the time before the next step up (up_next),
+ * before the one above is asked for. Down is as far as reception says. */
 static int rn_desired(const dm_v32_t *v)
 {
     float snr = (v->stage == STG_DATA) ? rx_snr(v) : v->snr_data;
     unsigned s = 0;
+    int best;
 
     for (int c = 0; c < CODE_COUNT; c++)
         if ((v->enabled & SET_BIS & CBIT(c)) && rx_can((coding_t) c, snr))
             s |= CBIT(c);
     s = allowed(v, s);
-    return (s != 0) ? best_of(s) : CODE_4800;
+    best = (s != 0) ? best_of(s) : CODE_4800;
+    for (int c = 0; c < CODE_COUNT; c++)
+        if ((v->enabled & SET_BIS & CBIT(c)) && CODING[c].rate > v->rate && CODING[best].rate > CODING[c].rate &&
+            (s & CBIT(c)))
+            return c;
+    return best;
 }
 
 /* The preamble: AA for 56 symbols then CC for 8 from the caller, AC then CA

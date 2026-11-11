@@ -437,9 +437,14 @@ requests, and makes its own:
   seconds as before;
 - **up**, when reception has been good enough for a higher rate, with a dB
   to spare, for ten seconds: after a step down that was more cautious than it
-  needed to be, or a bad patch that passed. An attempt that gets nothing -
-  the far end's receiver would not have it - waits twice as long before the
-  next.
+  needed to be, or a bad patch that passed. One rate at a time, whichever end
+  asks (our R4, or our R5 answering the far end's): SNR at one rate is only
+  an estimate of the next, and less of one for each rate beyond, and a
+  production call whose hold on 12000 lifted went straight from 9600 to
+  14400 - the rate that had failed soonest. Each rate now holds for the
+  thirty seconds before the next step up may be asked for. An attempt that
+  gets nothing - the far end's receiver would not have it - waits twice as
+  long before the next.
 
 ```
 info  [v32] reception has been poor (18.3 dB SNR) for 1.0 seconds; asking the far end to change to 7200 (tag=out)
@@ -581,9 +586,17 @@ there for what counts as failing, and why not every failure does): our
 receive rate when our reception gives out, and our transmit rate when the
 far end's does - it asks for less, or retrains while our own reception was
 fine. What goes in our MP is ours to choose, and the rate each way is the
-most both MPs allow (11.4.1.1.3), so that is where the limit goes. When a
-limit lifts, one renegotiation lets both ends find their rate again, which
-nothing else would until the next failure.
+most both MPs allow (11.4.1.1.3), so that is where the limit goes.
+
+V.34 had no way back up, either: a call that stepped down, or whose
+renegotiation's TRN met a bad patch and settled low, stayed there to the
+end. Now, as in V.32bis, reception good enough for the next rate in, with a
+dB to spare, for ten seconds asks for it by renegotiating, one rate at a
+time, and the far end may come up one in the same exchange if its own
+reception says so; an attempt that gets nothing waits twice as long. A
+limit lifting renegotiates the same way, one rate up in whichever direction
+it held back. Over a line with one bad patch six minutes in, the call that
+used to finish at 26400 climbs back to 31200 within a minute.
 
 The transmit side is what a production BBS needed. A caller whose own
 receiver could not hold 28800 from us retrained every fifteen seconds and
