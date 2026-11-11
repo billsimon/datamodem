@@ -135,6 +135,36 @@ case_ "V.34: back up a rate at a time" v34 \
     "+asking the far end to change rate \(to 31200" \
     "-; retraining \\("
 
+# A far end that loses us - a second of loud noise wrecks its receiver - and
+# never notices: no retrain, no request, just no more answers. We hear it
+# fine throughout; V.42's polls going unanswered are the only sign, and a
+# retrain from our end is what brings its receiver back. As on the
+# production call that ended with "the far end stopped answering our polls".
+case_ "V.32 bis: a far end that loses us silently" v32bis \
+    DATAMODEM_NO_RETRAIN=call DATAMODEM_SELFTEST_LINE=ulaw,delay=100,fade=1/60/-12/call \
+    DATAMODEM_SELFTEST_BYTES=400000 -- \
+    "+has not answered 5 polls in a row, though we hear it fine" \
+    "+the answering modem is sending AC; retraining" \
+    "-link was lost"
+
+# V.34 renegotiates for it (11.6) rather than retraining: its TRN goes both
+# ways, and a Phase 2 on a line with bursts in it can be broken by them.
+case_ "V.34: a far end that loses us silently" v34 \
+    DATAMODEM_NO_RETRAIN=call DATAMODEM_SELFTEST_LINE=ulaw,delay=100,fade=1/60/-12/call \
+    DATAMODEM_SELFTEST_BYTES=400000 -- \
+    "+has not answered 5 polls in a row, though we hear it fine" \
+    "+training its receiver again; asking the far end to change rate" \
+    "-link was lost"
+
+# Polls lost to a line that is disturbed every two seconds are the line's
+# doing, not a deaf far end's: no retrain for them on top of what the line
+# already calls for. One here sent V.34 through a Phase 2 the bursts kept
+# breaking, and the call was lost.
+case_ "V.34: bursts every two seconds" v34 \
+    DATAMODEM_SELFTEST_LINE=delay=150,ulaw,burst=60/2 DATAMODEM_SELFTEST_BYTES=150000 -- \
+    "-has not answered" \
+    "-link was lost"
+
 # A far end that retrains whenever its reception is poor, at whatever rate
 # training gives it, as the one did that a BBS hung up on after four of
 # them in two minutes: it is our transmitter that has to slow down.

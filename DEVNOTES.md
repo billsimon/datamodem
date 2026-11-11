@@ -1189,6 +1189,34 @@ error [modem] the error-corrected link was lost - the far end stopped answering 
 without answers is ridden out, which N400 of 5 was not, and twenty-five is
 given up on with that reason.
 
+**A far end that loses us and does not notice.** With N400 at 16 a later
+call on the same BBS ran twenty-five minutes, and ended the same way: the
+far end stopped answering, for the seventeen seconds V.42 now allows, while
+everything we heard from it was perfect - no poor reception, no tone, no
+lost packets. Its receiver had lost our signal, and it never retrained, so
+nothing at the modem level on our side could tell. V.42's unanswered polls
+were the only sign. So once five in a row have gone unanswered
+(`dm_v42_unanswered()` in the vendored V.42), and our own reception has been
+undisturbed - no retrain, rate change or dropped carrier - for eight
+seconds, the modem trains the far end's receiver again: V.32 by retraining,
+which the far end must join on hearing AC or AA (7.1 and 7.2/V.32bis), V.34
+by a renegotiation at the rates in use, whose TRN goes both ways (11.6) and
+which becomes a retrain if the far end does not hear it. V.42's timers stop
+meanwhile (7.10/V.42), so the eleven polls left are still there after it;
+if they go unanswered too, the link is given up as before.
+
+```
+warn  [modem] the far end has not answered 5 polls in a row, though we hear it fine - it has most likely lost our signal (tag=in)
+info  [v32] retraining to bring its receiver back; retraining (tag=in)
+```
+
+The eight quiet seconds matter. Without them, a line with a burst of noise
+every two seconds - polls lost, but to the line, which the pumps already
+deal with by renegotiating - had V.34 retrain on top, through a Phase 2 the
+bursts kept breaking, and the call was lost where renegotiations alone had
+carried it. V.32bis and V.34 retrain when their own reception is poor
+anyway; this is only for the far end's.
+
 ### Knowing when it is safe to hang up
 
 Handing a byte to the link layer is not the same as putting it on the line,
@@ -1248,9 +1276,19 @@ pjmedia's own idea of how full the buffer is (`size`) is not its delay - on
 loopback, with 150 ms in each direction's buffer and a 300 ms round trip, it
 read 280 to 320 ms - so the delay given is the buffer's own measure of it.
 
-Whether the BBS's retrains were that, and on which side of the call the
-buffer was, is what these are for; if they were, the cure is to lock our
-transmit clock to the far end's, not anything in the modems.
+What the far end's RTCP receiver reports say of our packets - how many it
+lost, the jitter it saw, the network round trip - goes with the five-minute
+and retrain lines, a line of its own whenever it reports more lost, and the
+summary (`far_reports`, `far_lost`, `far_jitter_ms`, `net_rtt_ms`): the
+direction we send in is the one we cannot measure, and the one a far end
+goes deaf in.
+
+The next long call on that BBS answered the question: `clock_ppm=+13`, to
+within 13, over twenty-five minutes. The clocks agree. Its jitter buffer did
+run dry once, for six frames, at a moment two packets were lost - which a
+V.32bis call before the dropout fix would have retrained over, and this one
+rode out. The round trip's creep is more likely jitter buffers refilling
+after each such hiccup than drift.
 
 Nothing in the modem runs until the call is actually answered. That sounds
 obvious and is easy to get wrong: pjmedia's conference bridge starts clocking
@@ -1447,7 +1485,9 @@ never sees. `fade=.../call` and `noise=-36/call` put it only on what the
 caller hears (`/answer` the answerer), for a direction one end's receiver
 cannot hold and the other's can. `DATAMODEM_V34_PLAIN_RECOVERY=call` makes
 that end retrain whenever its reception is poor and remember no rate that
-failed, as many far ends do. `scripts/retrain-test.sh` runs the cases these
+failed, as many far ends do; `DATAMODEM_NO_RETRAIN=call` makes it never do
+anything about its own reception at all - a far end that loses us and does
+not notice, which only the other end's V.42 can see. `scripts/retrain-test.sh` runs the cases these
 were made for - a step down where one will do, no rate held against a
 dropout, a step up that does not hold, a far end that keeps retraining - and
 checks what the log says happened, not just that the data arrived:

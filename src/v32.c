@@ -483,6 +483,7 @@ struct dm_v32
     unsigned rn_offer;        /* our R4 or R5 */
     bool rn_refused;          /* the far end ignored a renegotiation; do not ask again */
     bool rn_deaf;             /* test hook: never hear the far end's renegotiation */
+    bool no_retrain;          /* test hook: never act on our own poor reception */
     unsigned renegotiations;
     int rn_from;              /* the coding a renegotiation we asked for started from */
     bool rn_down;             /* and it asked for less */
@@ -2778,7 +2779,10 @@ static void control(dm_v32_t *v, long long n)
         return;
 
     /* 5.5: the far end starting a retrain, or starting over. A renegotiation
-     * preamble's 56 symbols of AC or AA are too short to be taken for one. */
+     * preamble's 56 symbols of AC or AA are too short to be taken for one -
+     * but a retrain's first 24 are taken for a preamble, by rn_pre_watch(),
+     * so one arrives here in STG_RN_RESP: the far end's request, as we took
+     * it, at the rate still in use. */
     {
         bool in_data = v->stage == STG_DATA || v->stage == STG_RN_SEND || v->stage == STG_RN_RESP ||
                        v->stage == STG_RN_WAIT_E || v->stage == STG_RN_B1;
@@ -2786,7 +2790,7 @@ static void control(dm_v32_t *v, long long n)
         if (v->calling && v->ac_strict >= RUN_128T &&
             (v->stage == STG_C_TRAIN2 || v->stage == STG_C_WAIT_E || v->stage == STG_C_B1 || in_data))
         {
-            if (v->stage == STG_DATA)
+            if (v->stage == STG_DATA || v->stage == STG_RN_RESP)
                 rate_failed(v, v->coding, v->poor_since == 0 || n - v->poor_since < SECONDS(0.3),
                             "the far end retrained");
             if (in_data)
@@ -2798,7 +2802,7 @@ static void control(dm_v32_t *v, long long n)
             (v->stage == STG_A_R1 || v->stage == STG_A_TRAIN || v->stage == STG_A_WAIT_E ||
              v->stage == STG_A_B1 || in_data))
         {
-            if (v->stage == STG_DATA)
+            if (v->stage == STG_DATA || v->stage == STG_RN_RESP)
                 rate_failed(v, v->coding, v->poor_since == 0 || n - v->poor_since < SECONDS(0.3),
                             "the far end retrained");
             if (in_data)
@@ -3089,7 +3093,7 @@ static void control(dm_v32_t *v, long long n)
             }
         }
 
-        if (snr < poor)
+        if (snr < poor && !v->no_retrain)
         {
             if (v->poor_since == 0)
             {
@@ -3222,6 +3226,7 @@ dm_v32_t *dm_v32_create(const dm_v32_params_t *p)
     v->calling = p->calling;
     v->bis = p->v32bis;
     v->rn_deaf = p->deaf_to_renegotiation;
+    v->no_retrain = p->no_retrain;
     v->trellis = p->trellis || p->v32bis;
     /* 4800 always. V.32 bis keeps the nonredundant 9600 for a V.32 far end
      * that has no trellis coder (1e/V.32 bis: "compatibility with V.32"). */
@@ -3320,6 +3325,15 @@ bool dm_v32_engaged(const dm_v32_t *v)
 int dm_v32_bit_rate(const dm_v32_t *v)
 {
     return v->rate;
+}
+
+bool dm_v32_retrain(dm_v32_t *v, const char *why)
+{
+    if (v->stage != STG_DATA)
+        return false;
+    emit(v, DM_V32_RETRAINING);
+    restart(v, why, false);
+    return true;
 }
 
 bool dm_v32_renegotiate(dm_v32_t *v, int rate)

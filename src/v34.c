@@ -244,6 +244,7 @@ struct dm_v34
     int req_trellis;          /* 0, 1, 2: 16, 32, 64 states */
     bool req_shaping;
     bool plain_recovery;      /* test hook: see dm_v34_params_t */
+    bool no_retrain;          /* test hook: likewise */
     bool lapm;
     float nominal_dbm0;
     int (*get_bit)(void *user);
@@ -3067,7 +3068,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             {
                 v->low_since = 0;
             }
-            if (snr < rate_needs_db(v->rate_rx, v->sr_rx) - 4.0f)
+            if (snr < rate_needs_db(v->rate_rx, v->sr_rx) - 4.0f && !v->no_retrain)
             {
                 if (v->poor_since == 0)
                 {
@@ -3459,6 +3460,7 @@ dm_v34_t *dm_v34_create(const dm_v34_params_t *p)
     v->req_trellis = (p->trellis == 64) ? 2 : (p->trellis == 32) ? 1 : 0;
     v->req_shaping = p->shaping;
     v->plain_recovery = p->plain_recovery;
+    v->no_retrain = p->no_retrain;
     v->lapm = p->lapm;
     v->nominal_dbm0 = p->tx_power;
     v->get_bit = p->get_bit;
@@ -3541,6 +3543,11 @@ bool dm_v34_engaged(const dm_v34_t *v)
 int dm_v34_rx_rate(const dm_v34_t *v)
 {
     return (v->stage == ST_DATA || v->rx_in_data) ? v->rate_rx : 0;
+}
+
+bool dm_v34_resync(dm_v34_t *v, const char *why)
+{
+    return rn_begin(v, v->rate_rx, why);
 }
 
 bool dm_v34_renegotiate(dm_v34_t *v, int rx_rate)

@@ -352,6 +352,15 @@ a link comes up so that one link's cannot carry over to the next.
 `tests/v42_test.c` cuts a link both ways and checks it rides out ten seconds
 and gives the right reason after twenty-five.
 
+### 16. How long the far end has been silent
+
+`dm_v42_unanswered()` says how many times in a row T401 has run out on a
+connected link without anything from the far end to acknowledge us - polls
+gone unanswered - so that datamodem can tell a far end that has lost our
+signal while we still hear it fine, and retrain to bring it back rather than
+wait for N400 to run out. `tests/v42_test.c` checks it counts up through a
+silence and is back to nothing after.
+
 ### The test hook
 
 `dm_v42_refuse_sabme` makes the answering end refuse that many SABMEs with

@@ -50,6 +50,8 @@ typedef struct
     bool listen_first;        /* calling: stay silent until dm_v32_start(), or until AC is heard */
     float tx_power;           /* dBm0 */
     bool deaf_to_renegotiation; /* test hook: act like a far end that ignores 8/V.32 bis */
+    bool no_retrain;            /* test hook: never retrain or step down for our own reception,
+                                 * as a far end that loses us and does not notice */
     const char *tag;          /* for logs */
 
     /* Called on whichever thread drives dm_v32_tx / dm_v32_rx. get_bit is
@@ -110,6 +112,10 @@ int dm_v32_bit_rate(const dm_v32_t *v);
  * that both ends will take (8/V.32 bis). False if this is not a V.32 bis
  * call, or not in data. DM_V32_RATE_CHANGED says when it has happened. */
 bool dm_v32_renegotiate(dm_v32_t *v, int rate);
+
+/* In data, retrain (5.5) - for a reason the receiver cannot see, such as
+ * the far end's having stopped answering. False if not in data. */
+bool dm_v32_retrain(dm_v32_t *v, const char *why);
 float dm_v32_rx_power(const dm_v32_t *v);
 void dm_v32_stats(const dm_v32_t *v, dm_v32_stats_t *out);
 

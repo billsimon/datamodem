@@ -124,6 +124,7 @@ extern int dm_v42_answer_no_ec;
 extern int dm_v42_no_xid;
 extern int dm_v42_xid_done(const v42_state_t *s);
 extern void dm_v42_set_t401(const v42_state_t *s, int ms);
+extern int dm_v42_unanswered(const v42_state_t *s);
 #endif
 
 /* How long to leave between attempts at establishment. Long enough that a
@@ -296,6 +297,9 @@ struct dm_modem
     int v42bis_max_string;
     bool lapm_up;
     bool lapm_lost;            /* LAPM was up and has closed: the call is ending */
+    bool stall_retrained;      /* retrained for the far end's silence; see check_v42_stall() */
+    int64_t disturbed_ms;      /* the last retrain, rate change or carrier drop, 0 if none */
+    bool no_retrain;           /* test hook DATAMODEM_NO_RETRAIN: a far end that never notices */
     bool rx_busy;              /* LAPM told the far end to wait: our receive queue is full */
     bool v42_fell_back;        /* gave up on V.42 and went back to raw async */
     int v42_timeout_s;
@@ -1898,6 +1902,7 @@ static void note_connected(dm_modem_t *m)
     settle(m, "trained");
     m->connected = true;
     m->carrier_down_ms = 0;
+    m->disturbed_ms = dm_now_ms();
     m->phase = DM_PHASE_DATA;
     if (m->v22 != NULL)
     {
@@ -2057,6 +2062,7 @@ static void rx_status(void *user, int status)
         /* Not the end of the call yet. Stop treating what arrives as data,
          * start the clock, and let dm_modem_tx() decide if it stays away.
          * See DM_CARRIER_GRACE_MS. */
+        m->disturbed_ms = dm_now_ms();
         if (m->connected && !m->carrier_lost && m->carrier_down_ms == 0)
         {
             m->carrier_down_ms = dm_now_ms();
@@ -2163,6 +2169,7 @@ static void v32_event(void *user, dm_v32_event_t ev)
          * carrier never went; only the rate, and V.42's timers with it. */
         m->bit_rate = dm_v32_bit_rate(m->v32);
         m->tx_bit_rate = m->bit_rate;
+        m->disturbed_ms = dm_now_ms();
         v42_set_bit_rate(m, m->tx_bit_rate);
         DM_INFO("modem", "rate changed to %d bps (tag=%s)", m->bit_rate, m->tag);
         break;
@@ -2203,6 +2210,7 @@ static void v34_event(void *user, dm_v34_event_t ev)
         m->bit_rate = dm_v34_rx_rate(m->v34);
         m->tx_bit_rate = dm_v34_tx_rate(m->v34);
         m->carrier_down_ms = 0;
+        m->disturbed_ms = dm_now_ms();
         m->phase = DM_PHASE_DATA;
         v42_set_bit_rate(m, m->tx_bit_rate);
         DM_INFO("modem", "rate changed to %d bps in, %d out (tag=%s)", m->bit_rate, m->tx_bit_rate, m->tag);
@@ -2266,6 +2274,61 @@ static const char *v42_failure_reason(const dm_modem_t *m)
  * wrong place about half the time. Real data, even over a poor line, does
  * not do that. Content-independent, so it does not care what the far end was
  * trying to say. */
+/* V.42 has polled the far end this many times in a row and heard nothing
+ * back - about five seconds - with our own reception fine all the while:
+ * no retrain, rate change or dropped carrier for this long. Polls lost to a
+ * line that keeps being disturbed are the line's doing, and the pumps deal
+ * with that themselves; a retrain on top, on a line with a burst of noise
+ * every two seconds, sent V.34 through a Phase 2 the bursts kept breaking,
+ * where renegotiations alone had carried the call. */
+#define DM_V42_STALL_POLLS 5
+#define DM_V42_STALL_QUIET_MS 8000
+
+/* A far end that stops answering V.42 while we go on hearing it perfectly
+ * well has most likely lost our signal: its receiver, not ours. A
+ * production V.32bis call ended that way, its polls unanswered for the
+ * seventeen seconds V.42 allows, with our reception clean throughout and no
+ * retrain from the far end, which never noticed. Nothing at the modem level
+ * on our side could see it; the only sign was V.42's. So train the far
+ * end's receiver again: V.32 by retraining, which the far end has to join
+ * on hearing AC or AA (7.1 and 7.2/V.32 bis); V.34 by a renegotiation,
+ * whose TRN goes both ways (11.6) and which becomes a retrain (11.5) if the
+ * far end does not hear it. V.42's timers stop meanwhile (7.10/V.42), so
+ * the polls left are still there after, and if they go unanswered too the
+ * link is given up as before. Once for each silence: an answer puts it
+ * back. */
+static void check_v42_stall(dm_modem_t *m)
+{
+#if defined(DATAMODEM_VENDORED_V42)
+    int unanswered;
+
+    /* Our reception is fine in the pump's own judgement: one whose reception
+     * goes bad retrains by itself, and the carrier is then down. */
+    if (m->v42 == NULL || !m->lapm_up || m->carrier_lost || m->carrier_down_ms != 0 ||
+        (m->v32 == NULL && m->v34 == NULL) || m->no_retrain)
+        return;
+    unanswered = dm_v42_unanswered(m->v42);
+    if (unanswered == 0)
+    {
+        m->stall_retrained = false;
+        return;
+    }
+    if (unanswered < DM_V42_STALL_POLLS || m->stall_retrained ||
+        (m->disturbed_ms != 0 && dm_now_ms() - m->disturbed_ms < DM_V42_STALL_QUIET_MS))
+        return;
+    m->stall_retrained = true;
+    DM_WARN("modem", "the far end has not answered %d polls in a row, though we hear it fine - it has most "
+                     "likely lost our signal (tag=%s)",
+            unanswered, m->tag);
+    if (m->v32 != NULL)
+        dm_v32_retrain(m->v32, "retraining to bring its receiver back");
+    else
+        dm_v34_resync(m->v34, "training its receiver again");
+#else
+    (void) m;
+#endif
+}
+
 static void check_rate_agreement(dm_modem_t *m)
 {
     int64_t now;
@@ -2592,6 +2655,17 @@ static bool create_v32_pump(dm_modem_t *m, bool listen_first)
                              "seconds into the call. This is a test hook.", rate, secs);
         }
     }
+    /* Test hook: "call" or "answer" makes that end never retrain or step
+     * down for its own reception - a far end that has lost us and not
+     * noticed - so that what the other end does about it gets exercised. */
+    if (getenv("DATAMODEM_NO_RETRAIN") != NULL &&
+        strcmp(getenv("DATAMODEM_NO_RETRAIN"), m->calling ? "call" : "answer") == 0)
+    {
+        vp.no_retrain = true;
+        m->no_retrain = true;
+        DM_WARN("modem", "DATAMODEM_NO_RETRAIN: this end will not retrain for its own reception. This is a "
+                         "test hook.");
+    }
     /* Test hook: "answer" or "call" makes that end ignore the far end's
      * requests to change rate, as a far end might that does not do 8/V.32
      * bis properly - so the asking end's give-up-and-retrain gets run. */
@@ -2683,6 +2757,14 @@ static bool create_pump(dm_modem_t *m, bool listen_first)
          * reception the way many far ends do - a retrain every time, at
          * whatever rate training then picks - so that what the other end
          * does about a far end like that gets exercised. */
+        if (getenv("DATAMODEM_NO_RETRAIN") != NULL &&
+            strcmp(getenv("DATAMODEM_NO_RETRAIN"), m->calling ? "call" : "answer") == 0)
+        {
+            vp.no_retrain = true;
+            m->no_retrain = true;
+            DM_WARN("modem", "DATAMODEM_NO_RETRAIN: this end will not retrain for its own reception. This is a "
+                             "test hook.");
+        }
         if (getenv("DATAMODEM_V34_PLAIN_RECOVERY") != NULL &&
             strcmp(getenv("DATAMODEM_V34_PLAIN_RECOVERY"), m->calling ? "call" : "answer") == 0)
         {
@@ -3783,6 +3865,7 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
          * recovery harder. */
         check_v42_deadline(m);
         check_rate_agreement(m);
+        check_v42_stall(m);
 
         if (m->carrier_down_ms != 0 && !m->carrier_lost &&
             dm_now_ms() - m->carrier_down_ms > m->carrier_grace_ms)

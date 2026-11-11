@@ -66,6 +66,8 @@ typedef struct
     int pre_emphasis;         /* test hook: likewise, -1 = whatever probing says, else 0 to 10 */
     int trellis;              /* the code our receiver asks for: 16 (0 means 16), 32 or 64 */
     bool shaping;             /* ask for expanded shaping */
+    bool no_retrain;          /* test hook: never retrain or renegotiate for our own reception,
+                               * as a far end that loses us and does not notice */
     bool plain_recovery;      /* test hook: retrain whenever reception is poor, and remember no
                                * rate that failed - as a far end might */
     const char *tag;          /* for logs */
@@ -126,6 +128,12 @@ int dm_v34_rx_rate(const dm_v34_t *v);
 /* Ask the far end to change to at most this rate in our receive direction
  * (11.6). False if not in data. DM_V34_RATE_CHANGED says when it is done. */
 bool dm_v34_renegotiate(dm_v34_t *v, int rx_rate);
+
+/* In data, renegotiate at the rates in use (11.6), whose TRN trains both
+ * receivers - for a reason ours cannot see, such as the far end's having
+ * stopped answering. It becomes a retrain if the far end does not join in.
+ * False if not in data. */
+bool dm_v34_resync(dm_v34_t *v, const char *why);
 
 float dm_v34_rx_power(const dm_v34_t *v);
 void dm_v34_stats(const dm_v34_t *v, dm_v34_stats_t *out);

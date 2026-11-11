@@ -2036,6 +2036,20 @@ SPAN_DECLARE(void) v42_rx_bit(void *user_data, int bit)
 }
 /*- End of function --------------------------------------------------------*/
 
+/* datamodem: on a link that is up, how many times in a row T401 has run out
+   with nothing from the far end to acknowledge us - each time a poll gone
+   unanswered - or 0. The modem watches it: a far end that has stopped
+   answering while we still hear it perfectly well has most likely lost our
+   signal, and a retrain is what gets its receiver back (see modem.c's
+   check_v42_stall()). */
+int dm_v42_unanswered(const v42_state_t *ss)
+{
+    if (ss->lapm.state != LAPM_DATA  ||  ss->bit_timer_func != t401_expired)
+        return 0;
+    return ss->lapm.retry_count;
+}
+/*- End of function --------------------------------------------------------*/
+
 /* datamodem: send another SABME, without re-running detection.
    Establishment and detection are separate phases, and only the first of
    them failed. v42_restart() would go back to the detection phase, which a

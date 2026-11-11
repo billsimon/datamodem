@@ -65,6 +65,13 @@ typedef struct
     unsigned jb_max_delay_ms;
     unsigned jb_empty;         /* times it had nothing to give the modem */
     unsigned jb_discard;       /* frames it threw away */
+    /* What the far end says of ours, in its RTCP receiver reports - the only
+     * view there is of the direction we send in. far_reports is 0 if it
+     * sends none. */
+    unsigned far_reports;
+    unsigned far_lost;         /* of our packets */
+    unsigned far_jitter_us;    /* in our packets' arrival, as it last reported */
+    unsigned net_rtt_us;       /* the network's round trip, from those reports; 0 if unknown */
 } dm_link_quality_t;
 
 bool dm_sip_link_quality(dm_link_quality_t *q);

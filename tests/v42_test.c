@@ -15,6 +15,7 @@ extern void dm_v42_set_t401(const v42_state_t *s, int ms);
 extern int dm_v42_xid_done(const v42_state_t *s);
 extern int dm_v42_xid_slots_in_use(void);
 extern char dm_v42_disconnect_cause[80];
+extern int dm_v42_unanswered(const v42_state_t *s);
 
 static int failures;
 
@@ -83,7 +84,7 @@ static void link_status(void *user, int status)
 /* Bring a link up, cut the line for cut_s seconds, and run on for another
  * 30. True if the caller's link was still up at the end;
  * why says what it said if not. */
-static int survives_cut(double cut_s, char *why, size_t why_len)
+static int survives_cut(double cut_s, char *why, size_t why_len, int *most_unanswered, int *unanswered_after)
 {
     const long rate = 9600;
     link_seen_t ca = { 0 }, an = { 0 };
@@ -109,6 +110,8 @@ static int survives_cut(double cut_s, char *why, size_t why_len)
 
         v42_rx_bit(b, cut ? 1 : ab);
         v42_rx_bit(a, cut ? 1 : ba);
+        if (dm_v42_unanswered(a) > *most_unanswered)
+            *most_unanswered = dm_v42_unanswered(a);
         if (up_at < 0 && ca.connected && an.connected)
         {
             up_at = t;
@@ -118,6 +121,7 @@ static int survives_cut(double cut_s, char *why, size_t why_len)
             break;
     }
     ok = up_at >= 0 && ca.disconnected == 0;
+    *unanswered_after = dm_v42_unanswered(a);
     snprintf(why, why_len, "%s", up_at < 0 ? "never came up" : ca.why);
     v42_free(a);
     v42_free(b);
@@ -192,13 +196,22 @@ int main(void)
      * what became of the DISC that followed. */
     {
         char why[96];
+        int most = 0, after = 0;
 
-        if (!survives_cut(10.0, why, sizeof(why)))
+        if (!survives_cut(10.0, why, sizeof(why), &most, &after))
         {
             printf("FAIL a link hung up after ten seconds without answers: %s\n", why);
             failures++;
         }
-        if (survives_cut(25.0, why, sizeof(why)))
+        /* What modem.c watches to retrain for a far end gone deaf: it
+         * counts up through the silence, and back to nothing after. */
+        if (most < 5 || most > 11 || after != 0)
+        {
+            printf("FAIL unanswered polls: %d at most in ten seconds' silence, %d after\n", most, after);
+            failures++;
+        }
+        most = 0;
+        if (survives_cut(25.0, why, sizeof(why), &most, &after))
         {
             printf("FAIL a link waited out twenty-five seconds without answers\n");
             failures++;

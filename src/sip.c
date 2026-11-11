@@ -1552,6 +1552,10 @@ bool dm_sip_link_quality(dm_link_quality_t *q)
     q->jb_max_delay_ms = stat.jbuf.max_delay;
     q->jb_empty = stat.jbuf.empty;
     q->jb_discard = stat.jbuf.discard;
+    q->far_reports = stat.rtcp.tx.update_cnt;
+    q->far_lost = stat.rtcp.tx.loss;
+    q->far_jitter_us = (unsigned) stat.rtcp.tx.jitter.last;
+    q->net_rtt_us = (unsigned) stat.rtcp.rtt.last;
     return true;
 }
 
