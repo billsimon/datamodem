@@ -289,8 +289,13 @@ void dm_rate_memory_text(double hold_s, char *out, size_t out_len)
         snprintf(out, out_len, "staying below it for %.0f minutes", hold_s / 60.0);
 }
 
-/* Five quiet minutes and --max-retrains counts afresh. */
-#define RETRAIN_QUIET_MS (5 * 60 * 1000)
+/* Two quiet minutes and --max-retrains counts afresh. What it is for is a
+ * link that never settles - the V.22bis pair that disagree about the rate
+ * retrain every few seconds - and a link that has carried data for two
+ * minutes since its last retrain is working. Five used to be the figure, and
+ * a V.32 bis call that retrained cleanly every three or four minutes through
+ * its line's dropouts was one retrain from being hung up. */
+#define RETRAIN_QUIET_MS (2 * 60 * 1000)
 
 unsigned dm_retrain_count_update(dm_retrain_count_t *c, unsigned retrains, int rx_rate, int tx_rate,
                                  bool in_data, int64_t now_ms)

@@ -88,6 +88,19 @@ case_ "V.32 bis: a step up that does not hold" v32bis \
     "+14400 did not hold - the far end asked for less" \
     "-; retraining \\("
 
+# A fifth of a second of silence from the far end - a dropout on its line,
+# which arrives as audio rather than lost packets - is ridden out with no
+# retrain, as V.34 always has. It used to wreck the equaliser.
+case_ "V.32 bis: a short dropout" v32bis \
+    DATAMODEM_SELFTEST_LINE=ulaw,delay=100,cut=20/200 DATAMODEM_SELFTEST_BYTES=60000 -- \
+    "-; retraining \\(" \
+    "-poor"
+
+case_ "V.34: a short dropout" v34 \
+    DATAMODEM_SELFTEST_LINE=ulaw,delay=100,cut=20/200 DATAMODEM_SELFTEST_BYTES=60000 -- \
+    "-; retraining \\(" \
+    "-poor"
+
 # V.34 over bad patches: renegotiation (11.6), not a retrain.
 case_ "V.34: bad patches, a renegotiation will do" v34 \
     DATAMODEM_SELFTEST_LINE=ulaw,delay=100,fade=4/30/-45 DATAMODEM_SELFTEST_BYTES=400000 -- \

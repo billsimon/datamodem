@@ -147,10 +147,25 @@ int main(void)
             printf("FAIL retrain count: %u strikes after two retrains in one look\n", c.strikes);
             failures++;
         }
-        /* Five quiet minutes, and it starts again. */
-        if (dm_retrain_count_update(&c, 7, 33600, 24000, true, 80 * s + 301 * s) != 1)
+        /* Two quiet minutes, and it starts again. */
+        if (dm_retrain_count_update(&c, 7, 33600, 24000, true, 80 * s + 121 * s) != 1)
         {
-            printf("FAIL retrain count: %u strikes after five quiet minutes\n", c.strikes);
+            printf("FAIL retrain count: %u strikes after two quiet minutes\n", c.strikes);
+            failures++;
+        }
+    }
+    {
+        dm_retrain_count_t c = { 0 };
+        const int64_t m = 60 * 1000;
+
+        /* The V.32 bis call that prompted two minutes: clean retrains at
+         * 9600 every three or four minutes count for nothing. */
+        dm_retrain_count_update(&c, 0, 9600, 0, true, 0);
+        for (unsigned k = 1; k <= 8; k++)
+            dm_retrain_count_update(&c, k, 9600, 0, true, (int64_t) k * 3 * m + 30 * 1000);
+        if (c.strikes > 1)
+        {
+            printf("FAIL retrain count: %u strikes for retrains three minutes apart\n", c.strikes);
             failures++;
         }
     }

@@ -398,6 +398,7 @@ typedef struct
     int pre_run;
     int pre_count;
     int pre_tail;
+    float norm_ref;           /* in data, the equaliser's input power as it usually is; 0 until known */
 } rx_t;
 
 typedef struct
@@ -1762,6 +1763,7 @@ static void rx_enter_data(dm_v32_t *v, coding_t coding)
     r->prev_y = Y_OF_QUAD[r->prev_q];
     vit_reset(&r->vit);
     r->vit_mse = r->mse;
+    r->norm_ref = 0.0f;
     r->pre_run = 0;
     r->pre_prev = 0.0f;
     set_loops(r, 0.01f, 0.03f, 0.0005f, 0.01f);
@@ -1925,6 +1927,26 @@ static void symbol_out(dm_v32_t *v)
     }
     u = vout * (cosf(r->theta) - I * sinf(r->theta));
     idx = r->osym++;
+
+    /* A dropout on the far end's line arrives as audio, not as lost packets,
+     * so dm_v32_rx_fillin() never hears of it - and as the far end goes
+     * quiet, and again as it comes back, the equaliser's window holds next
+     * to nothing: its update, normalised by that, is enormous, the taps
+     * are wrecked in a few symbols, and the SNR goes below zero and stays
+     * there until a retrain. A hundred milliseconds was enough to cost a
+     * six-second retrain, where V.34 (which holds its own adaptation the
+     * same way) rode it out. So in data, a window 6 dB down on what it
+     * usually holds stops all adaptation, as a lost packet does, until it
+     * has filled with signal again. */
+    if (r->mode == RX_DATA || r->mode == RX_RN_PRE)
+    {
+        if (r->norm_ref <= 0.0f)
+            r->norm_ref = norm;
+        else if (norm < 0.25f * r->norm_ref)
+            v->freeze_until = v->n + 2 * MF_HALF + EQ_LEN * 2;
+        else if (v->n >= v->freeze_until)
+            r->norm_ref += 0.002f * (norm - r->norm_ref);
+    }
 
     switch (r->mode)
     {

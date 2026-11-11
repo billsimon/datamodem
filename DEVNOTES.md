@@ -329,6 +329,30 @@ with the echo 3 dB down and a 250 ms path, with the far modem's clock 1000
 ppm off ours (ten times what V.32 permits), and through a dispersive
 channel; 20-60 ms of lost audio costs the bits in it and no retrain.
 
+**Dropouts that arrive as audio.** That last was lost *packets*, which
+`dm_v32_rx_fillin()` hears of and freezes adaptation across. A dropout on the
+far end's own line arrives as perfectly good RTP with next to nothing in it,
+and nothing froze for that. As the far end goes quiet, and again as it comes
+back, the equaliser's window holds almost no signal, and its update -
+normalised by what the window holds - is enormous: the taps are wrecked in a
+few symbols and the SNR goes below zero and stays there until a retrain. A
+production V.32bis call showed exactly that signature, every few minutes, at
+every rate:
+
+```
+info  [v32] reception has been poor (-9.6 dB SNR) for 2.0 seconds; retraining (tag=in)
+```
+
+An SNR below zero is not noise - the error is bigger than the signal - and
+in the selftest a hundred milliseconds of silence (`cut=20/100`) was enough
+to do it and cost a six-second retrain, where V.34, which holds its own
+adaptation while the far end is quiet, rode out 200 ms without one. Now a
+window 6 dB down on what it usually holds in data stops all adaptation
+(equaliser, phase, timing, echo canceller) until it has filled with signal
+again, and V.32 rides out 100, 200 and 350 ms with no retrain; the 400 ms
+that counts as the carrier gone still retrains. `scripts/retrain-test.sh`
+checks it.
+
 **Against other manufacturers' modems.** Everything above is datamodem
 against datamodem, which has exactly the weakness the V.42 sections below
 describe: two copies of the same code agree with each other even where they
@@ -575,7 +599,7 @@ error [session] the link retrained 4 times at 31200 bps and will not hold (40.1 
 
 Now our transmitter steps below a rate the far end gives up on, and
 `--max-retrains` counts only retrains that did not come back slower in
-either direction, afresh after five quiet minutes. `DATAMODEM_V34_PLAIN_RECOVERY`
+either direction, afresh after two quiet minutes. `DATAMODEM_V34_PLAIN_RECOVERY`
 (under Testing) makes one end of the selftest a far end like that one; the
 other end steps from 33600 to 31200 after its first retrain and holds there,
 where it used to answer nine retrains in the same transfer.

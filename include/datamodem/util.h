@@ -73,8 +73,8 @@ void dm_rate_memory_text(double hold_s, char *out, size_t out_len);
 
 /* The retrains --max-retrains counts. Not every one: a retrain that comes
  * back slower, in either direction, is the rate stepping down to one the
- * line will bear - the cure working - and retrains five minutes apart are a
- * line having the odd bad moment, after which the count starts again. */
+ * line will bear - the cure working - and retrains two minutes apart are a
+ * link that works between them, after which the count starts again. */
 typedef struct
 {
     unsigned seen;            /* the modem's retrain count at the last look */
