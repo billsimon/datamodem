@@ -71,6 +71,30 @@ int dm_rate_memory_limit(const dm_rate_memory_t *m, long long now);
  * dm_rate_memory_failed() returned. */
 void dm_rate_memory_text(double hold_s, char *out, size_t out_len);
 
+/* A retrain from data is about to hold a failure against a rate - the far
+ * end's retrain, against what we send, or ours, against what we receive.
+ * The round trip the retrain measures says whether the rate was to blame: if
+ * it has moved by DM_PATH_MOVED_MS or more, the path changed under the call -
+ * a jitter buffer along it growing or shrinking, which splices audio into
+ * the signal or takes it out - and no rate would have held through that. A
+ * production V.34 call to a MICA retrained three times as its round trip
+ * went 128, 148 and 288 ms, and held a rate against our transmitter each
+ * time. Arm with the memories as they are before the failure goes in (b may
+ * be NULL); judge with the new round trip, which puts them back and returns
+ * true if it moved and the failure had changed them. Round trips in ms, < 0
+ * for not measured. */
+#define DM_PATH_MOVED_MS 15.0
+
+typedef struct
+{
+    bool armed;
+    double rtd_ms;
+    dm_rate_memory_t a, b;
+} dm_path_watch_t;
+
+void dm_path_watch_arm(dm_path_watch_t *w, double rtd_ms, const dm_rate_memory_t *a, const dm_rate_memory_t *b);
+bool dm_path_watch_judge(dm_path_watch_t *w, double rtd_ms, dm_rate_memory_t *a, dm_rate_memory_t *b);
+
 /* The retrains --max-retrains counts. Not every one: a retrain that comes
  * back slower, in either direction, is the rate stepping down to one the
  * line will bear - the cure working - and retrains two minutes apart are a

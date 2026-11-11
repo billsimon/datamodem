@@ -119,6 +119,61 @@ int main(void)
         }
     }
 
+    /* a retrain's failure, put back if the round trip moved across it */
+    {
+        const long long min = 60LL * 8000;
+        dm_rate_memory_t rx = { 0 }, tx = { 0 };
+        dm_path_watch_t w = { 0 };
+
+        /* 128 to 148 ms, as a MICA's path did: the failure goes. */
+        dm_path_watch_arm(&w, 128.0, &rx, &tx);
+        dm_rate_memory_failed(&tx, 31200, 0, min);
+        if (!dm_path_watch_judge(&w, 148.0, &rx, &tx) || dm_rate_memory_limit(&tx, min) != 0 || tx.count != 0)
+        {
+            printf("FAIL path watch: a 20 ms move left %d held\n", dm_rate_memory_limit(&tx, min));
+            failures++;
+        }
+        /* Measured again within a few ms: the failure stands. */
+        dm_path_watch_arm(&w, 148.0, &rx, &tx);
+        dm_rate_memory_failed(&tx, 31200, 0, min);
+        if (dm_path_watch_judge(&w, 152.0, &rx, &tx) || dm_rate_memory_limit(&tx, min) != 31200)
+        {
+            printf("FAIL path watch: a 4 ms move put the failure back\n");
+            failures++;
+        }
+        /* Judged once only, and not without a measurement each side. */
+        if (dm_path_watch_judge(&w, 300.0, &rx, &tx) || dm_rate_memory_limit(&tx, min) != 31200)
+        {
+            printf("FAIL path watch: judged a second time\n");
+            failures++;
+        }
+        dm_path_watch_arm(&w, -1.0, &rx, &tx);
+        dm_rate_memory_failed(&rx, 28800, 0, min);
+        if (dm_path_watch_judge(&w, 300.0, &rx, &tx) || dm_rate_memory_limit(&rx, min) != 28800)
+        {
+            printf("FAIL path watch: judged with no round trip before\n");
+            failures++;
+        }
+        /* One memory, as V.32 bis has; and a move with nothing to put back. */
+        {
+            dm_rate_memory_t m = { 0 };
+
+            dm_path_watch_arm(&w, 200.0, &m, NULL);
+            if (dm_path_watch_judge(&w, 240.0, &m, NULL))
+            {
+                printf("FAIL path watch: said it put back a failure there was none of\n");
+                failures++;
+            }
+            dm_path_watch_arm(&w, 200.0, &m, NULL);
+            dm_rate_memory_failed(&m, 14400, 0, min);
+            if (!dm_path_watch_judge(&w, 180.0, &m, NULL) || dm_rate_memory_limit(&m, min) != 0)
+            {
+                printf("FAIL path watch: a round trip 20 ms shorter left the failure held\n");
+                failures++;
+            }
+        }
+    }
+
     /* retrain counting for --max-retrains */
     {
         dm_retrain_count_t c = { 0 };

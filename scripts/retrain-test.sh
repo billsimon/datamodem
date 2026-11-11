@@ -175,6 +175,36 @@ case_ "V.34: a far end that retrains at the same rate" v34 \
     "+trained: 31200 bit/s out" \
     "<3:answering a retrain"
 
+# A caller whose tone detector needs 100 ms of tone A before it will see the
+# reversal, retraining over bad patches. Answering, we reverse A once it has
+# been on 50 ms; when no reversal of B comes back, 11.2.2.2.2 has us keep A
+# on and reverse it again, not go silent and start over - which gave a MICA
+# 50 ms of A six times running, and it hung up.
+case_ "V.34: a caller slow to hear tone A" v34 \
+    DATAMODEM_V34_SLOW_TONE=call:100 DATAMODEM_V34_PLAIN_RECOVERY=call \
+    DATAMODEM_SELFTEST_LINE=ulaw,delay=100,fade=4/20/-45/call DATAMODEM_SELFTEST_BYTES=400000 -- \
+    "+answering a retrain" \
+    "+not answered our reversal of tone A in 2 seconds; reversing it again" \
+    "-timed out at 'measuring the round trip'"
+
+# A path whose delay grows by 40 ms forty seconds in - a jitter buffer
+# along it taking on two more frames - which splices audio into what the
+# caller hears and sends it into a retrain. The retrain's round trip shows
+# what happened, and the rate is not held against for it.
+case_ "V.34: a far end that retrains as the path slips" v34 \
+    DATAMODEM_V34_PLAIN_RECOVERY=call DATAMODEM_SELFTEST_LINE=ulaw,delay=100,slip=40/40/call \
+    DATAMODEM_SELFTEST_BYTES=400000 -- \
+    "+the round trip went from 200 ms to 240 across that retrain" \
+    "+retrained at 33600 bps \(tag=selftest-answer" \
+    "-trained: 31200 bit/s out"
+
+# V.32 bis rides through a slip of whole frames: 20 ms is a whole number of
+# its symbols and of its carrier's cycles.
+case_ "V.32 bis: a path that slips" v32bis \
+    DATAMODEM_SELFTEST_LINE=ulaw,delay=100,slip=40/40/call DATAMODEM_SELFTEST_BYTES=200000 -- \
+    "-; retraining \\(" \
+    "-poor"
+
 echo
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

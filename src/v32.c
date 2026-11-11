@@ -492,6 +492,7 @@ struct dm_v32
     long long up_next;        /* no asking for a higher rate before then */
     double up_backoff;        /* seconds, doubled each time asking for more got nothing */
     dm_rate_memory_t failed;  /* the rates that have failed on this call: see rate_failed() */
+    dm_path_watch_t path;     /* whether the retrain under way is the path's doing */
     long long rate_since;     /* line time the coding in use started */
     int trained_coding;       /* what the last start-up or retrain settled on */
     long long probe_from;     /* after a step up, reception has to bear it from then */
@@ -2339,6 +2340,23 @@ static void rate_failed(dm_v32_t *v, coding_t c, bool lower_held, const char *ho
     DM_INFO("v32", "%d did not hold - %s; %s (tag=%s)", CODING[c].rate, how, hold, v->tag);
 }
 
+/* A retrain from data, about to hold a failure against a rate, and the
+ * round trip it then measures: see dm_path_watch_t. */
+static void path_arm(dm_v32_t *v)
+{
+    dm_path_watch_arm(&v->path, (v->rtd >= 0.0) ? v->rtd / 8.0 : -1.0, &v->failed, NULL);
+}
+
+static void path_judge(dm_v32_t *v)
+{
+    double before = v->path.rtd_ms;
+
+    if (dm_path_watch_judge(&v->path, v->rtd / 8.0, &v->failed, NULL))
+        DM_INFO("v32", "the round trip went from %.0f ms to %.0f across that retrain: the path changed under the "
+                       "call, which no rate would have held through, so not holding it against the rate (tag=%s)",
+                before, v->rtd / 8.0, v->tag);
+}
+
 /* The next coding down from c that both ends can run, or -1. */
 static int next_down(const dm_v32_t *v, coding_t c)
 {
@@ -2354,6 +2372,7 @@ static int next_down(const dm_v32_t *v, coding_t c)
 static void go_data(dm_v32_t *v)
 {
     stage_enter(v, STG_DATA, 0.0);
+    v->path.armed = false;
     v->tx.data_on = true;
     v->rx.data_on = true;
     v->low_since = v->poor_since = 0;
@@ -2791,8 +2810,11 @@ static void control(dm_v32_t *v, long long n)
             (v->stage == STG_C_TRAIN2 || v->stage == STG_C_WAIT_E || v->stage == STG_C_B1 || in_data))
         {
             if (v->stage == STG_DATA || v->stage == STG_RN_RESP)
+            {
+                path_arm(v);
                 rate_failed(v, v->coding, v->poor_since == 0 || n - v->poor_since < SECONDS(0.3),
                             "the far end retrained");
+            }
             if (in_data)
                 emit(v, DM_V32_RETRAINING);
             restart(v, "the answering modem is sending AC", false);
@@ -2803,8 +2825,11 @@ static void control(dm_v32_t *v, long long n)
              v->stage == STG_A_B1 || in_data))
         {
             if (v->stage == STG_DATA || v->stage == STG_RN_RESP)
+            {
+                path_arm(v);
                 rate_failed(v, v->coding, v->poor_since == 0 || n - v->poor_since < SECONDS(0.3),
                             "the far end retrained");
+            }
             if (in_data)
                 emit(v, DM_V32_RETRAINING);
             restart(v, "the calling modem is sending AA", false);
@@ -2864,6 +2889,10 @@ static void control(dm_v32_t *v, long long n)
             v->rtd = v->nt - 64.0 * SPS;
             if (v->rtd < 0.0)
                 v->rtd = 0.0;
+            /* Not from S: that only says roughly where the reversal was. */
+            if (v->s_run >= S_RUN)
+                v->path.armed = false;
+            path_judge(v);
             tx_set(v, SEG_SILENCE, -1);
             v->want_train = true;
             v->train_gate = n;
@@ -2915,6 +2944,7 @@ static void control(dm_v32_t *v, long long n)
             v->rtd = v->nt - 64.0 * SPS;
             if (v->rtd < 0.0)
                 v->rtd = 0.0;
+            path_judge(v);
             /* Back to AC after an A, which in CA means an even boundary. */
             if ((k - v->ca_start) & 1)
                 k += (boundary_time(k + 1) - target < target - boundary_time(k - 1)) ? 1 : -1;
@@ -3117,9 +3147,14 @@ static void control(dm_v32_t *v, long long n)
                              (double) (n - v->poor_since) / 8000.0);
                     int down = next_down(v, v->coding);
 
+                    path_arm(v);
                     rate_failed(v, v->coding, down >= 0 && snr >= CODING[down].poor_db, "our reception gave out");
                     if (step && rn_start(v, want, why))
+                    {
+                        /* No retrain, so no round trip to judge by. */
+                        v->path.armed = false;
                         break;
+                    }
                     emit(v, DM_V32_RETRAINING);
                     restart(v, why, false);
                     return;

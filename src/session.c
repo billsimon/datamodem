@@ -292,21 +292,32 @@ static void term_reply(void *user, const void *data, size_t len)
         dm_modem_send(s->modem, data, len);
 }
 
-/* Our clock against the far end's, in parts per million, from the packets
- * each has sent since the connect: we send one per 20 ms of ours, it one per
- * 20 ms of its own. Positive is ours running fast. False until a minute of
- * them, when one packet either way is still 330 ppm; res is that, for the
- * log line. */
-static bool clock_ppm(const dm_session_t *s, const dm_link_quality_t *q, int64_t now, double *ppm, double *res)
+/* How many more packets the far end has sent us since the connect than we
+ * have sent it: we send one per 20 ms of our clock, it one per 20 ms of its
+ * own. A count that grows through a call is the clocks drifting apart; one
+ * that jumps and then stays put is something on the path adding or taking
+ * out audio. A production call had one of those - 80 ms, at the moment the
+ * far end retrained - which this, given in ppm, made look like drift that
+ * faded as the call went on. One either way is just where the two ends'
+ * ticks fall. False before the connect. */
+static bool packet_skew(const dm_session_t *s, const dm_link_quality_t *q, long *skew)
 {
     long rx = (long) (q->rx_packets + q->rx_lost) - (long) (s->path_base.rx_packets + s->path_base.rx_lost);
     long tx = (long) q->tx_packets - (long) s->path_base.tx_packets;
 
-    if (s->path_base_ms == 0 || now - s->path_base_ms < 60 * 1000 || rx <= 0)
+    if (s->path_base_ms == 0 || rx <= 0)
         return false;
-    *ppm = (double) (tx - rx) * 1e6 / (double) rx;
-    *res = 1e6 / (double) rx;
+    *skew = rx - tx;
     return true;
+}
+
+static void skew_text(long skew, char *out, size_t len)
+{
+    if (skew == 0)
+        snprintf(out, len, "; the far end has sent as many packets as we have since the connect");
+    else
+        snprintf(out, len, "; the far end has sent %ld packet%s %s than we have since the connect (%ld ms of audio)",
+                 labs(skew), labs(skew) == 1 ? "" : "s", skew > 0 ? "more" : "fewer", labs(skew) * 20 /* ms a packet */);
 }
 
 /* A count since the connect, or the count itself if pjsua has started its
@@ -348,14 +359,14 @@ static void far_text(const dm_session_t *s, const dm_link_quality_t *q, char *ou
  *     so, at most every ten seconds, so it can be set beside the modem's own;
  *     and the same each time the far end reports losing some of ours;
  *   - at each retrain, its state and the round trip the retrain measured;
- *   - every five minutes, its state and the two clocks compared;
+ *   - every five minutes, its state and the packets each end has sent;
  *
  * and with each of the last two, what the far end reports of ours. */
 static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64_t now)
 {
     const dm_link_quality_t *q = &s->quality;
-    double ppm, res;
-    char clocks[96] = "";
+    long skew;
+    char clocks[128] = "";
     char far[160];
 
     if (!s->have_quality)
@@ -385,8 +396,8 @@ static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64
         s->far_lost_unsaid += q->far_lost - s->far_lost_seen;
     s->far_lost_seen = q->far_lost;
     far_text(s, q, far, sizeof(far));
-    if (clock_ppm(s, q, now, &ppm, &res))
-        snprintf(clocks, sizeof(clocks), "; our clock %+.0f ppm (+/-%.0f) against the far end's", ppm, res);
+    if (packet_skew(s, q, &skew))
+        skew_text(skew, clocks, sizeof(clocks));
 
     if ((s->jb_empty_unsaid > 0 || s->jb_discard_unsaid > 0) && now - s->jb_said_ms >= DM_JB_SAY_MS)
     {
@@ -1698,24 +1709,24 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
         {
             unsigned bad = q.rx_lost + q.rx_discarded;
             unsigned pct = bad * 100u / (q.rx_packets + bad);
-            double ppm = 0.0, res = 0.0;
-            char ppm_text[16] = "unknown";
+            long skew = 0;
+            char skew_count[24] = "unknown";
 
             /* The jitter buffer from the connect, not from call setup. */
             unsigned jb_empty = since_base(q.jb_empty, s.path_base_ms != 0 ? s.path_base.jb_empty : 0);
             unsigned jb_discard = since_base(q.jb_discard, s.path_base_ms != 0 ? s.path_base.jb_discard : 0);
 
-            if (clock_ppm(&s, &q, dm_now_ms(), &ppm, &res))
-                snprintf(ppm_text, sizeof(ppm_text), "%+.0f", ppm);
+            if (packet_skew(&s, &q, &skew))
+                snprintf(skew_count, sizeof(skew_count), "%+ld", skew);
 
             dm_log_event(DM_LOG_INFO, "session", "audio path",
                          "rx_packets=%u rx_lost=%u rx_discarded=%u rx_reordered=%u tx_packets=%u "
                          "jitter_ms=%.1f jitter_max_ms=%.1f rx_level_dbm0=%.1f jb_avg_delay_ms=%u jb_max_delay_ms=%u "
-                         "jb_empty=%u jb_discard=%u clock_ppm=%s far_reports=%u far_lost=%u far_jitter_ms=%.1f "
+                         "jb_empty=%u jb_discard=%u far_extra_packets=%s far_reports=%u far_lost=%u far_jitter_ms=%.1f "
                          "net_rtt_ms=%u",
                          q.rx_packets, q.rx_lost, q.rx_discarded, q.rx_reordered, q.tx_packets,
                          q.jitter_us / 1000.0, q.jitter_max_us / 1000.0, (double) st.rx_power, q.jb_avg_delay_ms,
-                         q.jb_max_delay_ms, jb_empty, jb_discard, ppm_text, q.far_reports,
+                         q.jb_max_delay_ms, jb_empty, jb_discard, skew_count, q.far_reports,
                          since_base(q.far_lost, s.path_base_ms != 0 ? s.path_base.far_lost : 0),
                          q.far_jitter_us / 1000.0, q.net_rtt_us / 1000);
 

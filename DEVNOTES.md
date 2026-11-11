@@ -617,6 +617,33 @@ either direction, afresh after two quiet minutes. `DATAMODEM_V34_PLAIN_RECOVERY`
 other end steps from 33600 to 31200 after its first retrain and holds there,
 where it used to answer nine retrains in the same transfer.
 
+Not every far-end retrain is the rate's fault. A call from the MICA through
+a VoIP path retrained three times in four minutes as the round trip each
+Phase 2 measured went 128, 148 and 288 ms - a jitter buffer somewhere past
+Telnyx taking on frames, each one splicing audio into the signal, which no
+rate survives (at 3429 baud and 1959 Hz, 20 ms is not a whole number of
+symbols or carrier cycles; V.32 bis, at 2400 and 1800, rides through). Each
+retrain held a rate against our transmitter all the same. A retrain from
+data now remembers the rate memory as it was before the failure went in,
+and when Phase 2 measures the round trip, puts it back if that has moved by
+15 ms or more (`dm_path_watch_t`, used by V.32 bis too):
+
+```
+info  [v34] the round trip went from 200 ms to 240 across that retrain: the path changed under the call, which no rate would have held through, so not holding it against the rate (tag=selftest-answer)
+```
+
+That call's third retrain is the one that lost it: six times over, two
+seconds apart, we reversed tone A and the caller never reversed B in reply.
+Each time we went silent for 70 ms and started over with tone A, which gave
+the caller 50 ms of A before each reversal - the least 11.2.1.2.3 allows,
+and maybe less than its tone detector needed to be listening for one.
+11.2.2.2.2 says otherwise: no reversal of B in 2 s, keep A on and reverse it
+again. We do that now, five times before starting over
+(`the caller has not answered our reversal of tone A in 2 seconds; reversing
+it again`). The caller's side of it, 11.2.2.1.3, was already near enough:
+silence, then tone B and a wait for A's reversal, which an answerer doing
+11.2.2.2.2 will be sending.
+
 Our receiver asks for the 16-state trellis code, no precoding and no
 non-linear encoder - which is what keeps it to a linear equaliser - but the
 transmitter does everything the far end's MP can ask for: all three trellis
@@ -1254,9 +1281,9 @@ about one frame's worth of drift between retrains - and nothing in the log
 said what the buffer was doing. The session now does:
 
 ```
-info  [session] the jitter buffer had nothing for 1 frame (20 ms) and threw away 0 - the modem was handed a gap (its delay 150 ms on average, 140 to 160); our clock +138 ppm (+/-11) against the far end's
-info  [session] audio path at retrain 3: jitter buffer delay 150 ms on average (140 to 160), empty for 2 frames and 0 thrown away since the connect; round trip 287 ms; our clock ...
-info  [session] audio path: jitter buffer delay 160 ms on average (160 to 160), empty for 0 frames and 0 thrown away since the connect, 0 packets lost; our clock +0 ppm (+/-67) against the far end's
+info  [session] the jitter buffer had nothing for 1 frame (20 ms) and threw away 0 - the modem was handed a gap (its delay 150 ms on average, 140 to 160); the far end has sent 4 packets fewer than we have since the connect (80 ms of audio)
+info  [session] audio path at retrain 3: jitter buffer delay 150 ms on average (140 to 160), empty for 2 frames and 0 thrown away since the connect; round trip 287 ms; the far end has sent ...
+info  [session] audio path: jitter buffer delay 160 ms on average (160 to 160), empty for 0 frames and 0 thrown away since the connect, 0 packets lost; the far end has sent as many packets as we have since the connect
 ```
 
 (The last is a real one, from a loopback call; the first two show the form.)
@@ -1267,10 +1294,14 @@ info  [session] audio path: jitter buffer delay 160 ms on average (160 to 160), 
   on a path whose delay is not changing should not change either;
 - every five minutes, and in the end-of-call `audio path` summary
   (`jb_avg_delay_ms`, `jb_max_delay_ms`, `jb_empty`, `jb_discard`,
-  `clock_ppm`), the buffer and the two clocks compared - from the packets each end has sent since the
-  connect, which no jitter buffer can disguise. It needs a minute of packets
-  before it says anything, and is good to the `+/-` it gives: one packet in
-  the time so far, 67 ppm after five minutes and 11 after half an hour.
+  `far_extra_packets`), the buffer and how many more packets the far end has
+  sent than we have since the connect, which no jitter buffer can disguise.
+  A count that grows through the call is the two clocks drifting apart; one
+  that jumps and stays is the path adding or taking out audio; one either way
+  is only where the two ends' ticks fall. It used to be given as our clock in
+  ppm, which made a jump look like drift fading as the call went on: a MICA
+  call's `-454 (+/-114)` at three minutes and `-300` at four and a half were
+  the same 4 packets, 80 ms, arriving at the moment the caller retrained.
 
 pjmedia's own idea of how full the buffer is (`size`) is not its delay - on
 loopback, with 150 ms in each direction's buffer and a 300 ms round trip, it
@@ -1284,7 +1315,7 @@ direction we send in is the one we cannot measure, and the one a far end
 goes deaf in.
 
 The next long call on that BBS answered the question: `clock_ppm=+13`, to
-within 13, over twenty-five minutes. The clocks agree. Its jitter buffer did
+within 13 - a packet or so - over twenty-five minutes. The clocks agree. Its jitter buffer did
 run dry once, for six frames, at a moment two packets were lost - which a
 V.32bis call before the dropout fix would have retrained over, and this one
 rode out. The round trip's creep is more likely jitter buffers refilling
@@ -1487,7 +1518,12 @@ cannot hold and the other's can. `DATAMODEM_V34_PLAIN_RECOVERY=call` makes
 that end retrain whenever its reception is poor and remember no rate that
 failed, as many far ends do; `DATAMODEM_NO_RETRAIN=call` makes it never do
 anything about its own reception at all - a far end that loses us and does
-not notice, which only the other end's V.42 can see. `scripts/retrain-test.sh` runs the cases these
+not notice, which only the other end's V.42 can see. `slip=40/40/call` makes
+what the caller hears 40 ms later from forty seconds in, repeating the 40 ms
+before - a jitter buffer on the path taking on two frames - and
+`DATAMODEM_V34_SLOW_TONE=call:100` makes the caller miss a reversal of tone A
+that comes less than 100 ms after the tone, as a slow tone detector might.
+`scripts/retrain-test.sh` runs the cases these
 were made for - a step down where one will do, no rate held against a
 dropout, a step up that does not hold, a far end that keeps retraining - and
 checks what the log says happened, not just that the data arrived:

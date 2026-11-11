@@ -245,6 +245,7 @@ struct dm_v34
     bool req_shaping;
     bool plain_recovery;      /* test hook: see dm_v34_params_t */
     bool no_retrain;          /* test hook: likewise */
+    int slow_tone_ms;         /* test hook: likewise */
     bool lapm;
     float nominal_dbm0;
     int (*get_bit)(void *user);
@@ -365,6 +366,7 @@ struct dm_v34
     bool have_mp, far_ack, far_e;
     long long rtd;            /* samples; -1 until measured */
     long long rev_sent;       /* line time of our reversal */
+    unsigned rev_tries;       /* answering: reversals of tone A the caller has not answered */
     double rev_cand;          /* a reversal not yet known to be followed by L1, -1 if none */
     int sr_tx, sr_rx;
     bool high_tx, high_rx;
@@ -386,6 +388,7 @@ struct dm_v34
     unsigned failures;
     /* The rates that have failed on this call, each way: see rate_failed(). */
     dm_rate_memory_t rx_failed, tx_failed;
+    dm_path_watch_t path;     /* whether the retrain under way is the path's doing */
     long long rx_since, tx_since; /* line time each direction's rate started */
     int trained_rx, trained_tx;   /* what the last start-up or retrain settled on */
     int rn_prev_tx, rn_prev_rx;   /* the rates as a renegotiation started */
@@ -494,6 +497,17 @@ static void rate_failed(dm_v34_t *v, bool rx, int rate, long long since, bool lo
     dm_rate_memory_text(dm_rate_memory_failed(rx ? &v->rx_failed : &v->tx_failed, rate, since, v->n), hold,
                         sizeof(hold));
     DM_INFO("v34", "%d bit/s %s did not hold - %s; %s (tag=%s)", rate, rx ? "in" : "out", how, hold, v->tag);
+}
+
+/* Phase 2 has measured the round trip again: see dm_path_watch_t. */
+static void path_judge(dm_v34_t *v)
+{
+    double before = v->path.rtd_ms;
+
+    if (dm_path_watch_judge(&v->path, v->rtd / 8.0, &v->rx_failed, &v->tx_failed))
+        DM_INFO("v34", "the round trip went from %.0f ms to %.0f across that retrain: the path changed under the "
+                       "call, which no rate would have held through, so not holding it against the rate (tag=%s)",
+                before, v->rtd / 8.0, v->tag);
 }
 
 /* ------------------------------------------------------------------ V.8 */
@@ -2219,6 +2233,7 @@ static void go_data(dm_v34_t *v)
     stage_enter(v, ST_DATA, 0.0);
     v->poor_since = v->low_since = 0;
     v->failures = 0;
+    v->path.armed = false;
     if (v->renegotiating)
     {
         int lim = rate_ceiling(&v->tx_failed, v->n);
@@ -2699,6 +2714,7 @@ static void begin_phase2(dm_v34_t *v)
     v->have_info0 = false;
     v->ack_info0 = false;
     v->info0_count = 0;
+    v->rev_tries = 0;
     send_info0(v);
     stage_enter(v, v->calling ? ST_C2_INFO0 : ST_A2_INFO0, 10.0);
     DM_DEBUG("v34", "Phase 2: INFO0%c (tag=%s)", v->calling ? 'c' : 'a', v->tag);
@@ -2840,6 +2856,22 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             v->info0_count = 1;
             send_info0(v);
         }
+        /* Test hook: a tone detector that needs this long of tone A before
+         * it looks for the reversal. The reversal itself can dip the tone
+         * out, as v34_p2rx allows for. */
+        if (reversed && v->slow_tone_ms > 0)
+        {
+            long long since = (r->tone_since >= 0 && r->tone_since < (long long) rev - 240) ? r->tone_since
+                              : (r->prev_until >= (long long) rev - 160)                    ? r->prev_since
+                                                                                             : -1;
+
+            if (since < 0 || rev - (double) since < MS(v->slow_tone_ms))
+            {
+                DM_INFO("v34", "test hook: missing a reversal of tone A that came too soon after the tone (tag=%s)",
+                        v->tag);
+                reversed = false;
+            }
+        }
         if (reversed && v->have_info0 && v34_p2tx_pending(&v->p2tx) == 0)
         {
             /* 11.2.1.1.3: our reversal 40 ms after theirs. */
@@ -2886,6 +2918,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             if (v->rtd < 0)
                 v->rtd = 0;
             DM_DEBUG("v34", "round trip %.1f ms; receiving L1 and L2 (tag=%s)", v->rtd / 8.0, v->tag);
+            path_judge(v);
             v34_probe_init(&v->probe);
             v->probing = true;
             /* L1 after 10 ms more of A; L2 160 ms after that. */
@@ -2963,6 +2996,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             if (v->rtd < 0)
                 v->rtd = 0;
             DM_DEBUG("v34", "round trip %.1f ms; L1 and L2 (tag=%s)", v->rtd / 8.0, v->tag);
+            path_judge(v);
             p2_reverse(v, (long long) rev + MS(40), 10, true);
             stage_enter(v, ST_A2_L, 0.05 + 0.16 + 0.6 + rt + 0.5);
         }
@@ -3092,11 +3126,17 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
 
                         snprintf(why, sizeof(why), "reception has been poor (%.1f dB SNR) for %.1f seconds", snr,
                                  (double) (n - v->poor_since) / 8000.0);
+                        dm_path_watch_arm(&v->path, (v->rtd >= 0) ? v->rtd / 8.0 : -1.0, &v->rx_failed,
+                                          &v->tx_failed);
                         rate_failed(v, true, v->rate_rx, v->rx_since,
                                     down >= lowest_rate(v->sr_rx) && snr >= rate_needs_db(down, v->sr_rx) - 4.0f,
                                     "our reception gave out");
                         if (resync && rn_begin(v, rate_ceiling(&v->rx_failed, n), why))
+                        {
+                            /* No Phase 2, so no round trip to judge by. */
+                            v->path.armed = false;
                             return;
+                        }
                         restart_phase2(v, true, why);
                         return;
                     }
@@ -3182,8 +3222,11 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
              * data to start the retrain - its silence and the 60 ms of tone
              * read as poor reception too - it was not the line. */
             if (v->stage == ST_DATA && !v->renegotiating)
+            {
+                dm_path_watch_arm(&v->path, (v->rtd >= 0) ? v->rtd / 8.0 : -1.0, &v->rx_failed, &v->tx_failed);
                 rate_failed(v, false, v->rate_tx, v->tx_since, v->poor_since == 0 || n - v->poor_since < MS(300),
                             "the far end retrained");
+            }
             restart_phase2(v, false, v->calling ? "the answerer is sending tone A" : "the caller is sending tone B");
             return;
         }
@@ -3227,8 +3270,25 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             p2_carrier(v, true);
             v->info0_count = 1;
             v->ack_info0 = true;
+            v->rev_tries = 0;
             stage_enter(v, v->calling ? ST_C2_INFO0 : ST_A2_INFO0, 6.0 + 2.0 * rt);
             return;
+        case ST_A2_REV1:
+            /* 11.2.2.2.2: no reversal of tone B within 2 s. Tone A is still
+             * on; reverse it again once tone B is heard (11.2.1.2.3), rather
+             * than start over. Starting over gives the caller 50 ms of tone A
+             * after each 70 ms of silence before the reversal comes, and on
+             * a production call a MICA answered none of six attempts at that,
+             * then hung up. */
+            if (++v->rev_tries <= 5)
+            {
+                DM_INFO("v34", "the caller has not answered our reversal of tone A in 2 seconds; reversing it again "
+                               "(tag=%s)",
+                        v->tag);
+                stage_enter(v, ST_A2_INFO0, 6.0 + 2.0 * rt);
+                return;
+            }
+            break;
         default:
             break;
         }
@@ -3461,6 +3521,7 @@ dm_v34_t *dm_v34_create(const dm_v34_params_t *p)
     v->req_shaping = p->shaping;
     v->plain_recovery = p->plain_recovery;
     v->no_retrain = p->no_retrain;
+    v->slow_tone_ms = p->slow_tone_ms;
     v->lapm = p->lapm;
     v->nominal_dbm0 = p->tx_power;
     v->get_bit = p->get_bit;

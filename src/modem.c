@@ -2772,6 +2772,17 @@ static bool create_pump(dm_modem_t *m, bool listen_first)
             DM_WARN("modem", "DATAMODEM_V34_PLAIN_RECOVERY: this end retrains whenever reception is poor, and "
                              "remembers no rate that failed. This is a test hook.");
         }
+        /* Test hook: "call:ms" makes the caller miss a reversal of tone A
+         * that comes less than ms after the tone itself, as a tone detector
+         * might that is slow to settle. */
+        if (getenv("DATAMODEM_V34_SLOW_TONE") != NULL && m->calling &&
+            strncmp(getenv("DATAMODEM_V34_SLOW_TONE"), "call:", 5) == 0)
+        {
+            vp.slow_tone_ms = atoi(getenv("DATAMODEM_V34_SLOW_TONE") + 5);
+            DM_WARN("modem", "DATAMODEM_V34_SLOW_TONE: this end misses a reversal of tone A less than %d ms after "
+                             "the tone. This is a test hook.",
+                    vp.slow_tone_ms);
+        }
         if (getenv("DATAMODEM_V34_PRE_EMPHASIS") != NULL)
         {
             vp.pre_emphasis = atoi(getenv("DATAMODEM_V34_PRE_EMPHASIS"));
@@ -4258,7 +4269,10 @@ int64_t dm_modem_since_rx_ms(dm_modem_t *m)
  * fade=4/30/-30 raises the noise to -30 dBm0 for 4 seconds in every 30, from
  * 15 seconds in - a line whose trouble comes and goes, the kind training
  * cannot see - and fade=4/30/-30/call does it only to what the caller
- * hears ("answer" the answerer). A test hook, not an option - it is how
+ * hears ("answer" the answerer); slip=40/40/call makes what the caller hears
+ * 40 ms later from 40 seconds in, repeating the 40 ms before - a jitter
+ * buffer on the path growing by two frames, which splices audio into the
+ * signal - and "answer" does it to the answerer. A test hook, not an option - it is how
  * V.32's echo canceller and round-trip measurement get tested without a
  * phone line. */
 #define SELFTEST_LINE_MAX (SELFTEST_CHUNK * 128) /* 2.5 s of each direction */
@@ -4281,6 +4295,9 @@ typedef struct
     long fade_len;            /* samples */
     long fade_every;          /* samples */
     int fade_ends;            /* bit 0: the caller hears it, bit 1: the answerer */
+    long slip_at;             /* the path's delay grows from here, 0 = never */
+    int slip_len;             /* samples */
+    int slip_ends;            /* bit 0: the caller hears it, bit 1: the answerer */
     int16_t hist[2][SELFTEST_LINE_MAX];
     long pos;
 } selftest_line_t;
@@ -4365,6 +4382,22 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
             ln->fade_ends = (who[0] == '\0') ? 3 : (strcmp(who, "call") == 0) ? 1 : 2;
             ln->fade = awgn_init_dbm0(NULL, 2468013, (float) db);
         }
+        else if (strncmp(tok, "slip=", 5) == 0)
+        {
+            double at = 0.0, ms = 0.0;
+            char who[16] = "";
+
+            if (sscanf(tok + 5, "%lf/%lf/%15s", &at, &ms, who) != 3 || at <= 0.0 || ms <= 0.0 || ms > 500.0 ||
+                (strcmp(who, "call") != 0 && strcmp(who, "answer") != 0))
+            {
+                DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: slip= wants seconds/ms/call or /answer, as in "
+                                     "slip=40/40/call");
+                return false;
+            }
+            ln->slip_at = (long) (at * DM_SAMPLE_RATE);
+            ln->slip_len = (int) (ms * DM_SAMPLE_RATE / 1000.0);
+            ln->slip_ends = (strcmp(who, "call") == 0) ? 1 : 2;
+        }
         else if (strncmp(tok, "burst=", 6) == 0)
         {
             double ms = 0.0;
@@ -4381,7 +4414,7 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
         }
         else
         {
-            DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise=, burst=, fade=, cut=, drift= or ulaw",
+            DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise=, burst=, fade=, cut=, slip=, drift= or ulaw",
                      tok);
             return false;
         }
@@ -4400,6 +4433,11 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
         ln->echo_gain = powf(10.0f, (float) echo_db / 20.0f);
     if (noise_db < 0.0)
         ln->noise = awgn_init_dbm0(NULL, 1234567, (float) noise_db);
+    if (ln->delay + ln->slip_len + 256 >= SELFTEST_LINE_MAX - SELFTEST_CHUNK)
+    {
+        DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: too much delay to slip as well");
+        return false;
+    }
     if (ln->drift != 0.0 && ln->delay + 256 >= SELFTEST_LINE_MAX - SELFTEST_CHUNK)
     {
         DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: too much delay to drift as well");
@@ -4416,6 +4454,10 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
                  ln->fade_ends == 1   ? " as the caller hears it"
                  : ln->fade_ends == 2 ? " as the answerer hears it"
                                       : "");
+    if (ln->slip_len > 0)
+        snprintf(desc + strlen(desc), desc_len - strlen(desc), ", %.0f ms more delay %.0f s in as the %s hears it",
+                 ln->slip_len * 1000.0 / DM_SAMPLE_RATE, (double) ln->slip_at / DM_SAMPLE_RATE,
+                 ln->slip_ends == 1 ? "caller" : "answerer");
     return true;
 }
 
@@ -4453,7 +4495,8 @@ static void selftest_line_run(selftest_line_t *ln, dm_modem_t *caller, dm_modem_
         ln->hist[1][t % SELFTEST_LINE_MAX] = out[1][i];
         for (int e = 0; e < 2; e++)
         {
-            float x = (t >= ln->delay) ? ln->hist[1 - e][(t - ln->delay) % SELFTEST_LINE_MAX] : 0.0f;
+            int d = ln->delay + ((ln->slip_ends & (1 << e)) && t >= ln->slip_at ? ln->slip_len : 0);
+            float x = (t >= d) ? ln->hist[1 - e][(t - d) % SELFTEST_LINE_MAX] : 0.0f;
 
             /* What the caller hears from an answerer whose clock runs fast or
              * slow: read the answerer's samples at a drifting instant, by
@@ -4461,7 +4504,7 @@ static void selftest_line_run(selftest_line_t *ln, dm_modem_t *caller, dm_modem_
              * a few minutes' drift either way stays in the history. */
             if (ln->drift != 0.0 && e == 0)
             {
-                double at = (double) t - ln->delay - 128.0 + (double) t * ln->drift * 1e-6;
+                double at = (double) t - d - 128.0 + (double) t * ln->drift * 1e-6;
                 long i0 = (long) floor(at);
                 double fr = at - (double) i0;
                 double acc = 0.0;

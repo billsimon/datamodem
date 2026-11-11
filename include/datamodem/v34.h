@@ -70,6 +70,8 @@ typedef struct
                                * as a far end that loses us and does not notice */
     bool plain_recovery;      /* test hook: retrain whenever reception is poor, and remember no
                                * rate that failed - as a far end might */
+    int slow_tone_ms;         /* test hook: calling, miss a reversal of tone A that comes less
+                               * than this long after the tone does */
     const char *tag;          /* for logs */
 
     /* Called on whichever thread drives dm_v34_tx / dm_v34_rx. get_bit is

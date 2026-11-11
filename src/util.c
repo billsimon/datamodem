@@ -289,6 +289,39 @@ void dm_rate_memory_text(double hold_s, char *out, size_t out_len)
         snprintf(out, out_len, "staying below it for %.0f minutes", hold_s / 60.0);
 }
 
+void dm_path_watch_arm(dm_path_watch_t *w, double rtd_ms, const dm_rate_memory_t *a, const dm_rate_memory_t *b)
+{
+    w->armed = rtd_ms >= 0.0;
+    w->rtd_ms = rtd_ms;
+    w->a = *a;
+    if (b != NULL)
+        w->b = *b;
+}
+
+static bool memory_same(const dm_rate_memory_t *x, const dm_rate_memory_t *y)
+{
+    return x->failed == y->failed && x->until == y->until && x->count == y->count;
+}
+
+bool dm_path_watch_judge(dm_path_watch_t *w, double rtd_ms, dm_rate_memory_t *a, dm_rate_memory_t *b)
+{
+    double moved = rtd_ms - w->rtd_ms;
+    bool changed;
+
+    if (!w->armed)
+        return false;
+    w->armed = false;
+    if (moved < 0.0)
+        moved = -moved;
+    if (rtd_ms < 0.0 || moved < DM_PATH_MOVED_MS)
+        return false;
+    changed = !memory_same(a, &w->a) || (b != NULL && !memory_same(b, &w->b));
+    *a = w->a;
+    if (b != NULL)
+        *b = w->b;
+    return changed;
+}
+
 /* Two quiet minutes and --max-retrains counts afresh. What it is for is a
  * link that never settles - the V.22bis pair that disagree about the rate
  * retrain every few seconds - and a link that has carried data for two
