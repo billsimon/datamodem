@@ -233,6 +233,15 @@ typedef struct
     float pwr_q;             /* T/2 sample power over the last few, to see a silence start at once */
 } qrx_t;
 
+/* The far end's TRN that the rate is chosen from: symbols 100 to 700 of it,
+ * clear of the S-bar to TRN turn. Phase 4 chooses after 600, a
+ * renegotiation after 700 - long enough that a burst of noise of 60 ms
+ * covers less than half of it, and dm_robust_mean() can leave it out. */
+#define TRN_FROM 100
+#define TRN_TO 700
+#define TRN_BLOCK 25
+#define TRN_BLOCKS ((TRN_TO - TRN_FROM) / TRN_BLOCK)
+
 struct dm_v34
 {
     bool calling;
@@ -345,6 +354,9 @@ struct dm_v34
     long long far_trn;        /* symbols of it */
     double trn_err;           /* squared error over a block of it, for the rate */
     int trn_err_n;
+    double trn_blk[TRN_BLOCKS]; /* and in 25-symbol pieces, to leave a burst of noise out */
+    int trn_blk_n;
+    double trn_blk_acc;
     v34_dec_t dec;
     v34_enc_t b1ref;
     v34_cf_t b1u[256];
@@ -389,6 +401,7 @@ struct dm_v34
     /* The rates that have failed on this call, each way: see rate_failed(). */
     dm_rate_memory_t rx_failed, tx_failed;
     dm_path_watch_t path;     /* whether the retrain under way is the path's doing */
+    dm_loss_watch_t loss;     /* whether the far end's last retrain was a lost packet's doing */
     long long rx_since, tx_since; /* line time each direction's rate started */
     int trained_rx, trained_tx;   /* what the last start-up or retrain settled on */
     int rn_prev_tx, rn_prev_rx;   /* the rates as a renegotiation started */
@@ -416,6 +429,14 @@ static void stage_enter(dm_v34_t *v, stage_t st, double timeout_s)
     v->stage = st;
     v->t_stage = v->n;
     v->deadline = (timeout_s > 0.0) ? v->n + (long long) (timeout_s * 8000.0) : 0;
+}
+
+static void trn_reset(dm_v34_t *v)
+{
+    v->trn_err = 0.0;
+    v->trn_err_n = 0;
+    v->trn_blk_n = 0;
+    v->trn_blk_acc = 0.0;
 }
 
 static double rtd_s(const dm_v34_t *v)
@@ -733,6 +754,7 @@ static void info_bits_reset(dm_v34_t *v, int expect)
 static void p2_start_rx(dm_v34_t *v)
 {
     v34_p2rx_init(&v->p2rx, v->calling);
+    v->p2rx.floor = 4.0f * v->pmin;
     info_bits_reset(v, V34_INFO0_BITS);
 }
 
@@ -1751,12 +1773,19 @@ static void rx_symbol(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf_t u)
         {
             /* The block the rate is chosen from: clear of the S-bar to TRN
              * turn, and before MP. */
-            if (v->far_trn >= 100 && v->far_trn < 600)
+            if (v->far_trn >= TRN_FROM && v->far_trn < TRN_TO)
             {
                 v34_cf_t e = u - pt4(quad);
+                double e2 = crealf(e) * crealf(e) + cimagf(e) * cimagf(e);
 
-                v->trn_err += crealf(e) * crealf(e) + cimagf(e) * cimagf(e);
+                v->trn_err += e2;
                 v->trn_err_n++;
+                v->trn_blk_acc += e2;
+                if ((v->far_trn - TRN_FROM) % TRN_BLOCK == TRN_BLOCK - 1 && v->trn_blk_n < TRN_BLOCKS)
+                {
+                    v->trn_blk[v->trn_blk_n++] = v->trn_blk_acc / TRN_BLOCK;
+                    v->trn_blk_acc = 0.0;
+                }
             }
             v->far_trn++;
         }
@@ -2139,7 +2168,9 @@ static void choose_rx_rate(dm_v34_t *v)
         cap = v->rn_want;
     if (lim > 0 && lim < cap)
         cap = lim;
-    if (v->trn_err_n > 100)
+    if (v->trn_blk_n >= 4)
+        v->snr_db = snr_from_mse((float) dm_robust_mean(v->trn_blk, v->trn_blk_n));
+    else if (v->trn_err_n > 100)
         v->snr_db = snr_from_mse((float) (v->trn_err / v->trn_err_n));
     v->want_rx = best_rate_for(v->snr_db, v->sr_rx, cap);
     if (v->want_rx == 0)
@@ -2163,8 +2194,7 @@ static void p4_heard_sbar(dm_v34_t *v)
         v->q.ones_a = 0;
         v->far_trn_on = true;
         v->far_trn = 0;
-        v->trn_err = 0.0;
-        v->trn_err_n = 0;
+        trn_reset(v);
         stage_enter(v, ST_P4_TRN, 2.5 + 2.0 * rtd_s(v) + 2.0);
     }
     else if (v->renegotiating && (v->stage == ST_DATA || v->stage == ST_RN))
@@ -2174,8 +2204,7 @@ static void p4_heard_sbar(dm_v34_t *v)
         rx_dd_reset(&v->q);
         v->far_trn_on = true;
         v->far_trn = 0;
-        v->trn_err = 0.0;
-        v->trn_err_n = 0;
+        trn_reset(v);
         v->have_mp = v->far_ack = v->far_e = false;
         if (v->stage == ST_DATA)
         {
@@ -2195,8 +2224,7 @@ static void p4_heard_jprime(dm_v34_t *v)
     DM_DEBUG("v34", "J' heard; the caller's TRN follows (tag=%s)", v->tag);
     v->far_trn_on = true;
     v->far_trn = 0;
-    v->trn_err = 0.0;
-    v->trn_err_n = 0;
+    trn_reset(v);
 }
 
 static void heard_e(dm_v34_t *v)
@@ -2440,6 +2468,7 @@ static void enter_phase3(dm_v34_t *v)
             V34_SR_NAME[v->sr_tx], v34_carrier(v->sr_tx, v->high_tx), v->pe_tx, V34_SR_NAME[v->sr_rx],
             v34_carrier(v->sr_rx, v->high_rx), v->rtd / 8.0, v->tag);
     v34_p2rx_init(&v->tonerx, v->calling);
+    v->tonerx.floor = 4.0f * v->pmin;
     qrx_start(v, v->sr_rx, v->high_rx);
     v->q.far_md = v->md_far > 0;
     v->far_trn_on = false;
@@ -2586,7 +2615,13 @@ static bool rn_begin(dm_v34_t *v, int rx_rate, const char *why)
     v->tx_data = false;
     v->tx16 = false;
     v->have_mp = v->far_ack = v->far_e = false;
+    /* The far end's TRN is still to come. far_trn left over from the last
+     * renegotiation passed the test below before any of it had arrived,
+     * and the rate was chosen from that one's TRN: a call renegotiated
+     * over a bad patch asked for the bad patch's rate ever after. */
     v->far_trn_on = false;
+    v->far_trn = 0;
+    trn_reset(v);
     tx_set(v, TS_S, 128);
     tx_then(v, TS_SBAR, 16);
     tx_then(v, TS_TRN, -1);
@@ -3050,7 +3085,8 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         }
         break;
     case ST_RN:
-        if (v->seg == TS_TRN && v->trn_symbols >= 512 && v->q.mode == RQ_DD && v->far_trn >= 400)
+        if (v->seg == TS_TRN && v->trn_symbols >= 512 && v->q.mode == RQ_DD && v->far_trn_on &&
+            v->far_trn >= TRN_TO)
         {
             choose_rx_rate(v);
             start_mp(v);
@@ -3224,8 +3260,14 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             if (v->stage == ST_DATA && !v->renegotiating)
             {
                 dm_path_watch_arm(&v->path, (v->rtd >= 0) ? v->rtd / 8.0 : -1.0, &v->rx_failed, &v->tx_failed);
+                dm_loss_watch_arm(&v->loss, n, &v->tx_failed);
                 rate_failed(v, false, v->rate_tx, v->tx_since, v->poor_since == 0 || n - v->poor_since < MS(300),
                             "the far end retrained");
+                if (dm_loss_watch_check(&v->loss, n, &v->tx_failed))
+                    DM_INFO("v34", "the far end has just reported losing some of our packets, which is what it "
+                                   "retrained over and no rate would have held through; not holding it against the "
+                                   "rate (tag=%s)",
+                            v->tag);
             }
             restart_phase2(v, false, v->calling ? "the answerer is sending tone A" : "the caller is sending tone B");
             return;
@@ -3609,6 +3651,25 @@ int dm_v34_rx_rate(const dm_v34_t *v)
 bool dm_v34_resync(dm_v34_t *v, const char *why)
 {
     return rn_begin(v, v->rate_rx, why);
+}
+
+bool dm_v34_retrain(dm_v34_t *v, const char *why)
+{
+    if (v->stage != ST_DATA)
+        return false;
+    restart_phase2(v, true, why);
+    return true;
+}
+
+void dm_v34_far_loss(dm_v34_t *v)
+{
+    long long ago = v->n - v->loss.retrain_at;
+
+    if (dm_loss_watch_loss(&v->loss, v->n, &v->tx_failed))
+        DM_INFO("v34", "the far end reports losing some of our packets around its retrain %.1f seconds ago, which "
+                       "is what it retrained over and no rate would have held through; not holding it against the "
+                       "rate (tag=%s)",
+                ago / 8000.0, v->tag);
 }
 
 bool dm_v34_renegotiate(dm_v34_t *v, int rx_rate)

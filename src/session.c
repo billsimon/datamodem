@@ -393,7 +393,12 @@ static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64
     s->jb_empty_seen = q->jb_empty;
     s->jb_discard_seen = q->jb_discard;
     if (q->far_lost > s->far_lost_seen)
+    {
         s->far_lost_unsaid += q->far_lost - s->far_lost_seen;
+        /* A far end that retrains over a gap in what it heard has not
+         * shown the rate to be too high. */
+        dm_modem_far_loss(s->modem);
+    }
     s->far_lost_seen = q->far_lost;
     far_text(s, q, far, sizeof(far));
     if (packet_skew(s, q, &skew))

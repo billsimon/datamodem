@@ -174,6 +174,81 @@ int main(void)
         }
     }
 
+    /* a far-end retrain's failure, put back if it lost our packets around it */
+    {
+        const long long sec = 8000, min = 60 * sec;
+        dm_loss_watch_t w = { 0 };
+        dm_rate_memory_t m = { 0 };
+
+        /* The report after the retrain, as the MICA's came: 2.4 s. */
+        dm_loss_watch_arm(&w, 100 * sec, &m);
+        dm_rate_memory_failed(&m, 31200, 0, 100 * sec);
+        if (dm_loss_watch_check(&w, 100 * sec, &m) || !dm_loss_watch_loss(&w, 102 * sec + sec / 2, &m) ||
+            dm_rate_memory_limit(&m, 103 * sec) != 0)
+        {
+            printf("FAIL loss watch: a loss 2.5 s after the retrain left the failure held\n");
+            failures++;
+        }
+        /* Before it: 2 s. */
+        dm_loss_watch_loss(&w, 198 * sec, &m);
+        dm_loss_watch_arm(&w, 200 * sec, &m);
+        dm_rate_memory_failed(&m, 31200, 0, 200 * sec);
+        if (!dm_loss_watch_check(&w, 200 * sec, &m) || dm_rate_memory_limit(&m, 200 * sec) != 0)
+        {
+            printf("FAIL loss watch: a loss 2 s before the retrain left the failure held\n");
+            failures++;
+        }
+        /* Too far either side: the failure stands. */
+        dm_loss_watch_loss(&w, 290 * sec, &m);
+        dm_loss_watch_arm(&w, 300 * sec, &m);
+        dm_rate_memory_failed(&m, 28800, 0, 300 * sec);
+        if (dm_loss_watch_check(&w, 300 * sec, &m) || dm_loss_watch_loss(&w, 309 * sec, &m) ||
+            dm_rate_memory_limit(&m, 309 * sec) != 28800)
+        {
+            printf("FAIL loss watch: a loss ten seconds off put the failure back\n");
+            failures++;
+        }
+        /* And only once for each retrain. */
+        if (dm_loss_watch_loss(&w, 310 * sec, &m) || dm_rate_memory_limit(&m, min * 6) != 28800)
+        {
+            printf("FAIL loss watch: one retrain forgiven twice\n");
+            failures++;
+        }
+    }
+
+    /* a training signal's error, leaving a burst of noise out */
+    {
+        double steady[8] = { 1.0, 1.2, 0.9, 1.1, 1.0, 0.8, 1.3, 1.0 };
+        double burst[8] = { 1.0, 1.2, 500.0, 800.0, 1.0, 0.8, 1.3, 1.0 };
+        double bad[8] = { 500.0, 600.0, 500.0, 800.0, 400.0, 700.0, 1.0, 500.0 };
+        double m;
+
+        m = dm_robust_mean(steady, 8);
+        if (m < 1.03 || m > 1.04)
+        {
+            printf("FAIL robust mean: a steady line came to %.3f, not its mean\n", m);
+            failures++;
+        }
+        m = dm_robust_mean(burst, 8);
+        if (m < 1.04 || m > 1.06)
+        {
+            printf("FAIL robust mean: a burst was not left out (%.3f)\n", m);
+            failures++;
+        }
+        /* A line bad throughout is bad, whatever one block says. */
+        m = dm_robust_mean(bad, 8);
+        if (m < 400.0)
+        {
+            printf("FAIL robust mean: a bad line came to %.3f\n", m);
+            failures++;
+        }
+        if (dm_robust_mean(steady, 0) != 0.0)
+        {
+            printf("FAIL robust mean: no blocks\n");
+            failures++;
+        }
+    }
+
     /* retrain counting for --max-retrains */
     {
         dm_retrain_count_t c = { 0 };

@@ -8,7 +8,7 @@
 #
 #   scripts/retrain-test.sh [path/to/datamodem]
 #
-# Takes about twenty seconds.
+# Takes about half a minute.
 set -uo pipefail
 
 BIN=${1:-build/datamodem}
@@ -145,6 +145,7 @@ case_ "V.32 bis: a far end that loses us silently" v32bis \
     DATAMODEM_SELFTEST_BYTES=400000 -- \
     "+has not answered 5 polls in a row, though we hear it fine" \
     "+the answering modem is sending AC; retraining" \
+    "+the far end is answering again" \
     "-link was lost"
 
 # V.34 renegotiates for it (11.6) rather than retraining: its TRN goes both
@@ -154,6 +155,26 @@ case_ "V.34: a far end that loses us silently" v34 \
     DATAMODEM_SELFTEST_BYTES=400000 -- \
     "+has not answered 5 polls in a row, though we hear it fine" \
     "+training its receiver again; asking the far end to change rate" \
+    "+the far end is answering again, [0-9.]+ seconds after we renegotiated" \
+    "-link was lost"
+
+# A far end that a first try does not bring back: its V.42 hears nothing
+# for eighteen seconds, though its modem hears us fine. A V.34 call from
+# abroad renegotiated for one like it and closed the link half a minute
+# later, with nothing to say whether the far end had heard us again. We
+# try once more, retraining, and say when it answers.
+case_ "V.34: a far end that stays lost" v34 \
+    DATAMODEM_V42_DEAF=call:20/18 DATAMODEM_SELFTEST_LINE=ulaw,delay=100 DATAMODEM_SELFTEST_BYTES=300000 -- \
+    "+has not answered 5 polls in a row" \
+    "+has still not answered" \
+    "+the far end is answering again, [0-9.]+ seconds after we retrained" \
+    "-link was lost"
+
+case_ "V.32 bis: a far end that stays lost" v32bis \
+    DATAMODEM_V42_DEAF=call:20/18 DATAMODEM_SELFTEST_LINE=ulaw,delay=100 DATAMODEM_SELFTEST_BYTES=300000 -- \
+    "+has not answered 5 polls in a row" \
+    "+has still not answered" \
+    "+the far end is answering again, [0-9.]+ seconds after we retrained" \
     "-link was lost"
 
 # Polls lost to a line that is disturbed every two seconds are the line's
@@ -197,6 +218,23 @@ case_ "V.34: a far end that retrains as the path slips" v34 \
     "+the round trip went from 200 ms to 240 across that retrain" \
     "+retrained at 33600 bps \(tag=selftest-answer" \
     "-trained: 31200 bit/s out"
+
+# A far end that retrains over a packet of ours it lost, as the MICA did
+# twice, each loss in its RTCP reports within 2.5 seconds of a retrain: the
+# gap is what failed, not the rate. The report can come before the retrain
+# is heard or after; the retrain at the next bad patch, with no loss
+# reported, still counts.
+case_ "V.34: a far end that loses a packet, report after" v34 \
+    DATAMODEM_V34_PLAIN_RECOVERY=call DATAMODEM_SELFTEST_LINE=ulaw,delay=100,fade=4/20/-45/call,lose=21/call \
+    DATAMODEM_SELFTEST_BYTES=400000 -- \
+    "+reports losing some of our packets around its retrain [0-9.]+ seconds ago" \
+    "+33600 bit/s out did not hold"
+
+case_ "V.34: a far end that loses a packet, report before" v34 \
+    DATAMODEM_V34_PLAIN_RECOVERY=call DATAMODEM_SELFTEST_LINE=ulaw,delay=100,fade=4/20/-45/call,lose=18/call \
+    DATAMODEM_SELFTEST_BYTES=400000 -- \
+    "+has just reported losing some of our packets" \
+    "+33600 bit/s out did not hold"
 
 # V.32 bis rides through a slip of whole frames: 20 ms is a whole number of
 # its symbols and of its carrier's cycles.

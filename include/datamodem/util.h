@@ -95,6 +95,42 @@ typedef struct
 void dm_path_watch_arm(dm_path_watch_t *w, double rtd_ms, const dm_rate_memory_t *a, const dm_rate_memory_t *b);
 bool dm_path_watch_judge(dm_path_watch_t *w, double rtd_ms, dm_rate_memory_t *a, dm_rate_memory_t *b);
 
+/* A far-end retrain from data that held a failure against what we send it,
+ * and the far end's RTCP reports of losing our packets: a loss reported
+ * around the retrain means a gap in what it heard is what sent it there,
+ * which no rate would have held through. A MICA call lost two of our
+ * packets and retrained twice, each loss reported within 2.5 seconds of a
+ * retrain, and held 31200 and then 28800 against our transmitter for it.
+ * The two come in either order - the reports are five seconds or so apart -
+ * so a loss reported up to DM_LOSS_BEFORE_S before the retrain counts, or
+ * up to DM_LOSS_AFTER_S after. Arm with the memory as it is before the
+ * failure goes in, then check; and report each loss. Either puts the
+ * memory back and returns true if the failure had changed it. Times are
+ * line time, in samples at 8000 a second. */
+/* The mean of n blocks' squared errors, leaving out those more than 6 dB
+ * worse than the median - a burst of noise in a short training signal,
+ * which says nothing of the rate the line will carry between bursts. A
+ * line with a 60 ms burst every two seconds had it land in renegotiation
+ * after renegotiation, and was walked from 33600 down to 2400 by them. On
+ * a line steadily that bad no block is left out. n at most 64; 0 if n is
+ * 0. */
+double dm_robust_mean(const double *blocks, int n);
+
+#define DM_LOSS_BEFORE_S 3
+#define DM_LOSS_AFTER_S 8
+
+typedef struct
+{
+    bool armed;
+    long long retrain_at;
+    long long loss_at;        /* the last loss reported, 0 if none */
+    dm_rate_memory_t m;
+} dm_loss_watch_t;
+
+void dm_loss_watch_arm(dm_loss_watch_t *w, long long now, const dm_rate_memory_t *m);
+bool dm_loss_watch_check(dm_loss_watch_t *w, long long now, dm_rate_memory_t *m);
+bool dm_loss_watch_loss(dm_loss_watch_t *w, long long now, dm_rate_memory_t *m);
+
 /* The retrains --max-retrains counts. Not every one: a retrain that comes
  * back slower, in either direction, is the rate stepping down to one the
  * line will bear - the cure working - and retrains two minutes apart are a

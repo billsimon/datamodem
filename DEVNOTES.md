@@ -644,6 +644,46 @@ it again`). The caller's side of it, 11.2.2.1.3, was already near enough:
 silence, then tone B and a wait for A's reversal, which an answerer doing
 11.2.2.2.2 will be sending.
 
+Testing that recovery turned up two more. Phase 2's tone detector judged a
+tone by how much of the band's power was steady, with no floor on the power
+itself: in an answerer's retrain, the caller's 70 ms of silence before tone
+B - the tail of its data signal dying away in it - read as tone B, then as
+B's reversal, and the round trip came out at nothing, so the probing window
+was in the wrong place and the retrain failed. Below 4 x `pmin` (-42 dBm0)
+there is now no tone and no reversal.
+
+And a renegotiation we started chose our receive rate from the previous
+renegotiation's TRN: `rn_begin()` cleared `far_trn_on` but not the count of
+the far end's TRN symbols, which still passed "400 of them" before any had
+arrived. A call that renegotiated over a bad patch asked for the bad
+patch's rate at every renegotiation after, and the deaf far end of
+`DATAMODEM_NO_RETRAIN` sat at 16800 with 37 dB of SNR. With that fixed,
+every renegotiation really measures, and on a line with a burst of noise
+every two seconds the bursts landed in the TRN and walked the call down to
+2400. So the rate is chosen from TRN in 25-symbol blocks, leaving out any
+more than 6 dB worse than the median (`dm_robust_mean()`), and a
+renegotiation waits for 600 symbols of the far end's TRN rather than 300,
+so that a 60 ms burst covers less than half of it. Over six burst lines the
+transfers now take less time on four, the same on one, and longer on one;
+on one of them the old code lost the call.
+
+A far end that retrains over a packet of ours it lost - the MICA did, twice,
+each loss in its RTCP reports within 2.5 seconds of a retrain - has not
+shown the rate too high either. The session passes each new reported loss
+to the modem (`dm_modem_far_loss()`), and a far-end retrain up to 3 seconds
+after one, or 8 before, is not held against the rate (`dm_loss_watch_t`,
+V.34 and V.32bis):
+
+```
+info  [v34] the far end reports losing some of our packets around its retrain 0.3 seconds ago, which is what it retrained over and no rate would have held through; not holding it against the rate (tag=selftest-answer)
+```
+
+Not yet done: V.34 changes symbol rate only by retraining, so a retrain
+whose probing meets a fade settles at 2400 symbols/s and stays there until
+the next retrain, however good the line is after. On the selftest's line
+with a deep three-second fade every forty, every retrain now completes
+inside the fade and the call runs at 21600 throughout.
+
 Our receiver asks for the 16-state trellis code, no precoding and no
 non-linear encoder - which is what keeps it to a linear equaliser - but the
 transmitter does everything the far end's MP can ask for: all three trellis
@@ -1244,6 +1284,15 @@ bursts kept breaking, and the call was lost where renegotiations alone had
 carried it. V.32bis and V.34 retrain when their own reception is poor
 anyway; this is only for the far end's.
 
+A V.34 call from abroad stopped answering after losing two of our packets,
+renegotiated with us when we asked, and closed the link half a minute
+later - and nothing said whether it had heard us again in between. Now the
+modem says when the far end answers again (`the far end is answering
+again, 7.2 seconds after we retrained`), and if five more polls go
+unanswered after the first try, with the same eight quiet seconds, it tries
+once more: a retrain, all of Phase 2, for V.34 (`dm_v34_retrain()`), and
+another retrain for V.32bis. After that the polls left run out as before.
+
 ### Knowing when it is safe to hang up
 
 Handing a byte to the link layer is not the same as putting it on the line,
@@ -1523,6 +1572,11 @@ what the caller hears 40 ms later from forty seconds in, repeating the 40 ms
 before - a jitter buffer on the path taking on two frames - and
 `DATAMODEM_V34_SLOW_TONE=call:100` makes the caller miss a reversal of tone A
 that comes less than 100 ms after the tone, as a slow tone detector might.
+`lose=22/call` loses the 20 ms packet the caller would hear 22 seconds in
+and tells the answerer two seconds later, as an RTCP report would; and
+`DATAMODEM_V42_DEAF=call:20/18` makes the caller's V.42 hear nothing for 18
+seconds from 20 seconds after the connect, though its modem hears us fine -
+a far end the first try does not bring back.
 `scripts/retrain-test.sh` runs the cases these
 were made for - a step down where one will do, no rate held against a
 dropout, a step up that does not hold, a far end that keeps retraining - and

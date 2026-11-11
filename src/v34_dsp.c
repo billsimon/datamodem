@@ -455,6 +455,13 @@ bool v34_p2rx_sample(v34_p2rx_t *r, float x, long long n, double *when)
         if (r->tone > 1.5f)
             r->tone = 1.5f;
     }
+    /* How much of the band is a tone says nothing when there is next to
+     * nothing in the band: the far end's 70 ms of silence before a retrain's
+     * tone B, with the tail of its data signal dying away in it, read as
+     * tone B and then as its reversal, and our round trip came out at
+     * nothing (11.5.2.1). */
+    if (r->level < r->floor)
+        r->tone = 0.0f;
     if (r->tone > 0.6f)
     {
         if (r->tone_since < 0)
@@ -472,7 +479,8 @@ bool v34_p2rx_sample(v34_p2rx_t *r, float x, long long n, double *when)
     /* Only in a tone that was steady until the reversal began - which is
      * what keeps L2, whose 2250 and 2550 Hz tones beat inside the window,
      * from looking like one. */
-    if (i >= V34_P2_HIST && n >= r->rev_rearm && r->tone_last > 0 && n - r->tone_last < V34_P2_BOX + 40)
+    if (i >= V34_P2_HIST && n >= r->rev_rearm && r->level >= r->floor && r->tone_last > 0 &&
+        n - r->tone_last < V34_P2_BOX + 40)
     {
         v34_cf_t a = r->rev[i % V34_P2_HIST];
         v34_cf_t b = r->rev[(i - V34_P2_REV) % V34_P2_HIST];

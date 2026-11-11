@@ -116,6 +116,10 @@ bool dm_v32_renegotiate(dm_v32_t *v, int rate);
 /* In data, retrain (5.5) - for a reason the receiver cannot see, such as
  * the far end's having stopped answering. False if not in data. */
 bool dm_v32_retrain(dm_v32_t *v, const char *why);
+
+/* The far end has reported (by RTCP) losing some of what we sent it. If it
+ * retrained just now, the gap is why, not the rate: see dm_loss_watch_t. */
+void dm_v32_far_loss(dm_v32_t *v);
 float dm_v32_rx_power(const dm_v32_t *v);
 void dm_v32_stats(const dm_v32_t *v, dm_v32_stats_t *out);
 

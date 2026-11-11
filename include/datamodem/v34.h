@@ -137,6 +137,14 @@ bool dm_v34_renegotiate(dm_v34_t *v, int rx_rate);
  * False if not in data. */
 bool dm_v34_resync(dm_v34_t *v, const char *why);
 
+/* In data, retrain (11.5): for when a renegotiation has not brought the far
+ * end's receiver back. False if not in data. */
+bool dm_v34_retrain(dm_v34_t *v, const char *why);
+
+/* The far end has reported (by RTCP) losing some of what we sent it. If it
+ * retrained just now, the gap is why, not the rate: see dm_loss_watch_t. */
+void dm_v34_far_loss(dm_v34_t *v);
+
 float dm_v34_rx_power(const dm_v34_t *v);
 void dm_v34_stats(const dm_v34_t *v, dm_v34_stats_t *out);
 

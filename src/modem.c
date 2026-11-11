@@ -297,7 +297,10 @@ struct dm_modem
     int v42bis_max_string;
     bool lapm_up;
     bool lapm_lost;            /* LAPM was up and has closed: the call is ending */
-    bool stall_retrained;      /* retrained for the far end's silence; see check_v42_stall() */
+    int stall_tries;           /* what we have done about the far end's silence; see check_v42_stall() */
+    int stall_polls;           /* the polls unanswered when we last did something */
+    int64_t stall_ms;          /* and when */
+    int64_t deaf_at_ms, deaf_len_ms; /* test hook DATAMODEM_V42_DEAF: V.42 hears nothing, from the connect */
     int64_t disturbed_ms;      /* the last retrain, rate change or carrier drop, 0 if none */
     bool no_retrain;           /* test hook DATAMODEM_NO_RETRAIN: a far end that never notices */
     bool rx_busy;              /* LAPM told the far end to wait: our receive queue is full */
@@ -2100,6 +2103,13 @@ static void rx_put_bit(void *user, int bit)
     }
     if (m->v42 != NULL && !m->v42_fell_back)
     {
+        if (m->deaf_len_ms > 0 && m->connect_ms > 0)
+        {
+            int64_t t = dm_now_ms() - m->connect_ms;
+
+            if (t >= m->deaf_at_ms && t < m->deaf_at_ms + m->deaf_len_ms)
+                bit = 1;
+        }
         v42_rx_bit(m->v42, bit);
         /* In parallel, and only until V.42 is decided: if it turns out the
          * far end never wanted V.42, these are the characters it has been
@@ -2294,9 +2304,13 @@ static const char *v42_failure_reason(const dm_modem_t *m)
  * on hearing AC or AA (7.1 and 7.2/V.32 bis); V.34 by a renegotiation,
  * whose TRN goes both ways (11.6) and which becomes a retrain (11.5) if the
  * far end does not hear it. V.42's timers stop meanwhile (7.10/V.42), so
- * the polls left are still there after, and if they go unanswered too the
- * link is given up as before. Once for each silence: an answer puts it
- * back. */
+ * the polls left are still there after. A V.34 call from abroad lost two of
+ * our packets, stopped answering, renegotiated with us, and closed the link
+ * half a minute later, and nothing said whether it had heard us again in
+ * between: so we say when it does, and if five more polls go unanswered
+ * after the first try, retrain - the whole of Phase 2 for V.34. After that
+ * the link is given up as before if the polls left go unanswered too. An
+ * answer starts it all again. */
 static void check_v42_stall(dm_modem_t *m)
 {
 #if defined(DATAMODEM_VENDORED_V42)
@@ -2305,25 +2319,43 @@ static void check_v42_stall(dm_modem_t *m)
     /* Our reception is fine in the pump's own judgement: one whose reception
      * goes bad retrains by itself, and the carrier is then down. */
     if (m->v42 == NULL || !m->lapm_up || m->carrier_lost || m->carrier_down_ms != 0 ||
-        (m->v32 == NULL && m->v34 == NULL) || m->no_retrain)
+        (m->v32 == NULL && m->v34 == NULL) || m->no_retrain || m->deaf_len_ms > 0)
         return;
     unanswered = dm_v42_unanswered(m->v42);
     if (unanswered == 0)
     {
-        m->stall_retrained = false;
+        if (m->stall_tries > 0)
+            DM_INFO("modem", "the far end is answering again, %.1f seconds after we %s (tag=%s)",
+                    (double) (dm_now_ms() - m->stall_ms) / 1000.0,
+                    (m->stall_tries == 1 && m->v34 != NULL) ? "renegotiated" : "retrained", m->tag);
+        m->stall_tries = 0;
         return;
     }
-    if (unanswered < DM_V42_STALL_POLLS || m->stall_retrained ||
+    if (m->stall_tries >= 2 ||
+        unanswered < (m->stall_tries == 0 ? DM_V42_STALL_POLLS : m->stall_polls + DM_V42_STALL_POLLS) ||
         (m->disturbed_ms != 0 && dm_now_ms() - m->disturbed_ms < DM_V42_STALL_QUIET_MS))
         return;
-    m->stall_retrained = true;
-    DM_WARN("modem", "the far end has not answered %d polls in a row, though we hear it fine - it has most "
-                     "likely lost our signal (tag=%s)",
-            unanswered, m->tag);
-    if (m->v32 != NULL)
-        dm_v32_retrain(m->v32, "retraining to bring its receiver back");
+    m->stall_tries++;
+    m->stall_polls = unanswered;
+    m->stall_ms = dm_now_ms();
+    if (m->stall_tries == 1)
+    {
+        DM_WARN("modem", "the far end has not answered %d polls in a row, though we hear it fine - it has most "
+                         "likely lost our signal (tag=%s)",
+                unanswered, m->tag);
+        if (m->v32 != NULL)
+            dm_v32_retrain(m->v32, "retraining to bring its receiver back");
+        else
+            dm_v34_resync(m->v34, "training its receiver again");
+    }
     else
-        dm_v34_resync(m->v34, "training its receiver again");
+    {
+        DM_WARN("modem", "the far end has still not answered, %d polls in a row (tag=%s)", unanswered, m->tag);
+        if (m->v32 != NULL)
+            dm_v32_retrain(m->v32, "retraining again");
+        else
+            dm_v34_retrain(m->v34, "retraining, since renegotiating did not bring its receiver back");
+    }
 #else
     (void) m;
 #endif
@@ -3406,6 +3438,25 @@ dm_modem_t *dm_modem_create(const dm_modem_params_t *params)
     parse_guard(params->guard_tone, &m->guard);
     m->mod_name = modulation_name(m->mod);
     m->calling = params->calling;
+    /* Test hook: "call:20/15" makes the caller's V.42 hear nothing from 20
+     * seconds after the connect for 15 seconds, though its modem hears us
+     * fine - a far end that a renegotiation does not bring back - so that
+     * what the other end does next gets exercised. */
+    if (getenv("DATAMODEM_V42_DEAF") != NULL)
+    {
+        const char *d = getenv("DATAMODEM_V42_DEAF");
+        double at = 0.0, len = 0.0;
+        const char *who = m->calling ? "call:" : "answer:";
+
+        if (strncmp(d, who, strlen(who)) == 0 && sscanf(d + strlen(who), "%lf/%lf", &at, &len) == 2 && len > 0.0)
+        {
+            m->deaf_at_ms = (int64_t) (at * 1000.0);
+            m->deaf_len_ms = (int64_t) (len * 1000.0);
+            DM_WARN("modem", "DATAMODEM_V42_DEAF: V.42 at this end will hear nothing for %.0f seconds, %.0f "
+                             "seconds after the connect. This is a test hook.",
+                    len, at);
+        }
+    }
     m->data_bits = params->data_bits;
     m->stop_bits = params->stop_bits;
     m->v14 = params->v14;
@@ -4206,6 +4257,16 @@ bool dm_modem_connected(dm_modem_t *m)
     return c;
 }
 
+void dm_modem_far_loss(dm_modem_t *m)
+{
+    pthread_mutex_lock(&m->lock);
+    if (m->v34 != NULL)
+        dm_v34_far_loss(m->v34);
+    else if (m->v32 != NULL)
+        dm_v32_far_loss(m->v32);
+    pthread_mutex_unlock(&m->lock);
+}
+
 dm_modem_phase_t dm_modem_phase(dm_modem_t *m)
 {
     dm_modem_phase_t p;
@@ -4272,7 +4333,10 @@ int64_t dm_modem_since_rx_ms(dm_modem_t *m)
  * hears ("answer" the answerer); slip=40/40/call makes what the caller hears
  * 40 ms later from 40 seconds in, repeating the 40 ms before - a jitter
  * buffer on the path growing by two frames, which splices audio into the
- * signal - and "answer" does it to the answerer. A test hook, not an option - it is how
+ * signal - and "answer" does it to the answerer; lose=22/call loses the
+ * 20 ms packet the caller would hear 22 seconds in, and two seconds later
+ * tells the answerer so, as the caller's RTCP report would. A test hook,
+ * not an option - it is how
  * V.32's echo canceller and round-trip measurement get tested without a
  * phone line. */
 #define SELFTEST_LINE_MAX (SELFTEST_CHUNK * 128) /* 2.5 s of each direction */
@@ -4298,6 +4362,9 @@ typedef struct
     long slip_at;             /* the path's delay grows from here, 0 = never */
     int slip_len;             /* samples */
     int slip_ends;            /* bit 0: the caller hears it, bit 1: the answerer */
+    long lose_at;             /* a packet lost here, 0 = never */
+    int lose_ends;            /* bit 0: the caller would have heard it, bit 1: the answerer */
+    bool lose_told;           /* the sender has had the far end's report of it */
     int16_t hist[2][SELFTEST_LINE_MAX];
     long pos;
 } selftest_line_t;
@@ -4398,6 +4465,22 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
             ln->slip_len = (int) (ms * DM_SAMPLE_RATE / 1000.0);
             ln->slip_ends = (strcmp(who, "call") == 0) ? 1 : 2;
         }
+        else if (strncmp(tok, "lose=", 5) == 0)
+        {
+            double at = 0.0;
+            char who[16] = "";
+
+            if (sscanf(tok + 5, "%lf/%15s", &at, who) != 2 || at <= 0.0 ||
+                (strcmp(who, "call") != 0 && strcmp(who, "answer") != 0))
+            {
+                DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: lose= wants seconds/call or /answer, as in "
+                                     "lose=22/call");
+                return false;
+            }
+            /* On a packet's boundary. */
+            ln->lose_at = (long) (at * DM_SAMPLE_RATE) / SELFTEST_CHUNK * SELFTEST_CHUNK;
+            ln->lose_ends = (strcmp(who, "call") == 0) ? 1 : 2;
+        }
         else if (strncmp(tok, "burst=", 6) == 0)
         {
             double ms = 0.0;
@@ -4414,7 +4497,7 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
         }
         else
         {
-            DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise=, burst=, fade=, cut=, slip=, drift= or ulaw",
+            DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise=, burst=, fade=, cut=, slip=, lose=, drift= or ulaw",
                      tok);
             return false;
         }
@@ -4542,9 +4625,16 @@ static void selftest_line_run(selftest_line_t *ln, dm_modem_t *caller, dm_modem_
             /* The line going dead for a moment, which only a retrain cures. */
             if (ln->cut_at > 0 && t >= ln->cut_at && t < ln->cut_at + ln->cut_len)
                 in[e][i] = 0;
+            if (ln->lose_at > 0 && (ln->lose_ends & (1 << e)) && t >= ln->lose_at && t < ln->lose_at + SELFTEST_CHUNK)
+                in[e][i] = 0;
         }
     }
     ln->pos += SELFTEST_CHUNK;
+    if (ln->lose_at > 0 && !ln->lose_told && ln->pos >= ln->lose_at + 2L * DM_SAMPLE_RATE)
+    {
+        ln->lose_told = true;
+        dm_modem_far_loss(ln->lose_ends == 1 ? answerer : caller);
+    }
     dm_modem_rx(answerer, in[1], SELFTEST_CHUNK);
     dm_modem_rx(caller, in[0], SELFTEST_CHUNK);
 }

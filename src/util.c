@@ -322,6 +322,73 @@ bool dm_path_watch_judge(dm_path_watch_t *w, double rtd_ms, dm_rate_memory_t *a,
     return changed;
 }
 
+double dm_robust_mean(const double *blocks, int n)
+{
+    double sorted[64];
+    double median, sum = 0.0;
+    int used = 0;
+
+    if (n <= 0)
+        return 0.0;
+    if (n > 64)
+        n = 64;
+    for (int i = 0; i < n; i++)
+    {
+        int j = i;
+
+        while (j > 0 && sorted[j - 1] > blocks[i])
+        {
+            sorted[j] = sorted[j - 1];
+            j--;
+        }
+        sorted[j] = blocks[i];
+    }
+    median = (n % 2) ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+    for (int i = 0; i < n; i++)
+        if (blocks[i] <= 4.0 * median)
+        {
+            sum += blocks[i];
+            used++;
+        }
+    return sum / used;
+}
+
+void dm_loss_watch_arm(dm_loss_watch_t *w, long long now, const dm_rate_memory_t *m)
+{
+    w->armed = true;
+    w->retrain_at = now;
+    w->m = *m;
+}
+
+static bool loss_restore(dm_loss_watch_t *w, dm_rate_memory_t *m)
+{
+    bool changed = !memory_same(m, &w->m);
+
+    *m = w->m;
+    w->armed = false;
+    return changed;
+}
+
+bool dm_loss_watch_check(dm_loss_watch_t *w, long long now, dm_rate_memory_t *m)
+{
+    if (!w->armed || w->loss_at <= 0 || now - w->loss_at > DM_LOSS_BEFORE_S * 8000LL)
+        return false;
+    return loss_restore(w, m);
+}
+
+bool dm_loss_watch_loss(dm_loss_watch_t *w, long long now, dm_rate_memory_t *m)
+{
+    w->loss_at = now;
+    if (!w->armed)
+        return false;
+    if (now - w->retrain_at > DM_LOSS_AFTER_S * 8000LL)
+    {
+        w->armed = false;
+        return false;
+    }
+    return loss_restore(w, m);
+}
+
 /* Two quiet minutes and --max-retrains counts afresh. What it is for is a
  * link that never settles - the V.22bis pair that disagree about the rate
  * retrain every few seconds - and a link that has carried data for two

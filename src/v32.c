@@ -493,6 +493,7 @@ struct dm_v32
     double up_backoff;        /* seconds, doubled each time asking for more got nothing */
     dm_rate_memory_t failed;  /* the rates that have failed on this call: see rate_failed() */
     dm_path_watch_t path;     /* whether the retrain under way is the path's doing */
+    dm_loss_watch_t loss;     /* whether the far end's last retrain was a lost packet's doing */
     long long rate_since;     /* line time the coding in use started */
     int trained_coding;       /* what the last start-up or retrain settled on */
     long long probe_from;     /* after a step up, reception has to bear it from then */
@@ -2357,6 +2358,20 @@ static void path_judge(dm_v32_t *v)
                 before, v->rtd / 8.0, v->tag);
 }
 
+/* The far end has started a retrain from data: hold it against the rate,
+ * unless the round trip it measures or a lost packet it reports says it
+ * was not the rate's doing. */
+static void far_retrained(dm_v32_t *v, long long n)
+{
+    path_arm(v);
+    dm_loss_watch_arm(&v->loss, n, &v->failed);
+    rate_failed(v, v->coding, v->poor_since == 0 || n - v->poor_since < SECONDS(0.3), "the far end retrained");
+    if (dm_loss_watch_check(&v->loss, n, &v->failed))
+        DM_INFO("v32", "the far end has just reported losing some of our packets, which is what it retrained over "
+                       "and no rate would have held through; not holding it against the rate (tag=%s)",
+                v->tag);
+}
+
 /* The next coding down from c that both ends can run, or -1. */
 static int next_down(const dm_v32_t *v, coding_t c)
 {
@@ -2810,11 +2825,7 @@ static void control(dm_v32_t *v, long long n)
             (v->stage == STG_C_TRAIN2 || v->stage == STG_C_WAIT_E || v->stage == STG_C_B1 || in_data))
         {
             if (v->stage == STG_DATA || v->stage == STG_RN_RESP)
-            {
-                path_arm(v);
-                rate_failed(v, v->coding, v->poor_since == 0 || n - v->poor_since < SECONDS(0.3),
-                            "the far end retrained");
-            }
+                far_retrained(v, n);
             if (in_data)
                 emit(v, DM_V32_RETRAINING);
             restart(v, "the answering modem is sending AC", false);
@@ -2825,11 +2836,7 @@ static void control(dm_v32_t *v, long long n)
              v->stage == STG_A_B1 || in_data))
         {
             if (v->stage == STG_DATA || v->stage == STG_RN_RESP)
-            {
-                path_arm(v);
-                rate_failed(v, v->coding, v->poor_since == 0 || n - v->poor_since < SECONDS(0.3),
-                            "the far end retrained");
-            }
+                far_retrained(v, n);
             if (in_data)
                 emit(v, DM_V32_RETRAINING);
             restart(v, "the calling modem is sending AA", false);
@@ -3369,6 +3376,17 @@ bool dm_v32_retrain(dm_v32_t *v, const char *why)
     emit(v, DM_V32_RETRAINING);
     restart(v, why, false);
     return true;
+}
+
+void dm_v32_far_loss(dm_v32_t *v)
+{
+    long long ago = v->n - v->loss.retrain_at;
+
+    if (dm_loss_watch_loss(&v->loss, v->n, &v->failed))
+        DM_INFO("v32", "the far end reports losing some of our packets around its retrain %.1f seconds ago, which "
+                       "is what it retrained over and no rate would have held through; not holding it against the "
+                       "rate (tag=%s)",
+                ago / 8000.0, v->tag);
 }
 
 bool dm_v32_renegotiate(dm_v32_t *v, int rate)
