@@ -328,6 +328,30 @@ slot back and `v42_init()` clears any left at its address.
 `dm_v42_xid_slots_in_use()` reports how many are taken, for
 `tests/v42_test.c`.
 
+### 14. A link that was up gave up in five seconds
+
+spandsp's N400 is 5 throughout, so a connected link that hears nothing back
+gives up a little over five T401s after the last answer - less than a bad
+patch on the line and the retrain that cures it. A production call did
+exactly that, and the far end acknowledged the DISC that followed: it was
+still there. V.42 specifies no value (9.2.2), and Appendix III.2 advises "a
+relatively large value (e.g. 16)". `t401_expired()` now allows 16 once the
+link is up (`DM_N400_CONNECTED`); establishment and release keep 5, since
+datamodem repeats establishment itself as `--v42-timeout` allows.
+
+### 15. The reason for hanging up was overwritten by how it went
+
+A link that gave up on its polls set "the far end stopped answering our
+polls" and sent DISC - and when the far end answered the DISC, "our DISC was
+acknowledged" replaced it, so the log said how the link ended and not why.
+If the DISC went unanswered instead, the exhausted retries reported "no
+answer to SABME", because release shares that path with establishment. The
+DISC outcomes are now recorded only when no reason is already, "no answer to
+our DISC" is what an unanswered one says, and the reason is cleared whenever
+a link comes up so that one link's cannot carry over to the next.
+`tests/v42_test.c` cuts a link both ways and checks it rides out ten seconds
+and gives the right reason after twenty-five.
+
 ### The test hook
 
 `dm_v42_refuse_sabme` makes the answering end refuse that many SABMEs with

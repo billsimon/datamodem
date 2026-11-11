@@ -102,7 +102,7 @@ static const opt_def_t OPTS[] = {
     INT_OPT("train-timeout", train_timeout_s, 5, 600,
             "seconds allowed for training (default 45)"),
     INT_OPT("max-retrains", max_retrains, 0, 100,
-            "retrains before hanging up (default 4, 0 = no limit)"),
+            "retrains that find no slower rate that holds, before hanging up (default 4, 0 = no limit)"),
     BOOL_OPT("speaker", speaker,
              "play the line on the sound device until carrier, like a modem's speaker (ATM1) "
              "(default off)"),

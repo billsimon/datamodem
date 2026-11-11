@@ -1,4 +1,5 @@
-/* Unit tests for the small shared pieces in util.c: caller ID parsing. */
+/* Unit tests for the small shared pieces in util.c: caller ID parsing, rate
+ * memory and the retrain count. */
 #include "datamodem/util.h"
 
 #include <stdio.h>
@@ -54,6 +55,114 @@ int main(void)
         if (strcmp(name, "Lon") != 0 || strcmp(user, "123") != 0)
         {
             printf("FAIL truncation: name=[%s] user=[%s]\n", name, user);
+            failures++;
+        }
+    }
+
+    /* rate memory: five minutes, twenty, then eighty, and never for a rate
+     * that ran five minutes before it failed */
+    {
+        dm_rate_memory_t m = { 0 };
+        const long long min = 60LL * 8000;
+        double h;
+
+        if (dm_rate_memory_limit(&m, 0) != 0)
+        {
+            printf("FAIL rate memory: a limit before anything failed\n");
+            failures++;
+        }
+        h = dm_rate_memory_failed(&m, 14400, 9 * min, 10 * min);
+        if (h != 300.0 || dm_rate_memory_limit(&m, 10 * min) != 14400 ||
+            dm_rate_memory_limit(&m, 15 * min - 1) != 14400 || dm_rate_memory_limit(&m, 15 * min) != 0)
+        {
+            printf("FAIL rate memory: first failure held %.0f s\n", h);
+            failures++;
+        }
+        /* A higher rate failing does not lift a lower limit still in force;
+         * a lower one lowers it. */
+        h = dm_rate_memory_failed(&m, 9600, 10 * min, 11 * min);
+        if (h != 1200.0 || dm_rate_memory_limit(&m, 11 * min) != 9600)
+        {
+            printf("FAIL rate memory: second failure held %.0f s\n", h);
+            failures++;
+        }
+        h = dm_rate_memory_failed(&m, 14400, 11 * min, 12 * min);
+        if (h != 4800.0 || dm_rate_memory_limit(&m, 12 * min) != 9600 ||
+            dm_rate_memory_limit(&m, 92 * min - 1) != 9600 || dm_rate_memory_limit(&m, 92 * min) != 0)
+        {
+            printf("FAIL rate memory: third failure held %.0f s, limit %d\n", h,
+                   dm_rate_memory_limit(&m, 12 * min));
+            failures++;
+        }
+        if (dm_rate_memory_failed(&m, 12000, 100 * min, 101 * min) != 4800.0)
+        {
+            printf("FAIL rate memory: the hold grew past eighty minutes\n");
+            failures++;
+        }
+    }
+    {
+        dm_rate_memory_t m = { 0 };
+        char text[96];
+
+        /* Five minutes and more at a rate is a rate that held. */
+        if (dm_rate_memory_failed(&m, 31200, 0, 6LL * 60 * 8000) != 0.0 ||
+            dm_rate_memory_limit(&m, 6LL * 60 * 8000) != 0 || m.count != 0)
+        {
+            printf("FAIL rate memory: a rate that held six minutes was held against\n");
+            failures++;
+        }
+        dm_rate_memory_text(1200.0, text, sizeof(text));
+        if (strcmp(text, "staying below it for 20 minutes") != 0)
+        {
+            printf("FAIL rate memory text: [%s]\n", text);
+            failures++;
+        }
+    }
+
+    /* retrain counting for --max-retrains */
+    {
+        dm_retrain_count_t c = { 0 };
+        const int64_t s = 1000;
+
+        /* V.34, 31200 in and 28800 out; the far end retrains three times
+         * and each time our transmitter comes back slower: none count. */
+        dm_retrain_count_update(&c, 0, 31200, 28800, true, 10 * s);
+        dm_retrain_count_update(&c, 0, 31200, 28800, false, 20 * s);
+        if (dm_retrain_count_update(&c, 1, 31200, 26400, true, 25 * s) != 0 ||
+            dm_retrain_count_update(&c, 2, 31200, 24000, true, 45 * s) != 0)
+        {
+            printf("FAIL retrain count: retrains that came back slower counted\n");
+            failures++;
+        }
+        /* The same rate again counts, and so does a faster one. */
+        if (dm_retrain_count_update(&c, 3, 31200, 24000, true, 60 * s) != 1 ||
+            dm_retrain_count_update(&c, 4, 33600, 24000, true, 70 * s) != 2)
+        {
+            printf("FAIL retrain count: %u strikes for retrains that did not slow down\n", c.strikes);
+            failures++;
+        }
+        /* Two at once, seen in one look. */
+        if (dm_retrain_count_update(&c, 6, 33600, 24000, true, 80 * s) != 4)
+        {
+            printf("FAIL retrain count: %u strikes after two retrains in one look\n", c.strikes);
+            failures++;
+        }
+        /* Five quiet minutes, and it starts again. */
+        if (dm_retrain_count_update(&c, 7, 33600, 24000, true, 80 * s + 301 * s) != 1)
+        {
+            printf("FAIL retrain count: %u strikes after five quiet minutes\n", c.strikes);
+            failures++;
+        }
+    }
+    {
+        dm_retrain_count_t c = { 0 };
+
+        /* V.22bis, one rate both ways: settling lower is the cure. */
+        dm_retrain_count_update(&c, 0, 2400, 0, true, 1000);
+        if (dm_retrain_count_update(&c, 1, 1200, 0, true, 2000) != 0 ||
+            dm_retrain_count_update(&c, 2, 1200, 0, true, 3000) != 1)
+        {
+            printf("FAIL retrain count: V.22bis, %u strikes\n", c.strikes);
             failures++;
         }
     }

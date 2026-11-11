@@ -43,4 +43,50 @@ bool dm_parse_key_spec(const char *s, int *out);
  * and another program's environment. */
 void dm_parse_sip_party(const char *s, char *name, size_t name_len, char *user, size_t user_len);
 
+/* The rates that have failed a modem on this call, so that it does not go
+ * straight back to one: a retrain picks its rate from how well training
+ * went, and training is short and quiet where a bad line's trouble is
+ * neither. A rate that fails within five minutes of starting, and every
+ * rate above it, is avoided for five minutes the first time, twenty the
+ * second and eighty after that. One that ran longer before failing was
+ * not too fast - the line had a bad moment, which any rate would have
+ * met - and is not held against it. Times are line time, in samples at
+ * 8000 a second. */
+typedef struct
+{
+    int failed;               /* stay below this; 0 = no limit */
+    long long until;          /* line time the limit lifts */
+    unsigned count;           /* failures held against a rate so far this call */
+} dm_rate_memory_t;
+
+/* rate, in use since line time since, failed at line time now. Returns how
+ * many seconds it will be avoided for, or 0 if it ran long enough that the
+ * failure is not held against it. */
+double dm_rate_memory_failed(dm_rate_memory_t *m, int rate, long long since, long long now);
+
+/* The rate to stay below at line time now, or 0 for no limit. */
+int dm_rate_memory_limit(const dm_rate_memory_t *m, long long now);
+
+/* "staying below it for 5 minutes", or why not: for a log line, given what
+ * dm_rate_memory_failed() returned. */
+void dm_rate_memory_text(double hold_s, char *out, size_t out_len);
+
+/* The retrains --max-retrains counts. Not every one: a retrain that comes
+ * back slower, in either direction, is the rate stepping down to one the
+ * line will bear - the cure working - and retrains five minutes apart are a
+ * line having the odd bad moment, after which the count starts again. */
+typedef struct
+{
+    unsigned seen;            /* the modem's retrain count at the last look */
+    unsigned strikes;         /* the ones that count */
+    int64_t last_ms;          /* when the latest happened */
+    int rates;                /* both directions' rates added, in data, before it */
+} dm_retrain_count_t;
+
+/* A look at the modem: its retrain count so far, the rates it runs at each
+ * way (tx_rate 0 where the two are one), and whether it is in data. Returns
+ * the strikes. */
+unsigned dm_retrain_count_update(dm_retrain_count_t *c, unsigned retrains, int rx_rate, int tx_rate,
+                                 bool in_data, int64_t now_ms);
+
 #endif /* DATAMODEM_UTIL_H */

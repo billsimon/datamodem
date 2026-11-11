@@ -66,6 +66,8 @@ typedef struct
     int pre_emphasis;         /* test hook: likewise, -1 = whatever probing says, else 0 to 10 */
     int trellis;              /* the code our receiver asks for: 16 (0 means 16), 32 or 64 */
     bool shaping;             /* ask for expanded shaping */
+    bool plain_recovery;      /* test hook: retrain whenever reception is poor, and remember no
+                               * rate that failed - as a far end might */
     const char *tag;          /* for logs */
 
     /* Called on whichever thread drives dm_v34_tx / dm_v34_rx. get_bit is

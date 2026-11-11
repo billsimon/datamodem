@@ -196,6 +196,9 @@ typedef struct
     dm_link_quality_t quality;
     bool have_quality;
 
+    /* What --max-retrains counts: see dm_retrain_count_update(). */
+    dm_retrain_count_t retrains;
+
     /* Dominance watch on what arrives, see count_repeats(). */
     unsigned hist[256];
     unsigned hist_n;
@@ -1401,20 +1404,29 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
          * then demodulates the other wrongly, so both see noise, and the
          * far end keeps asking to retrain. Say so and stop, rather than
          * filling the terminal with garbage until somebody clears the
-         * call. */
-        if (cfg->max_retrains > 0 && st.retrains >= (unsigned) cfg->max_retrains)
+         * call.
+         *
+         * But not every retrain counts (dm_retrain_count_update()): one that
+         * comes back slower is the rate stepping down to one the line will
+         * bear, which V.32 bis and V.34 do on purpose. A V.34 call whose far
+         * end retrained four times in two minutes, each time at a rate it
+         * could not hold, was hung up on here while each retrain still
+         * worked. */
+        dm_retrain_count_update(&s.retrains, st.retrains, st.bit_rate, st.tx_bit_rate, st.phase == DM_PHASE_DATA,
+                                now);
+        if (cfg->max_retrains > 0 && s.retrains.strikes >= (unsigned) cfg->max_retrains)
         {
             dm_tty_result("NO CARRIER");
             if (st.train_stage != NULL)
                 /* V.32 and V.34 agree their rates explicitly, so the ends cannot
                  * disagree about it the way V.22bis's can; and each retrain
-                 * already picks the rate the line will bear. One that still
+                 * that a rate failing caused steps below it. One that still
                  * will not hold has a line problem. */
                 DM_ERROR("session",
-                         "the link retrained %u times at %d bps and will not hold (%.1f dB SNR) - "
-                         "the audio path is too poor for %s. --modulation v22bis or v21 ask far "
-                         "less of it.",
-                         st.retrains, st.bit_rate, (double) st.snr_db,
+                         "the link retrained %u times in a few minutes without slowing to a rate that "
+                         "holds (now %d bps) - the audio path is too poor for %s. --modulation v22bis "
+                         "or v21 ask far less of it.",
+                         s.retrains.strikes, st.bit_rate,
                          strcmp(st.modulation, "v34") == 0      ? "V.34"
                          : strcmp(st.modulation, "v32bis") == 0 ? "V.32bis"
                                                                 : "V.32");
@@ -1424,13 +1436,13 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
                          "having offered %d, which usually means the two ends disagreed about "
                          "the rate - try --bit-rate %d so both start there, or --modulation v21, "
                          "which is far more tolerant of a poor audio path.",
-                         st.retrains, st.bit_rate, st.offered_rate, st.bit_rate);
+                         s.retrains.strikes, st.bit_rate, st.offered_rate, st.bit_rate);
             else
                 DM_ERROR("session",
                          "the link retrained %u times at %d bps and will not hold - check the "
                          "audio path, and try --modulation v21, which is far more tolerant of "
                          "a poor one.",
-                         st.retrains, st.bit_rate);
+                         s.retrains.strikes, st.bit_rate);
             finish(&s, DM_END_UNSTABLE);
             break;
         }

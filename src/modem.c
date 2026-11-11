@@ -2679,6 +2679,17 @@ static bool create_pump(dm_modem_t *m, bool listen_first)
             vp.shaping = true;
             DM_WARN("modem", "DATAMODEM_V34_SHAPING: asking for expanded shaping. This is a test hook.");
         }
+        /* Test hook: "call" or "answer" makes that end recover from poor
+         * reception the way many far ends do - a retrain every time, at
+         * whatever rate training then picks - so that what the other end
+         * does about a far end like that gets exercised. */
+        if (getenv("DATAMODEM_V34_PLAIN_RECOVERY") != NULL &&
+            strcmp(getenv("DATAMODEM_V34_PLAIN_RECOVERY"), m->calling ? "call" : "answer") == 0)
+        {
+            vp.plain_recovery = true;
+            DM_WARN("modem", "DATAMODEM_V34_PLAIN_RECOVERY: this end retrains whenever reception is poor, and "
+                             "remembers no rate that failed. This is a test hook.");
+        }
         if (getenv("DATAMODEM_V34_PRE_EMPHASIS") != NULL)
         {
             vp.pre_emphasis = atoi(getenv("DATAMODEM_V34_PRE_EMPHASIS"));
@@ -4154,13 +4165,19 @@ int64_t dm_modem_since_rx_ms(dm_modem_t *m)
  * way, in ms, as two jitter buffers and a network would make it; echo puts
  * each modem's own signal back into its receiver that many dB down, a whole
  * round trip later, the way the far end's hybrid does on a call into the
- * telephone network; noise is white noise in dBm0; ulaw passes everything
+ * telephone network; noise is white noise in dBm0, and noise=-36/call puts
+ * it only on what the caller hears ("answer" the answerer); ulaw passes everything
  * through G.711; burst=20/3 adds 20 ms of loud noise every 3 seconds, which
  * damages a frame or two without making the line look bad on average - how
  * V.42's recovery gets exercised; cut=20/600 silences the line both ways for
  * 600 ms, 20 seconds in, which a modem can only recover from by retraining;
- * drift=100 makes the answerer's clock 100 ppm fast as the caller hears it. A test hook, not an option - it is how V.32's echo
- * canceller and round-trip measurement get tested without a phone line. */
+ * drift=100 makes the answerer's clock 100 ppm fast as the caller hears it;
+ * fade=4/30/-30 raises the noise to -30 dBm0 for 4 seconds in every 30, from
+ * 15 seconds in - a line whose trouble comes and goes, the kind training
+ * cannot see - and fade=4/30/-30/call does it only to what the caller
+ * hears ("answer" the answerer). A test hook, not an option - it is how
+ * V.32's echo canceller and round-trip measurement get tested without a
+ * phone line. */
 #define SELFTEST_LINE_MAX (SELFTEST_CHUNK * 128) /* 2.5 s of each direction */
 
 typedef struct
@@ -4170,12 +4187,17 @@ typedef struct
     float echo_gain;          /* 0 = no echo */
     bool ulaw;
     awgn_state_t *noise;
+    int noise_ends;           /* bit 0: the caller hears it, bit 1: the answerer */
     awgn_state_t *burst;
     int burst_len;            /* samples */
     int burst_every;          /* samples */
     long cut_at;              /* line silent from here, both ways, 0 = never */
     int cut_len;
     double drift;             /* the answerer's clock against the caller's, parts per million */
+    awgn_state_t *fade;
+    long fade_len;            /* samples */
+    long fade_every;          /* samples */
+    int fade_ends;            /* bit 0: the caller hears it, bit 1: the answerer */
     int16_t hist[2][SELFTEST_LINE_MAX];
     long pos;
 } selftest_line_t;
@@ -4207,7 +4229,18 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
             echo = true;
         }
         else if (strncmp(tok, "noise=", 6) == 0)
-            noise_db = atof(tok + 6);
+        {
+            char who[16] = "";
+
+            if (sscanf(tok + 6, "%lf/%15s", &noise_db, who) < 1 ||
+                (who[0] != '\0' && strcmp(who, "call") != 0 && strcmp(who, "answer") != 0))
+            {
+                DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: noise= wants dBm0, and /call or /answer for "
+                                     "one end only, as in noise=-40");
+                return false;
+            }
+            ln->noise_ends = (who[0] == '\0') ? 3 : (strcmp(who, "call") == 0) ? 1 : 2;
+        }
         else if (strcmp(tok, "ulaw") == 0)
             ln->ulaw = true;
         else if (strncmp(tok, "drift=", 6) == 0)
@@ -4231,6 +4264,24 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
             ln->cut_at = (long) (at * DM_SAMPLE_RATE);
             ln->cut_len = (int) (ms * DM_SAMPLE_RATE / 1000.0);
         }
+        else if (strncmp(tok, "fade=", 5) == 0)
+        {
+            double secs = 0.0, every = 0.0, db = 0.0;
+            char who[16] = "";
+
+            if (sscanf(tok + 5, "%lf/%lf/%lf/%15s", &secs, &every, &db, who) < 3 || secs <= 0.0 ||
+                every <= secs || db >= 0.0 ||
+                (who[0] != '\0' && strcmp(who, "call") != 0 && strcmp(who, "answer") != 0))
+            {
+                DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: fade= wants seconds/every/dBm0, and /call or "
+                                     "/answer for one end only, as in fade=4/30/-30");
+                return false;
+            }
+            ln->fade_len = (long) (secs * DM_SAMPLE_RATE);
+            ln->fade_every = (long) (every * DM_SAMPLE_RATE);
+            ln->fade_ends = (who[0] == '\0') ? 3 : (strcmp(who, "call") == 0) ? 1 : 2;
+            ln->fade = awgn_init_dbm0(NULL, 2468013, (float) db);
+        }
         else if (strncmp(tok, "burst=", 6) == 0)
         {
             double ms = 0.0;
@@ -4247,7 +4298,7 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
         }
         else
         {
-            DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise=, burst=, cut=, drift= or ulaw",
+            DM_ERROR("selftest", "DATAMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise=, burst=, fade=, cut=, drift= or ulaw",
                      tok);
             return false;
         }
@@ -4276,6 +4327,12 @@ static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
     if (echo)
         snprintf(desc + strlen(desc), desc_len - strlen(desc), " (echo %.0f dB, noise %.0f dBm0)",
                  echo_db, noise_db);
+    if (ln->fade != NULL)
+        snprintf(desc + strlen(desc), desc_len - strlen(desc), ", fading %.0f s in every %.0f%s",
+                 (double) ln->fade_len / DM_SAMPLE_RATE, (double) ln->fade_every / DM_SAMPLE_RATE,
+                 ln->fade_ends == 1   ? " as the caller hears it"
+                 : ln->fade_ends == 2 ? " as the answerer hears it"
+                                      : "");
     return true;
 }
 
@@ -4285,6 +4342,8 @@ static void selftest_line_free(selftest_line_t *ln)
         awgn_free(ln->noise);
     if (ln->burst != NULL)
         awgn_free(ln->burst);
+    if (ln->fade != NULL)
+        awgn_free(ln->fade);
 }
 
 /* One 20 ms frame each way. Both transmit before either receives, which is
@@ -4339,11 +4398,14 @@ static void selftest_line_run(selftest_line_t *ln, dm_modem_t *caller, dm_modem_
 
             if (ln->echo_gain > 0.0f && t >= ln->echo_delay)
                 x += ln->echo_gain * ln->hist[e][(t - ln->echo_delay) % SELFTEST_LINE_MAX];
-            if (ln->noise != NULL)
+            if (ln->noise != NULL && (ln->noise_ends & (1 << e)))
                 x += awgn(ln->noise);
             /* Away from the start, so as to hit data rather than training. */
             if (ln->burst != NULL && t > 15 * DM_SAMPLE_RATE && t % ln->burst_every < ln->burst_len)
                 x += awgn(ln->burst);
+            if (ln->fade != NULL && (ln->fade_ends & (1 << e)) && t > 15 * DM_SAMPLE_RATE &&
+                t % ln->fade_every < ln->fade_len)
+                x += awgn(ln->fade);
             if (x > 32767.0f)
                 x = 32767.0f;
             else if (x < -32768.0f)
@@ -4731,7 +4793,8 @@ int dm_modem_selftest(const dm_config_t *cfg)
     else
         DM_INFO("selftest", "looping two %s modems back to back, %zu bytes each way", cfg->modulation,
                 nbytes);
-    if (line.delay > 0 || line.echo_gain > 0.0f || line.noise != NULL || line.burst != NULL || line.ulaw)
+    if (line.delay > 0 || line.echo_gain > 0.0f || line.noise != NULL || line.burst != NULL || line.fade != NULL ||
+        line.ulaw)
         DM_INFO("selftest", "the line between them: %s", line_desc);
     started = dm_now_real_ms();
 
