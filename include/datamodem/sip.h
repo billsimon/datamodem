@@ -60,6 +60,11 @@ typedef struct
     unsigned tx_packets;
     unsigned jitter_us;        /* mean inter-arrival jitter */
     unsigned jitter_max_us;
+    unsigned jb_avg_delay_ms;  /* the jitter buffer's delay, over the stream so far */
+    unsigned jb_min_delay_ms;
+    unsigned jb_max_delay_ms;
+    unsigned jb_empty;         /* times it had nothing to give the modem */
+    unsigned jb_discard;       /* frames it threw away */
 } dm_link_quality_t;
 
 bool dm_sip_link_quality(dm_link_quality_t *q);

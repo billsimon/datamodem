@@ -199,6 +199,15 @@ typedef struct
     /* What --max-retrains counts: see dm_retrain_count_update(). */
     dm_retrain_count_t retrains;
 
+    /* The audio path, watched through a call: see watch_audio_path(). */
+    unsigned jb_empty_seen, jb_discard_seen;     /* the jitter buffer's counts at the last look */
+    unsigned jb_empty_unsaid, jb_discard_unsaid; /* since the last line about them */
+    int64_t jb_said_ms;
+    unsigned path_retrains_seen;
+    int64_t path_report_ms;      /* when the last periodic line went out */
+    dm_link_quality_t path_base; /* the packet counts at connect */
+    int64_t path_base_ms;
+
     /* Dominance watch on what arrives, see count_repeats(). */
     unsigned hist[256];
     unsigned hist_n;
@@ -279,6 +288,113 @@ static void term_reply(void *user, const void *data, size_t len)
 
     if (!s->command_mode)
         dm_modem_send(s->modem, data, len);
+}
+
+/* Our clock against the far end's, in parts per million, from the packets
+ * each has sent since the connect: we send one per 20 ms of ours, it one per
+ * 20 ms of its own. Positive is ours running fast. False until a minute of
+ * them, when one packet either way is still 330 ppm; res is that, for the
+ * log line. */
+static bool clock_ppm(const dm_session_t *s, const dm_link_quality_t *q, int64_t now, double *ppm, double *res)
+{
+    long rx = (long) (q->rx_packets + q->rx_lost) - (long) (s->path_base.rx_packets + s->path_base.rx_lost);
+    long tx = (long) q->tx_packets - (long) s->path_base.tx_packets;
+
+    if (s->path_base_ms == 0 || now - s->path_base_ms < 60 * 1000 || rx <= 0)
+        return false;
+    *ppm = (double) (tx - rx) * 1e6 / (double) rx;
+    *res = 1e6 / (double) rx;
+    return true;
+}
+
+/* A count since the connect, or the count itself if pjsua has started its
+ * statistics again (a new stream, after a re-INVITE) and it went down. */
+static unsigned since_base(unsigned now_count, unsigned base)
+{
+    return (now_count >= base) ? now_count - base : now_count;
+}
+
+#define DM_PATH_REPORT_MS (5 * 60 * 1000)
+#define DM_JB_SAY_MS (10 * 1000)
+
+/* What the jitter buffer is doing, in the log, while connected. A modem
+ * expects an unbroken stream of samples, and the buffer cannot always give
+ * one: when our clock and the far end's disagree it slowly drains or fills,
+ * and each time it runs dry the modem is handed a frame of nothing. A V.32bis
+ * call to a production BBS retrained every few minutes at every rate while
+ * the round trip it measured at each retrain crept up a frame at a time, 107
+ * ms to 367 over half an hour - which is what that looks like from the
+ * modem, and nothing recorded what the buffer was doing. Now:
+ *
+ *   - each time it has nothing to give or throws frames away, a line saying
+ *     so, at most every ten seconds, so it can be set beside the modem's own;
+ *   - at each retrain, its state and the round trip the retrain measured;
+ *   - every five minutes, its state and the two clocks compared. */
+static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64_t now)
+{
+    const dm_link_quality_t *q = &s->quality;
+    double ppm, res;
+    char clocks[96] = "";
+
+    if (!s->have_quality)
+        return;
+    if (s->connected_ms == 0 || !st->connected)
+    {
+        /* Call setup has its own empties, before any audio arrives. */
+        s->jb_empty_seen = q->jb_empty;
+        s->jb_discard_seen = q->jb_discard;
+        return;
+    }
+    if (s->path_base_ms == 0)
+    {
+        s->path_base = *q;
+        s->path_base_ms = now;
+        s->path_report_ms = now;
+        s->path_retrains_seen = st->retrains;
+    }
+    if (q->jb_empty > s->jb_empty_seen)
+        s->jb_empty_unsaid += q->jb_empty - s->jb_empty_seen;
+    if (q->jb_discard > s->jb_discard_seen)
+        s->jb_discard_unsaid += q->jb_discard - s->jb_discard_seen;
+    s->jb_empty_seen = q->jb_empty;
+    s->jb_discard_seen = q->jb_discard;
+    if (clock_ppm(s, q, now, &ppm, &res))
+        snprintf(clocks, sizeof(clocks), "; our clock %+.0f ppm (+/-%.0f) against the far end's", ppm, res);
+
+    if ((s->jb_empty_unsaid > 0 || s->jb_discard_unsaid > 0) && now - s->jb_said_ms >= DM_JB_SAY_MS)
+    {
+        DM_INFO("session", "the jitter buffer had nothing for %u frame%s (%u ms) and threw away %u - the "
+                           "modem was handed a gap (its delay %u ms on average, %u to %u)%s",
+                s->jb_empty_unsaid, s->jb_empty_unsaid == 1 ? "" : "s", s->jb_empty_unsaid * 20 /* ms a frame */,
+                s->jb_discard_unsaid, q->jb_avg_delay_ms, q->jb_min_delay_ms, q->jb_max_delay_ms, clocks);
+        s->jb_empty_unsaid = s->jb_discard_unsaid = 0;
+        s->jb_said_ms = now;
+    }
+    if (st->retrains > s->path_retrains_seen)
+    {
+        char rtt[32] = "";
+
+        /* The round trip a V.32 or V.34 retrain has just measured: on a
+         * path whose delay is not changing, it should not either. */
+        if (st->round_trip_ms > 0)
+            snprintf(rtt, sizeof(rtt), "; round trip %d ms", st->round_trip_ms);
+        DM_INFO("session", "audio path at retrain %u: jitter buffer delay %u ms on average (%u to %u), empty "
+                           "for %u frames and %u thrown away since the connect%s%s",
+                st->retrains, q->jb_avg_delay_ms, q->jb_min_delay_ms, q->jb_max_delay_ms,
+                since_base(q->jb_empty, s->path_base.jb_empty),
+                since_base(q->jb_discard, s->path_base.jb_discard), rtt, clocks);
+        s->path_retrains_seen = st->retrains;
+    }
+    if (now - s->path_report_ms >= DM_PATH_REPORT_MS)
+    {
+        DM_INFO("session", "audio path: jitter buffer delay %u ms on average (%u to %u), empty for %u frames "
+                           "and %u thrown away since the connect, %u packets lost%s",
+                q->jb_avg_delay_ms, q->jb_min_delay_ms, q->jb_max_delay_ms,
+                since_base(q->jb_empty, s->path_base.jb_empty),
+                since_base(q->jb_discard, s->path_base.jb_discard), since_base(q->rx_lost, s->path_base.rx_lost),
+                clocks);
+        s->path_report_ms = now;
+    }
 }
 
 static void finish(dm_session_t *s, dm_session_end_t reason)
@@ -1284,6 +1400,7 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
         dm_modem_status(modem, &st);
         if (dm_sip_link_quality(&s.quality))
             s.have_quality = true;
+        watch_audio_path(&s, &st, now);
         update_screen(&s, &st);
 
         /* The speaker plays the training and stops at carrier, as ATM1. */
@@ -1546,12 +1663,23 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
         {
             unsigned bad = q.rx_lost + q.rx_discarded;
             unsigned pct = bad * 100u / (q.rx_packets + bad);
+            double ppm = 0.0, res = 0.0;
+            char ppm_text[16] = "unknown";
+
+            /* The jitter buffer from the connect, not from call setup. */
+            unsigned jb_empty = since_base(q.jb_empty, s.path_base_ms != 0 ? s.path_base.jb_empty : 0);
+            unsigned jb_discard = since_base(q.jb_discard, s.path_base_ms != 0 ? s.path_base.jb_discard : 0);
+
+            if (clock_ppm(&s, &q, dm_now_ms(), &ppm, &res))
+                snprintf(ppm_text, sizeof(ppm_text), "%+.0f", ppm);
 
             dm_log_event(DM_LOG_INFO, "session", "audio path",
                          "rx_packets=%u rx_lost=%u rx_discarded=%u rx_reordered=%u tx_packets=%u "
-                         "jitter_ms=%.1f jitter_max_ms=%.1f rx_level_dbm0=%.1f",
+                         "jitter_ms=%.1f jitter_max_ms=%.1f rx_level_dbm0=%.1f jb_avg_delay_ms=%u jb_max_delay_ms=%u "
+                         "jb_empty=%u jb_discard=%u clock_ppm=%s",
                          q.rx_packets, q.rx_lost, q.rx_discarded, q.rx_reordered, q.tx_packets,
-                         q.jitter_us / 1000.0, q.jitter_max_us / 1000.0, (double) st.rx_power);
+                         q.jitter_us / 1000.0, q.jitter_max_us / 1000.0, (double) st.rx_power, q.jb_avg_delay_ms,
+                         q.jb_max_delay_ms, jb_empty, jb_discard, ppm_text);
 
             /* A modem is far less forgiving than speech. If the path lost
              * anything at all, say so next to the failure rather than

@@ -1215,6 +1215,43 @@ which is exactly the wrong thing to hand a demodulator. The jitter buffer is
 fixed and never drops or stretches a frame, because chasing latency by
 discarding samples corrupts the stream the demodulator is tracking.
 
+What a fixed buffer cannot do is make two clocks agree. We send a packet per
+20 ms of our clock and the far end one per 20 ms of its own; if they differ,
+a buffer somewhere - ours, or the carrier's - slowly drains or fills, and
+each time it runs dry or overflows the modem on the other side of it gets a
+20 ms gap or splice. A V.32bis call to a production BBS retrained every few
+minutes at every rate while the round trip it measured at each retrain crept
+up a frame at a time, 107 ms to 367 over half an hour - about 135 ppm, and
+about one frame's worth of drift between retrains - and nothing in the log
+said what the buffer was doing. The session now does:
+
+```
+info  [session] the jitter buffer had nothing for 1 frame (20 ms) and threw away 0 - the modem was handed a gap (its delay 150 ms on average, 140 to 160); our clock +138 ppm (+/-11) against the far end's
+info  [session] audio path at retrain 3: jitter buffer delay 150 ms on average (140 to 160), empty for 2 frames and 0 thrown away since the connect; round trip 287 ms; our clock ...
+info  [session] audio path: jitter buffer delay 160 ms on average (160 to 160), empty for 0 frames and 0 thrown away since the connect, 0 packets lost; our clock +0 ppm (+/-67) against the far end's
+```
+
+(The last is a real one, from a loopback call; the first two show the form.)
+
+- a line each time the buffer has nothing to give or throws frames away, at
+  most every ten seconds, so it can be set beside the modem's own;
+- at each retrain, the buffer and the round trip the retrain measured, which
+  on a path whose delay is not changing should not change either;
+- every five minutes, and in the end-of-call `audio path` summary
+  (`jb_avg_delay_ms`, `jb_max_delay_ms`, `jb_empty`, `jb_discard`,
+  `clock_ppm`), the buffer and the two clocks compared - from the packets each end has sent since the
+  connect, which no jitter buffer can disguise. It needs a minute of packets
+  before it says anything, and is good to the `+/-` it gives: one packet in
+  the time so far, 67 ppm after five minutes and 11 after half an hour.
+
+pjmedia's own idea of how full the buffer is (`size`) is not its delay - on
+loopback, with 150 ms in each direction's buffer and a 300 ms round trip, it
+read 280 to 320 ms - so the delay given is the buffer's own measure of it.
+
+Whether the BBS's retrains were that, and on which side of the call the
+buffer was, is what these are for; if they were, the cure is to lock our
+transmit clock to the far end's, not anything in the modems.
+
 Nothing in the modem runs until the call is actually answered. That sounds
 obvious and is easy to get wrong: pjmedia's conference bridge starts clocking
 our media port the moment it joins, which is well before the far end picks
