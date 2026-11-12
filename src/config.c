@@ -70,7 +70,7 @@ static const opt_def_t OPTS[] = {
     /* Media */
     STR_OPT("codec", codec, "pcmu | pcma (default pcmu)"),
     INT_OPT("jitter-buffer-ms", jitter_buffer_ms, 0, 500,
-            "fixed jitter buffer (default 150); smaller starves the modem on a real path"),
+            "fixed jitter buffer (default 150); 0 for none - the modem has each packet as it arrives"),
     BOOL_OPT("user-phone", user_phone, "append ;user=phone to the request URI"),
 
     /* Modem */

@@ -1112,8 +1112,10 @@ void dm_modem_params_from_config(const dm_config_t *cfg, bool calling, const cha
     out->v42 = cfg->v42;
     out->v42_timeout_s = cfg->v42_timeout_s;
     /* A jitter buffer at each end, so the round trip is twice one of them.
-     * This is what V.42's detection window has to be stretched by. */
-    out->path_delay_ms = cfg->jitter_buffer_ms * 2;
+     * This is what V.42's detection window has to be stretched by. With
+     * --jitter-buffer-ms 0 ours is gone, but the far end's gateway still has
+     * one, which we can only guess at: the 150 ms that is our own default. */
+    out->path_delay_ms = (cfg->jitter_buffer_ms > 0) ? cfg->jitter_buffer_ms * 2 : 150;
     out->v42bis = cfg->v42bis;
     out->v42bis_dict = cfg->v42bis_dict;
     out->v42bis_max_string = cfg->v42bis_max_string;

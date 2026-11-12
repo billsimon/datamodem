@@ -2254,6 +2254,34 @@ static void heard_e(dm_v34_t *v)
     q->a2 = 0.0005f;
 }
 
+/* Which end set each direction's rate in the MPs just exchanged, for the
+ * log: what the far end's MP would take, what ours offered, and why ours
+ * offered less, if a failure is holding a rate back. A far end that asks to
+ * change rate every 30 seconds and gets the rate it had is usually trying
+ * to come back up past a rate our memory is holding it below. */
+static void mp_text(dm_v34_t *v, char *out, size_t len)
+{
+    v34_mp_t mine;
+    int far_out, far_in, my_out, my_in, lim_out, lim_in;
+    size_t k;
+
+    v34_mp_unpack(v->mpbits, v->mp_len, &mine);
+    far_out = 2400 * (v->calling ? v->mp_far.rate_c_to_a : v->mp_far.rate_a_to_c);
+    far_in = 2400 * (v->calling ? v->mp_far.rate_a_to_c : v->mp_far.rate_c_to_a);
+    my_out = 2400 * (v->calling ? mine.rate_c_to_a : mine.rate_a_to_c);
+    my_in = 2400 * (v->calling ? mine.rate_a_to_c : mine.rate_c_to_a);
+    lim_out = dm_rate_memory_limit(&v->tx_failed, v->n);
+    lim_in = dm_rate_memory_limit(&v->rx_failed, v->n);
+    k = (size_t) snprintf(out, len, "; out: the far end would take %d, we offered %d; in: it offered %d, we would "
+                                    "take %d", far_out, my_out, far_in, my_in);
+    if (lim_out > 0 && k < len)
+        k += (size_t) snprintf(out + k, len - k, "; holding below %d out for %.1f more minutes", lim_out,
+                               (double) (v->tx_failed.until - v->n) / (8000.0 * 60.0));
+    if (lim_in > 0 && k < len)
+        snprintf(out + k, len - k, "; holding below %d in for %.1f more minutes", lim_in,
+                 (double) (v->rx_failed.until - v->n) / (8000.0 * 60.0));
+}
+
 static void go_data(dm_v34_t *v)
 {
     bool retrain = v->trained_once;
@@ -2265,11 +2293,13 @@ static void go_data(dm_v34_t *v)
     if (v->renegotiating)
     {
         int lim = rate_ceiling(&v->tx_failed, v->n);
+        char why[256];
 
+        mp_text(v, why, sizeof(why));
         v->renegotiating = false;
         v->renegotiations++;
-        DM_INFO("v34", "rates changed without a retrain: %d bit/s out, %d in, SNR %.1f dB (tag=%s)", v->rate_tx,
-                v->rate_rx, v->snr_db, v->tag);
+        DM_INFO("v34", "rates changed without a retrain: %d bit/s out, %d in, SNR %.1f dB%s (tag=%s)", v->rate_tx,
+                v->rate_rx, v->snr_db, why, v->tag);
         /* Less of our transmitter, and not because our own MP said so: the
          * far end's reception would not bear what it had. */
         v->tx_step = 0;

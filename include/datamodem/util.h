@@ -149,4 +149,69 @@ typedef struct
 unsigned dm_retrain_count_update(dm_retrain_count_t *c, unsigned retrains, int rx_rate, int tx_rate,
                                  bool in_data, int64_t now_ms);
 
+/* What the far end sends, handed to the modem as it arrives - in place of a
+ * jitter buffer, which plays a fixed delay out against our own clock. That
+ * is right for a sound card, which needs a sample every 125 us whatever the
+ * network does, and wrong for a modem, which recovers the far end's clock
+ * from the signal and can take its samples whenever they come. A fixed
+ * buffer only ever grows: a packet late enough to empty it puts a frame of
+ * nothing in front of everything after, and a packet more than our clock
+ * asked for stays in it to the end of the call. A V.34 call to a BBS
+ * through a carrier that added a packet or two every few minutes went from
+ * 20 ms of buffer to its 240 ms limit, the round trip from 248 ms to 588,
+ * and once it was full each packet more was thrown away, a splice in the
+ * signal - the last of them in the middle of a retrain, which ended the
+ * call.
+ *
+ * Here the far end's own timestamps place each packet, so a packet lost or
+ * given up on becomes exactly as many samples of nothing as it would have
+ * held, and the samples the modem is given keep step with the far end's
+ * clock whatever the network does with the packets. Packets out of order
+ * wait for the one before them up to hold samples; with nothing arriving at
+ * all, or nothing yet, after hold the modem is given nothing, a tick at a
+ * time, as a jitter buffer would when empty - but a packet that comes after that loses only
+ * the part of it already given up on, and everything after it is on time.
+ * Timestamps and lengths are in samples at 8000 a second. One per call;
+ * not thread-safe. */
+#define DM_RTP_RX_SLOTS 32
+#define DM_RTP_RX_MAX_SAMPLES 480       /* 60 ms, the most a packet may hold */
+#define DM_RTP_RX_RESYNC (8000 * 2)     /* a jump in timestamps this big is a new stream */
+
+typedef struct
+{
+    bool used;
+    uint32_t ts;
+    int len;
+    int16_t s[DM_RTP_RX_MAX_SAMPLES];
+} dm_rtp_rx_slot_t;
+
+typedef struct
+{
+    dm_rtp_rx_slot_t slot[DM_RTP_RX_SLOTS];
+    int queued;
+    bool started;
+    uint32_t ssrc;
+    uint32_t next_ts;         /* the far end's timestamp of the next sample the modem is due */
+    int waited;               /* samples' worth of ticks with nothing to give */
+    /* Counts, for the log. */
+    unsigned late;            /* packets that came after the modem had been given nothing in their place */
+    unsigned dup;
+    unsigned overflow;        /* packets with no room for them */
+    unsigned resyncs;         /* a new SSRC, or timestamps that jumped */
+    unsigned long long filled; /* samples of nothing given the modem */
+    int max_queued;           /* the most packets ever waiting */
+} dm_rtp_rx_t;
+
+void dm_rtp_rx_reset(dm_rtp_rx_t *q);
+
+/* A packet from the far end: its SSRC, timestamp and len samples. Returns
+ * false if it was not kept - late, a duplicate, or no room. */
+bool dm_rtp_rx_push(dm_rtp_rx_t *q, uint32_t ssrc, uint32_t ts, const int16_t *s, int len);
+
+/* A tick of tick samples of our clock: everything that can go to the modem
+ * now goes, through out(user, samples, n), with samples NULL for n samples
+ * of nothing. */
+void dm_rtp_rx_drain(dm_rtp_rx_t *q, int tick, int hold, void (*out)(void *user, const int16_t *s, int n),
+                     void *user);
+
 #endif /* DATAMODEM_UTIL_H */

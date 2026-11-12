@@ -47,6 +47,12 @@ bool dm_sip_call_ended(void);
  * sample the stream yet. */
 int64_t dm_sip_since_rtp_ms(void);
 
+/* --jitter-buffer-ms 0: how long a packet out of order, or a gap in what
+ * arrives, is waited for before the modem is given nothing in its place.
+ * Two packets' worth: a path that reorders or stalls by more than that is
+ * one a modem was never going to like. */
+#define DM_DIRECT_HOLD_MS 40
+
 /* How the audio path is actually behaving. A modem is far less forgiving of
  * a lossy or jittery path than speech is, and when a call trains below its
  * offered rate, retrains repeatedly, or delivers noise, this is the first
@@ -63,8 +69,16 @@ typedef struct
     unsigned jb_avg_delay_ms;  /* the jitter buffer's delay, over the stream so far */
     unsigned jb_min_delay_ms;
     unsigned jb_max_delay_ms;
+    unsigned jb_depth_ms;      /* what it holds now */
     unsigned jb_empty;         /* times it had nothing to give the modem */
     unsigned jb_discard;       /* frames it threw away */
+    unsigned jb_frame_ms;      /* the length of those frames: G.711's are 10 ms, not a packet's 20 */
+    /* --jitter-buffer-ms 0, where the modem has each packet as it arrives
+     * (dm_rtp_rx_t) and the numbers above are only the speaker's. */
+    bool direct;
+    unsigned direct_late;      /* packets that came after the modem had been given nothing for them */
+    unsigned direct_filled_ms; /* nothing given the modem, for packets lost or late */
+    unsigned direct_waiting_max; /* the most packets ever waiting for one before them */
     /* What the far end says of ours, in its RTCP receiver reports - the only
      * view there is of the direction we send in. far_reports is 0 if it
      * sends none. */

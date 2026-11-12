@@ -1330,9 +1330,9 @@ about one frame's worth of drift between retrains - and nothing in the log
 said what the buffer was doing. The session now does:
 
 ```
-info  [session] the jitter buffer had nothing for 1 frame (20 ms) and threw away 0 - the modem was handed a gap (its delay 150 ms on average, 140 to 160); the far end has sent 4 packets fewer than we have since the connect (80 ms of audio)
-info  [session] audio path at retrain 3: jitter buffer delay 150 ms on average (140 to 160), empty for 2 frames and 0 thrown away since the connect; round trip 287 ms; the far end has sent ...
-info  [session] audio path: jitter buffer delay 160 ms on average (160 to 160), empty for 0 frames and 0 thrown away since the connect, 0 packets lost; the far end has sent as many packets as we have since the connect
+info  [session] the jitter buffer had nothing for 20 ms and threw away 0 ms - the modem was handed a gap (it holds 150 ms now, 150 on average, 140 to 160); the far end has sent 4 packets fewer than we have since the connect (80 ms of audio)
+info  [session] audio path at retrain 3: jitter buffer holding 150 ms (150 on average, 140 to 160), empty for 20 ms and 0 ms thrown away since the connect; round trip 287 ms; the far end has sent ...
+info  [session] audio path: jitter buffer holding 160 ms (160 on average, 160 to 160), empty for 0 ms and 0 ms thrown away since the connect, 0 packets lost; the far end has sent as many packets as we have since the connect
 ```
 
 (The last is a real one, from a loopback call; the first two show the form.)
@@ -1342,8 +1342,8 @@ info  [session] audio path: jitter buffer delay 160 ms on average (160 to 160), 
 - at each retrain, the buffer and the round trip the retrain measured, which
   on a path whose delay is not changing should not change either;
 - every five minutes, and in the end-of-call `audio path` summary
-  (`jb_avg_delay_ms`, `jb_max_delay_ms`, `jb_empty`, `jb_discard`,
-  `far_extra_packets`), the buffer and how many more packets the far end has
+  (`jb_avg_delay_ms`, `jb_max_delay_ms`, `jb_depth_ms`, `jb_empty_ms`,
+  `jb_discard_ms`, `far_extra_packets`), the buffer and how many more packets the far end has
   sent than we have since the connect, which no jitter buffer can disguise.
   A count that grows through the call is the two clocks drifting apart; one
   that jumps and stays is the path adding or taking out audio; one either way
@@ -1352,9 +1352,48 @@ info  [session] audio path: jitter buffer delay 160 ms on average (160 to 160), 
   call's `-454 (+/-114)` at three minutes and `-300` at four and a half were
   the same 4 packets, 80 ms, arriving at the moment the caller retrained.
 
-pjmedia's own idea of how full the buffer is (`size`) is not its delay - on
-loopback, with 150 ms in each direction's buffer and a 300 ms round trip, it
-read 280 to 320 ms - so the delay given is the buffer's own measure of it.
+pjmedia counts the buffer in the codec's frames, and G.711's are 10 ms, not
+a packet's 20: its `size`, taken for 20 ms frames, once read 280 to 320 ms on
+a loopback call with 150 ms in each buffer, and the empty and discard counts
+were logged at twice what they were. `size` times 10 ms is what it holds
+now; its average, least and most delay are over the whole stream, and on a
+long call say little about the moment.
+
+### Doing without a jitter buffer
+
+A fixed buffer only ever grows. A packet late enough to empty it puts a
+frame of nothing in front of everything after it, and a packet more than our
+clock asks for stays in it until it overflows. A V.34 call to a BBS through
+a carrier that added a packet or two every few minutes - +13 over 39 minutes,
+in steps, each one around a burst of poor reception, and none on another
+caller's route the same afternoon - went from 20 ms of buffer to its 240 ms
+limit, the round trip from 248 ms to 588; once it was full each packet more
+was thrown away, a splice made by us, and the last landed in the middle of a
+retrain and ended the call.
+
+A buffer exists to give a sound card a sample every 125 us. A modem needs no
+such thing: it recovers the far end's clock from the signal, and can take its
+samples whenever they come. So `--jitter-buffer-ms 0` puts a pjmedia
+transport adapter under the stream (`on_create_media_transport`) that copies
+each RTP packet, decoded, into a small queue (`dm_rtp_rx_t`) on its way to
+the stream - which still keeps the statistics, answers RTCP and feeds the
+speaker, but no longer the modem - and the modem port empties the queue on
+each tick of the bridge's clock, ahead of sending its own 20 ms. The far
+end's timestamps place each packet: one out of order waits for the one
+before it, up to 40 ms (`DM_DIRECT_HOLD_MS`); one lost becomes exactly as
+many samples of nothing as it held; and with nothing arriving at all, after
+40 ms the modem is given nothing a tick at a time, so its clock runs on as
+it did through an empty buffer - but a packet that turns up after that
+loses only the part already given up on, and nothing after it is delayed.
+
+The modems compare what they hear with what they sent by counting samples
+each way (V.34's round trip is `n - ntx`), and with a buffer the two counts
+advance together. Without one, the count received follows the far end's
+clock, so extra packets from the far end still move the round trip the
+modem measures - the same splice in the signal, just no longer a delay
+anyone waits through. On loopback the round trip measures 0 ms where two
+150 ms buffers made it 300. V.42's allowance for modulations that do not
+measure one still assumes 150 ms in the far end's gateway.
 
 What the far end's RTCP receiver reports say of our packets - how many it
 lost, the jitter it saw, the network round trip - goes with the five-minute

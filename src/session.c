@@ -200,10 +200,10 @@ typedef struct
     dm_retrain_count_t retrains;
 
     /* The audio path, watched through a call: see watch_audio_path(). */
-    unsigned jb_empty_seen, jb_discard_seen;     /* the jitter buffer's counts at the last look */
+    unsigned gap_seen, dropped_seen;             /* path_gaps()'s counts at the last look */
     unsigned far_lost_seen, far_lost_unsaid;     /* the far end's reports of our packets lost */
     int64_t far_said_ms;
-    unsigned jb_empty_unsaid, jb_discard_unsaid; /* since the last line about them */
+    unsigned gap_unsaid, dropped_unsaid;         /* since the last line about them */
     int64_t jb_said_ms;
     unsigned path_retrains_seen;
     int64_t path_report_ms;      /* when the last periodic line went out */
@@ -346,6 +346,38 @@ static void far_text(const dm_session_t *s, const dm_link_quality_t *q, char *ou
 #define DM_PATH_REPORT_MS (5 * 60 * 1000)
 #define DM_JB_SAY_MS (10 * 1000)
 
+/* The gaps the modem was handed, in ms, and what was thrown away: with a
+ * jitter buffer, the times it ran empty and the ms of frames it discarded;
+ * with none, the ms it was given nothing for and the packets that came too
+ * late to use. Counts since the stream began. */
+static void path_gaps(const dm_link_quality_t *q, unsigned *gap, unsigned *dropped)
+{
+    unsigned frame_ms = q->jb_frame_ms != 0 ? q->jb_frame_ms : 10;
+
+    *gap = q->direct ? q->direct_filled_ms : q->jb_empty * frame_ms;
+    *dropped = q->direct ? q->direct_late : q->jb_discard * frame_ms;
+}
+
+/* What is between the network and the modem, since the connect, for a log
+ * line. */
+static void buffer_text(const dm_session_t *s, const dm_link_quality_t *q, char *out, size_t len)
+{
+    unsigned gap, dropped, gap0, dropped0;
+
+    path_gaps(q, &gap, &dropped);
+    path_gaps(&s->path_base, &gap0, &dropped0);
+    if (q->direct)
+        snprintf(out, len, "no jitter buffer: the modem has been given nothing for %u ms and %u packet%s came too "
+                           "late to use since the connect, at most %u waiting at once",
+                 since_base(gap, gap0), since_base(dropped, dropped0), since_base(dropped, dropped0) == 1 ? "" : "s",
+                 q->direct_waiting_max);
+    else
+        snprintf(out, len, "jitter buffer holding %u ms (%u on average, %u to %u), empty for %u ms and %u ms thrown "
+                           "away since the connect",
+                 q->jb_depth_ms, q->jb_avg_delay_ms, q->jb_min_delay_ms, q->jb_max_delay_ms,
+                 since_base(gap, gap0), since_base(dropped, dropped0));
+}
+
 /* What the jitter buffer is doing, in the log, while connected. A modem
  * expects an unbroken stream of samples, and the buffer cannot always give
  * one: when our clock and the far end's disagree it slowly drains or fills,
@@ -366,16 +398,19 @@ static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64
 {
     const dm_link_quality_t *q = &s->quality;
     long skew;
+    unsigned gap, dropped;
     char clocks[128] = "";
     char far[160];
+    char buffer[256];
 
     if (!s->have_quality)
         return;
+    path_gaps(q, &gap, &dropped);
     if (s->connected_ms == 0 || !st->connected)
     {
         /* Call setup has its own empties, before any audio arrives. */
-        s->jb_empty_seen = q->jb_empty;
-        s->jb_discard_seen = q->jb_discard;
+        s->gap_seen = gap;
+        s->dropped_seen = dropped;
         s->far_lost_seen = q->far_lost;
         return;
     }
@@ -386,12 +421,12 @@ static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64
         s->path_report_ms = now;
         s->path_retrains_seen = st->retrains;
     }
-    if (q->jb_empty > s->jb_empty_seen)
-        s->jb_empty_unsaid += q->jb_empty - s->jb_empty_seen;
-    if (q->jb_discard > s->jb_discard_seen)
-        s->jb_discard_unsaid += q->jb_discard - s->jb_discard_seen;
-    s->jb_empty_seen = q->jb_empty;
-    s->jb_discard_seen = q->jb_discard;
+    if (gap > s->gap_seen)
+        s->gap_unsaid += gap - s->gap_seen;
+    if (dropped > s->dropped_seen)
+        s->dropped_unsaid += dropped - s->dropped_seen;
+    s->gap_seen = gap;
+    s->dropped_seen = dropped;
     if (q->far_lost > s->far_lost_seen)
     {
         s->far_lost_unsaid += q->far_lost - s->far_lost_seen;
@@ -401,16 +436,22 @@ static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64
     }
     s->far_lost_seen = q->far_lost;
     far_text(s, q, far, sizeof(far));
+    buffer_text(s, q, buffer, sizeof(buffer));
     if (packet_skew(s, q, &skew))
         skew_text(skew, clocks, sizeof(clocks));
 
-    if ((s->jb_empty_unsaid > 0 || s->jb_discard_unsaid > 0) && now - s->jb_said_ms >= DM_JB_SAY_MS)
+    if ((s->gap_unsaid > 0 || s->dropped_unsaid > 0) && now - s->jb_said_ms >= DM_JB_SAY_MS)
     {
-        DM_INFO("session", "the jitter buffer had nothing for %u frame%s (%u ms) and threw away %u - the "
-                           "modem was handed a gap (its delay %u ms on average, %u to %u)%s",
-                s->jb_empty_unsaid, s->jb_empty_unsaid == 1 ? "" : "s", s->jb_empty_unsaid * 20 /* ms a frame */,
-                s->jb_discard_unsaid, q->jb_avg_delay_ms, q->jb_min_delay_ms, q->jb_max_delay_ms, clocks);
-        s->jb_empty_unsaid = s->jb_discard_unsaid = 0;
+        if (q->direct)
+            DM_INFO("session", "the modem was given nothing for %u ms - packets lost, or more than %d ms late - and "
+                               "%u came too late to use%s",
+                    s->gap_unsaid, DM_DIRECT_HOLD_MS, s->dropped_unsaid, clocks);
+        else
+            DM_INFO("session", "the jitter buffer had nothing for %u ms and threw away %u ms - the modem was handed "
+                               "a gap (it holds %u ms now, %u on average, %u to %u)%s",
+                    s->gap_unsaid, s->dropped_unsaid, q->jb_depth_ms, q->jb_avg_delay_ms, q->jb_min_delay_ms,
+                    q->jb_max_delay_ms, clocks);
+        s->gap_unsaid = s->dropped_unsaid = 0;
         s->jb_said_ms = now;
     }
     if (s->far_lost_unsaid > 0 && now - s->far_said_ms >= DM_JB_SAY_MS)
@@ -429,21 +470,13 @@ static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64
          * path whose delay is not changing, it should not either. */
         if (st->round_trip_ms > 0)
             snprintf(rtt, sizeof(rtt), "; round trip %d ms", st->round_trip_ms);
-        DM_INFO("session", "audio path at retrain %u: jitter buffer delay %u ms on average (%u to %u), empty "
-                           "for %u frames and %u thrown away since the connect%s%s%s",
-                st->retrains, q->jb_avg_delay_ms, q->jb_min_delay_ms, q->jb_max_delay_ms,
-                since_base(q->jb_empty, s->path_base.jb_empty),
-                since_base(q->jb_discard, s->path_base.jb_discard), rtt, clocks, far);
+        DM_INFO("session", "audio path at retrain %u: %s%s%s%s", st->retrains, buffer, rtt, clocks, far);
         s->path_retrains_seen = st->retrains;
     }
     if (now - s->path_report_ms >= DM_PATH_REPORT_MS)
     {
-        DM_INFO("session", "audio path: jitter buffer delay %u ms on average (%u to %u), empty for %u frames "
-                           "and %u thrown away since the connect, %u packets lost%s%s",
-                q->jb_avg_delay_ms, q->jb_min_delay_ms, q->jb_max_delay_ms,
-                since_base(q->jb_empty, s->path_base.jb_empty),
-                since_base(q->jb_discard, s->path_base.jb_discard), since_base(q->rx_lost, s->path_base.rx_lost),
-                clocks, far);
+        DM_INFO("session", "audio path: %s, %u packets lost%s%s", buffer,
+                since_base(q->rx_lost, s->path_base.rx_lost), clocks, far);
         s->path_report_ms = now;
     }
 }
@@ -1717,21 +1750,31 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
             long skew = 0;
             char skew_count[24] = "unknown";
 
-            /* The jitter buffer from the connect, not from call setup. */
-            unsigned jb_empty = since_base(q.jb_empty, s.path_base_ms != 0 ? s.path_base.jb_empty : 0);
-            unsigned jb_discard = since_base(q.jb_discard, s.path_base_ms != 0 ? s.path_base.jb_discard : 0);
+            /* The gaps from the connect, not from call setup. */
+            unsigned gap, dropped, gap0 = 0, dropped0 = 0;
+            char buffer[160];
+
+            path_gaps(&q, &gap, &dropped);
+            if (s.path_base_ms != 0)
+                path_gaps(&s.path_base, &gap0, &dropped0);
+            if (q.direct)
+                snprintf(buffer, sizeof(buffer), "jitter_buffer=none gap_ms=%u late_packets=%u waiting_max=%u",
+                         since_base(gap, gap0), since_base(dropped, dropped0), q.direct_waiting_max);
+            else
+                snprintf(buffer, sizeof(buffer), "jb_avg_delay_ms=%u jb_max_delay_ms=%u jb_depth_ms=%u "
+                         "jb_empty_ms=%u jb_discard_ms=%u", q.jb_avg_delay_ms, q.jb_max_delay_ms, q.jb_depth_ms,
+                         since_base(gap, gap0), since_base(dropped, dropped0));
 
             if (packet_skew(&s, &q, &skew))
                 snprintf(skew_count, sizeof(skew_count), "%+ld", skew);
 
             dm_log_event(DM_LOG_INFO, "session", "audio path",
                          "rx_packets=%u rx_lost=%u rx_discarded=%u rx_reordered=%u tx_packets=%u "
-                         "jitter_ms=%.1f jitter_max_ms=%.1f rx_level_dbm0=%.1f jb_avg_delay_ms=%u jb_max_delay_ms=%u "
-                         "jb_empty=%u jb_discard=%u far_extra_packets=%s far_reports=%u far_lost=%u far_jitter_ms=%.1f "
-                         "net_rtt_ms=%u",
+                         "jitter_ms=%.1f jitter_max_ms=%.1f rx_level_dbm0=%.1f %s far_extra_packets=%s "
+                         "far_reports=%u far_lost=%u far_jitter_ms=%.1f net_rtt_ms=%u",
                          q.rx_packets, q.rx_lost, q.rx_discarded, q.rx_reordered, q.tx_packets,
-                         q.jitter_us / 1000.0, q.jitter_max_us / 1000.0, (double) st.rx_power, q.jb_avg_delay_ms,
-                         q.jb_max_delay_ms, jb_empty, jb_discard, skew_count, q.far_reports,
+                         q.jitter_us / 1000.0, q.jitter_max_us / 1000.0, (double) st.rx_power, buffer, skew_count,
+                         q.far_reports,
                          since_base(q.far_lost, s.path_base_ms != 0 ? s.path_base.far_lost : 0),
                          q.far_jitter_us / 1000.0, q.net_rtt_us / 1000);
 
