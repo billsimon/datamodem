@@ -50,8 +50,18 @@
 #define DM_CARRIER_GRACE_V32_MS 12000
 /* V.34's retrain goes back through Phase 2 - tones, probing, two training
  * sequences sized to the round trip, and the MP exchange - which is longer
- * again. */
+ * again.
+ *
+ * And a retrain that gets through Phase 2 has heard the far end there and
+ * retraining with us, so the grace starts again from there, up to
+ * DM_CARRIER_GRACE_V34_MAX_MS since the carrier went: a line that is dead
+ * still hangs up after 15 seconds, and one that is alive gets a second try
+ * at the rest. A call through a carrier that took audio out now and then
+ * had a renegotiation fail, five seconds gone, and the retrain after it
+ * probed at eight seconds and met another gap in Phase 3; both ends hung
+ * up at fifteen, still training. */
 #define DM_CARRIER_GRACE_V34_MS 15000
+#define DM_CARRIER_GRACE_V34_MAX_MS 45000
 
 /* Staging for compressor output waiting to be packed into LAPM frames.
  * Generous: V.42bis in transparent mode can expand slightly, and a frame is
@@ -241,6 +251,7 @@ struct dm_modem
     int offered_rate;
     int tx_bit_rate;         /* what we transmit at; V.23 differs by direction */
     int carrier_grace_ms;
+    int64_t grace_from_ms;   /* when the grace started, the carrier going or since */
     int guard;
     int data_bits;
     int parity;              /* ASYNC_PARITY_* */
@@ -297,6 +308,7 @@ struct dm_modem
     int v42bis_max_string;
     bool lapm_up;
     bool lapm_lost;            /* LAPM was up and has closed: the call is ending */
+    bool releasing;            /* we sent DISC to close it: see dm_modem_release() */
     int stall_tries;           /* what we have done about the far end's silence; see check_v42_stall() */
     int stall_polls;           /* the polls unanswered when we last did something */
     int64_t stall_ms;          /* and when */
@@ -1112,8 +1124,10 @@ void dm_modem_params_from_config(const dm_config_t *cfg, bool calling, const cha
     out->v42 = cfg->v42;
     out->v42_timeout_s = cfg->v42_timeout_s;
     /* A jitter buffer at each end, so the round trip is twice one of them.
-     * This is what V.42's detection window has to be stretched by. */
-    out->path_delay_ms = cfg->jitter_buffer_ms * 2;
+     * This is what V.42's detection window has to be stretched by. With
+     * --jitter-buffer-ms 0 ours is gone, but the far end's gateway still has
+     * one, which we can only guess at: the 150 ms that is our own default. */
+    out->path_delay_ms = (cfg->jitter_buffer_ms > 0) ? cfg->jitter_buffer_ms * 2 : 150;
     out->v42bis = cfg->v42bis;
     out->v42bis_dict = cfg->v42bis_dict;
     out->v42bis_max_string = cfg->v42bis_max_string;
@@ -1743,7 +1757,10 @@ static void v42_status(void *user, int status)
              * screen as ~?~?~?. A real modem says NO CARRIER here; so do we. */
             m->carrier_lost = true;
             m->phase = DM_PHASE_DOWN;
-            if (why != NULL && strcmp(why, "the far end sent DISC") == 0)
+            if (m->releasing)
+                DM_INFO("modem", "the error-corrected link is closed%s%s (tag=%s)",
+                        (why != NULL && why[0] != '\0') ? " - " : "", (why != NULL) ? why : "", m->tag);
+            else if (why != NULL && strcmp(why, "the far end sent DISC") == 0)
                 DM_INFO("modem", "the far end closed the error-corrected link; hanging up (tag=%s)", m->tag);
             else
                 DM_ERROR("modem", "the error-corrected link was lost%s%s, so the call is no use (tag=%s)",
@@ -2069,6 +2086,7 @@ static void rx_status(void *user, int status)
         if (m->connected && !m->carrier_lost && m->carrier_down_ms == 0)
         {
             m->carrier_down_ms = dm_now_ms();
+            m->grace_from_ms = m->carrier_down_ms;
             m->phase = DM_PHASE_TRAINING;
             DM_DEBUG("modem", "carrier dropped, allowing %dms for a retrain (tag=%s)",
                      m->carrier_grace_ms, m->tag);
@@ -2247,6 +2265,19 @@ static void v34_event(void *user, dm_v34_event_t ev)
             m->carrier_lost = true;
             m->phase = DM_PHASE_DOWN;
             DM_ERROR("modem", "the V.34 connection was cleared down (tag=%s)", m->tag);
+        }
+        break;
+    case DM_V34_PROBED:
+        /* See DM_CARRIER_GRACE_V34_MS. */
+        if (m->connected && !m->carrier_lost && m->carrier_down_ms != 0)
+        {
+            int64_t now = dm_now_ms();
+
+            if (now - m->grace_from_ms > 1000)
+                DM_DEBUG("modem", "the far end is retraining with us %.1f seconds after the carrier went; allowing "
+                                  "%dms more (tag=%s)",
+                         (double) (now - m->carrier_down_ms) / 1000.0, m->carrier_grace_ms, m->tag);
+            m->grace_from_ms = now;
         }
         break;
     }
@@ -3930,7 +3961,8 @@ int dm_modem_tx(dm_modem_t *m, int16_t *samples, int max_count)
         check_v42_stall(m);
 
         if (m->carrier_down_ms != 0 && !m->carrier_lost &&
-            dm_now_ms() - m->carrier_down_ms > m->carrier_grace_ms)
+            (dm_now_ms() - m->grace_from_ms > m->carrier_grace_ms ||
+             dm_now_ms() - m->carrier_down_ms > DM_CARRIER_GRACE_V34_MAX_MS))
         {
             m->carrier_lost = true;
             m->phase = DM_PHASE_DOWN;
@@ -4255,6 +4287,35 @@ bool dm_modem_connected(dm_modem_t *m)
     c = m->connected && !m->carrier_lost;
     pthread_mutex_unlock(&m->lock);
     return c;
+}
+
+int dm_modem_release(dm_modem_t *m)
+{
+    int wait_ms = 0;
+
+    pthread_mutex_lock(&m->lock);
+    if (m->v42 != NULL && m->lapm_up && !m->carrier_lost && m->carrier_down_ms == 0 && !m->releasing)
+    {
+        /* The DISC goes after whatever LAPM still has queued, and its UA
+         * comes back across the round trip: a second for that and for the
+         * far end to answer, which is V.42's own shortest T401. */
+        m->releasing = true;
+        v42_stop(m->v42);
+        wait_ms = v42_round_trip_ms(m) + 1000;
+        DM_INFO("modem", "closing the error-corrected link before hanging up (tag=%s)", m->tag);
+    }
+    pthread_mutex_unlock(&m->lock);
+    return wait_ms;
+}
+
+bool dm_modem_released(dm_modem_t *m)
+{
+    bool done;
+
+    pthread_mutex_lock(&m->lock);
+    done = !m->lapm_up || m->carrier_lost;
+    pthread_mutex_unlock(&m->lock);
+    return done;
 }
 
 void dm_modem_far_loss(dm_modem_t *m)

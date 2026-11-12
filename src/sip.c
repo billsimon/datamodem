@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <pjmedia/alaw_ulaw.h>
 #include <pjsua-lib/pjsua.h>
 
 #ifdef __APPLE__
@@ -26,13 +27,18 @@
 #define DM_HANGUP_GRACE_MS 3000
 
 /* A pjmedia port that is a modem: the conference bridge pulls 20 ms of modem
- * output from get_frame() and pushes 20 ms of the far end into put_frame(). */
+ * output from get_frame() and pushes 20 ms of the far end into put_frame() -
+ * or, with no jitter buffer, get_frame() hands the modem whatever has come
+ * from the far end since the last one (see the transport adapter below), and
+ * the bridge gives put_frame() nothing. */
 typedef struct
 {
     pjmedia_port base;
     dm_modem_t *modem;
     unsigned samples_per_frame;
     pj_timestamp ts;
+    dm_rtp_rx_t *direct;          /* NULL with a jitter buffer */
+    pthread_mutex_t *direct_lock;
 } dm_modem_port_t;
 
 typedef struct
@@ -57,6 +63,13 @@ typedef struct
     /* RTP arrival watch: the packet counter and when it last moved. */
     unsigned last_rx_pkts;
     int64_t last_rx_change_ms;
+
+    /* With no jitter buffer, what the far end has sent and the modem not yet
+     * had: filled on pjmedia's network thread, under g.lock and then this
+     * lock, and emptied on the bridge's clock, under this lock alone. */
+    bool direct;
+    pthread_mutex_t direct_lock;
+    dm_rtp_rx_t rx;
 } dm_call_t;
 
 /* Threads. pjsua calls the on_* callbacks on its own worker threads, while
@@ -187,6 +200,16 @@ static void log_pj_warning(const char *what, pj_status_t status)
 
 /* ------------------------------------------------------------ media port  */
 
+static void direct_to_modem(void *user, const int16_t *samples, int count)
+{
+    dm_modem_t *modem = user;
+
+    if (samples != NULL)
+        dm_modem_rx(modem, samples, count);
+    else
+        dm_modem_rx_missing(modem, count);
+}
+
 static pj_status_t modem_port_get_frame(pjmedia_port *port, pjmedia_frame *frame)
 {
     dm_modem_port_t *p = (dm_modem_port_t *) port;
@@ -194,6 +217,12 @@ static pj_status_t modem_port_get_frame(pjmedia_port *port, pjmedia_frame *frame
     unsigned spf = p->samples_per_frame;
     int n;
 
+    if (p->direct != NULL)
+    {
+        pthread_mutex_lock(p->direct_lock);
+        dm_rtp_rx_drain(p->direct, (int) spf, DM_CLOCK_RATE * DM_DIRECT_HOLD_MS / 1000, &direct_to_modem, p->modem);
+        pthread_mutex_unlock(p->direct_lock);
+    }
     n = dm_modem_tx(p->modem, buf, (int) spf);
     if (n < (int) spf)
         memset(buf + n, 0, (spf - (unsigned) n) * sizeof(int16_t));
@@ -209,6 +238,8 @@ static pj_status_t modem_port_put_frame(pjmedia_port *port, pjmedia_frame *frame
 {
     dm_modem_port_t *p = (dm_modem_port_t *) port;
 
+    if (p->direct != NULL)
+        return PJ_SUCCESS; /* the modem has its audio from get_frame() */
     if (frame->type == PJMEDIA_FRAME_TYPE_AUDIO && frame->buf != NULL && frame->size > 0)
         dm_modem_rx(p->modem, (const int16_t *) frame->buf, (int) (frame->size / sizeof(int16_t)));
     else
@@ -266,10 +297,14 @@ static dm_call_t *call_create(dm_modem_t *modem, bool inbound)
     c->inbound = inbound;
     c->started_ms = dm_now_ms();
     c->last_rx_change_ms = c->started_ms;
+    c->direct = (g.cfg.jitter_buffer_ms == 0);
+    pthread_mutex_init(&c->direct_lock, NULL);
+    dm_rtp_rx_reset(&c->rx);
 
     c->pool = pjsua_pool_create("dmcall", 1024, 1024);
     if (c->pool == NULL)
     {
+        pthread_mutex_destroy(&c->direct_lock);
         free(c);
         return NULL;
     }
@@ -278,8 +313,14 @@ static dm_call_t *call_create(dm_modem_t *modem, bool inbound)
     if (c->port == NULL)
     {
         pj_pool_release(c->pool);
+        pthread_mutex_destroy(&c->direct_lock);
         free(c);
         return NULL;
+    }
+    if (c->direct)
+    {
+        c->port->direct = &c->rx;
+        c->port->direct_lock = &c->direct_lock;
     }
 
     status = pjsua_conf_add_port(c->pool, &c->port->base, &c->slot);
@@ -287,6 +328,7 @@ static dm_call_t *call_create(dm_modem_t *modem, bool inbound)
     {
         log_pj_error("pjsua_conf_add_port", status);
         pj_pool_release(c->pool);
+        pthread_mutex_destroy(&c->direct_lock);
         free(c);
         return NULL;
     }
@@ -308,6 +350,7 @@ static void call_destroy(dm_call_t *c)
         pjsua_conf_remove_port(c->slot);
     if (c->pool != NULL)
         pj_pool_release(c->pool);
+    pthread_mutex_destroy(&c->direct_lock);
     free(c);
 }
 
@@ -517,6 +560,253 @@ void dm_sip_speaker_off(void)
     DM_INFO("sip", "speaker off");
 }
 
+/* ------------------------------------------------------ transport adapter */
+
+/* --jitter-buffer-ms 0: each RTP packet from the far end goes to the modem's
+ * queue (dm_rtp_rx_t) as it arrives, on its way to the stream - which still
+ * keeps the statistics, sends the RTCP and feeds the speaker, but no longer
+ * the modem. A pjmedia transport adapter is the one place pjsua lets an
+ * application see the packets before the stream's jitter buffer does; the
+ * rest of it passes everything through to the UDP transport beneath. */
+typedef struct
+{
+    pjmedia_transport base;
+    pjmedia_transport *slave;
+    bool del_slave;
+    pj_pool_t *pool;
+    pjsua_call_id call_id;
+    void *stream_user_data;
+    void (*stream_rtp_cb)(void *user_data, void *pkt, pj_ssize_t size);
+    void (*stream_rtp_cb2)(pjmedia_tp_cb_param *param);
+    void (*stream_rtcp_cb)(void *user_data, void *pkt, pj_ssize_t size);
+} dm_tap_t;
+
+static uint32_t be32(const uint8_t *b)
+{
+    return ((uint32_t) b[0] << 24) | ((uint32_t) b[1] << 16) | ((uint32_t) b[2] << 8) | b[3];
+}
+
+/* One RTP packet (RFC 3550, 5.1): G.711 into the call's queue. Anything else
+ * - comfort noise, telephone-events - has no samples, and is skipped like a
+ * packet lost. */
+static void tap_packet(pjsua_call_id call_id, const void *pkt, pj_ssize_t size)
+{
+    const uint8_t *b = pkt;
+    int16_t s[DM_RTP_RX_MAX_SAMPLES];
+    size_t hl, n;
+    unsigned pt;
+    dm_call_t *c;
+
+    if (size < 12 || (b[0] >> 6) != 2)
+        return;
+    hl = 12 + 4 * (size_t) (b[0] & 0x0f);
+    if ((b[0] & 0x10) && (size_t) size >= hl + 4)
+        hl += 4 + 4 * (((size_t) b[hl + 2] << 8) | b[hl + 3]);
+    if ((size_t) size <= hl)
+        return;
+    n = (size_t) size - hl;
+    if (b[0] & 0x20)
+    {
+        if (b[size - 1] >= n)
+            return;
+        n -= b[size - 1];
+    }
+    pt = b[1] & 0x7f;
+    if ((pt != 0 && pt != 8) || n > DM_RTP_RX_MAX_SAMPLES)
+        return;
+    for (size_t i = 0; i < n; i++)
+        s[i] = (int16_t) (pt == 0 ? pjmedia_ulaw2linear(b[hl + i]) : pjmedia_alaw2linear(b[hl + i]));
+
+    c = call_lock(call_id);
+    if (c == NULL)
+        return;
+    if (c->direct)
+    {
+        pthread_mutex_lock(&c->direct_lock);
+        dm_rtp_rx_push(&c->rx, be32(b + 8), (uint16_t) ((b[2] << 8) | b[3]), be32(b + 4), s, (int) n);
+        pthread_mutex_unlock(&c->direct_lock);
+    }
+    call_unlock();
+}
+
+static void tap_rtp_cb2(pjmedia_tp_cb_param *param)
+{
+    dm_tap_t *t = param->user_data;
+
+    tap_packet(t->call_id, param->pkt, param->size);
+    if (t->stream_rtp_cb2 != NULL)
+    {
+        pjmedia_tp_cb_param p = *param;
+
+        p.user_data = t->stream_user_data;
+        t->stream_rtp_cb2(&p);
+    }
+    else if (t->stream_rtp_cb != NULL)
+    {
+        t->stream_rtp_cb(t->stream_user_data, param->pkt, param->size);
+    }
+}
+
+static void tap_rtcp_cb(void *user_data, void *pkt, pj_ssize_t size)
+{
+    dm_tap_t *t = user_data;
+
+    if (t->stream_rtcp_cb != NULL)
+        t->stream_rtcp_cb(t->stream_user_data, pkt, size);
+}
+
+static pj_status_t tap_get_info(pjmedia_transport *tp, pjmedia_transport_info *info)
+{
+    return pjmedia_transport_get_info(((dm_tap_t *) tp)->slave, info);
+}
+
+static pj_status_t tap_attach2(pjmedia_transport *tp, pjmedia_transport_attach_param *prm)
+{
+    dm_tap_t *t = (dm_tap_t *) tp;
+    pj_status_t status;
+
+    t->stream_user_data = prm->user_data;
+    t->stream_rtp_cb = prm->rtp_cb;
+    t->stream_rtp_cb2 = prm->rtp_cb2;
+    t->stream_rtcp_cb = prm->rtcp_cb;
+    prm->user_data = t;
+    prm->rtp_cb = NULL;
+    prm->rtp_cb2 = &tap_rtp_cb2;
+    prm->rtcp_cb = &tap_rtcp_cb;
+    status = pjmedia_transport_attach2(t->slave, prm);
+    if (status != PJ_SUCCESS)
+    {
+        t->stream_user_data = NULL;
+        t->stream_rtp_cb = NULL;
+        t->stream_rtp_cb2 = NULL;
+        t->stream_rtcp_cb = NULL;
+    }
+    return status;
+}
+
+static void tap_detach(pjmedia_transport *tp, void *user_data)
+{
+    dm_tap_t *t = (dm_tap_t *) tp;
+
+    (void) user_data;
+    if (t->stream_user_data != NULL)
+    {
+        pjmedia_transport_detach(t->slave, t);
+        t->stream_user_data = NULL;
+        t->stream_rtp_cb = NULL;
+        t->stream_rtp_cb2 = NULL;
+        t->stream_rtcp_cb = NULL;
+    }
+}
+
+static pj_status_t tap_send_rtp(pjmedia_transport *tp, const void *pkt, pj_size_t size)
+{
+    return pjmedia_transport_send_rtp(((dm_tap_t *) tp)->slave, pkt, size);
+}
+
+static pj_status_t tap_send_rtcp(pjmedia_transport *tp, const void *pkt, pj_size_t size)
+{
+    return pjmedia_transport_send_rtcp(((dm_tap_t *) tp)->slave, pkt, size);
+}
+
+static pj_status_t tap_send_rtcp2(pjmedia_transport *tp, const pj_sockaddr_t *addr, unsigned addr_len,
+                                  const void *pkt, pj_size_t size)
+{
+    return pjmedia_transport_send_rtcp2(((dm_tap_t *) tp)->slave, addr, addr_len, pkt, size);
+}
+
+static pj_status_t tap_media_create(pjmedia_transport *tp, pj_pool_t *sdp_pool, unsigned options,
+                                    const pjmedia_sdp_session *rem_sdp, unsigned media_index)
+{
+    return pjmedia_transport_media_create(((dm_tap_t *) tp)->slave, sdp_pool, options, rem_sdp, media_index);
+}
+
+static pj_status_t tap_encode_sdp(pjmedia_transport *tp, pj_pool_t *sdp_pool, pjmedia_sdp_session *local_sdp,
+                                  const pjmedia_sdp_session *rem_sdp, unsigned media_index)
+{
+    return pjmedia_transport_encode_sdp(((dm_tap_t *) tp)->slave, sdp_pool, local_sdp, rem_sdp, media_index);
+}
+
+static pj_status_t tap_media_start(pjmedia_transport *tp, pj_pool_t *pool, const pjmedia_sdp_session *local_sdp,
+                                   const pjmedia_sdp_session *rem_sdp, unsigned media_index)
+{
+    return pjmedia_transport_media_start(((dm_tap_t *) tp)->slave, pool, local_sdp, rem_sdp, media_index);
+}
+
+static pj_status_t tap_media_stop(pjmedia_transport *tp)
+{
+    return pjmedia_transport_media_stop(((dm_tap_t *) tp)->slave);
+}
+
+static pj_status_t tap_simulate_lost(pjmedia_transport *tp, pjmedia_dir dir, unsigned pct_lost)
+{
+    return pjmedia_transport_simulate_lost(((dm_tap_t *) tp)->slave, dir, pct_lost);
+}
+
+/* The slave's group lock decides when the adapter goes, as pjmedia's own
+ * adapters do: a packet callback may still be running when it is closed. */
+static void tap_on_destroy(void *arg)
+{
+    pj_pool_release(((dm_tap_t *) arg)->pool);
+}
+
+static pj_status_t tap_destroy(pjmedia_transport *tp)
+{
+    dm_tap_t *t = (dm_tap_t *) tp;
+
+    if (t->del_slave)
+        pjmedia_transport_close(t->slave);
+    if (t->base.grp_lock != NULL)
+        pj_grp_lock_dec_ref(t->base.grp_lock);
+    else
+        tap_on_destroy(t);
+    return PJ_SUCCESS;
+}
+
+static pjmedia_transport_op tap_op = {
+    .get_info = &tap_get_info,
+    .attach = NULL,
+    .detach = &tap_detach,
+    .send_rtp = &tap_send_rtp,
+    .send_rtcp = &tap_send_rtcp,
+    .send_rtcp2 = &tap_send_rtcp2,
+    .media_create = &tap_media_create,
+    .encode_sdp = &tap_encode_sdp,
+    .media_start = &tap_media_start,
+    .media_stop = &tap_media_stop,
+    .simulate_lost = &tap_simulate_lost,
+    .destroy = &tap_destroy,
+    .attach2 = &tap_attach2,
+};
+
+static pjmedia_transport *on_create_media_transport(pjsua_call_id call_id, unsigned media_idx,
+                                                    pjmedia_transport *base_tp, unsigned flags)
+{
+    pj_pool_t *pool;
+    dm_tap_t *t;
+
+    (void) media_idx;
+    pool = pjsua_pool_create("dmtap", 512, 512);
+    if (pool == NULL)
+        return base_tp;
+    t = PJ_POOL_ZALLOC_T(pool, dm_tap_t);
+    t->pool = pool;
+    t->slave = base_tp;
+    t->del_slave = (flags & PJSUA_MED_TP_CLOSE_MEMBER) != 0;
+    t->call_id = call_id;
+    pj_ansi_strxcpy(t->base.name, pool->obj_name, sizeof(t->base.name));
+    t->base.type = PJMEDIA_TRANSPORT_TYPE_USER;
+    t->base.op = &tap_op;
+    if (base_tp->grp_lock != NULL)
+    {
+        t->base.grp_lock = base_tp->grp_lock;
+        pj_grp_lock_add_ref(t->base.grp_lock);
+        pj_grp_lock_add_handler(t->base.grp_lock, pool, t, &tap_on_destroy);
+    }
+    DM_DEBUG("sip", "call %d: no jitter buffer; the modem hears each packet as it arrives", (int) call_id);
+    return &t->base;
+}
+
 /* -------------------------------------------------------------- callbacks */
 
 /* Let the modem start only once the call is genuinely up.
@@ -582,6 +872,7 @@ static void on_call_media_state(pjsua_call_id call_id)
     pjsua_call_info ci;
     pjsua_conf_port_id slot;
     pjsua_conf_port_id speaker_slot;
+    bool direct;
 
     if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS)
         return;
@@ -594,11 +885,15 @@ static void on_call_media_state(pjsua_call_id call_id)
         if (c == NULL)
             return;
         slot = c->slot;
+        direct = c->direct;
         speaker_slot = g.speaker_slot;
         call_unlock();
 
-        /* Not under the lock: see the comment on g. */
-        pjsua_conf_connect(ci.conf_slot, slot);
+        /* Not under the lock: see the comment on g. With no jitter buffer
+         * the modem hears the far end from the transport adapter, not the
+         * stream. */
+        if (!direct)
+            pjsua_conf_connect(ci.conf_slot, slot);
         pjsua_conf_connect(slot, ci.conf_slot);
         /* A re-INVITE can give the call a new slot while the speaker plays. */
         if (speaker_slot != PJSUA_INVALID_ID)
@@ -1000,6 +1295,8 @@ int dm_sip_start(const dm_config_t *cfg)
     ua_cfg.cb.on_incoming_call = &on_incoming_call;
     ua_cfg.cb.on_reg_state2 = &on_reg_state2;
     ua_cfg.cb.on_call_sdp_created = &on_call_sdp_created;
+    if (cfg->jitter_buffer_ms == 0)
+        ua_cfg.cb.on_create_media_transport = &on_create_media_transport;
     ua_cfg.user_agent = pjs("datamodem");
 
     if (cfg->stun_server[0] != '\0')
@@ -1029,13 +1326,18 @@ int dm_sip_start(const dm_config_t *cfg)
                                * V.22bis in particular relies on the echo of
                                * its own band being left alone */
     med_cfg.quality = 10;     /* no resampling artefacts */
-    med_cfg.jb_init = cfg->jitter_buffer_ms;
-    med_cfg.jb_min_pre = cfg->jitter_buffer_ms;
-    med_cfg.jb_max_pre = cfg->jitter_buffer_ms;
-    med_cfg.jb_max = cfg->jitter_buffer_ms * 2;
     /* A jitter buffer that drops or stretches frames to chase latency would
      * corrupt the sample stream the demodulator is tracking; keep every
-     * sample, and let the fixed delay be the fixed delay. */
+     * sample, and let the fixed delay be the fixed delay. With
+     * --jitter-buffer-ms 0 the modem does without one (dm_rtp_rx_t), and
+     * the stream's, at pjsua's defaults, feeds only the speaker. */
+    if (cfg->jitter_buffer_ms > 0)
+    {
+        med_cfg.jb_init = cfg->jitter_buffer_ms;
+        med_cfg.jb_min_pre = cfg->jitter_buffer_ms;
+        med_cfg.jb_max_pre = cfg->jitter_buffer_ms;
+        med_cfg.jb_max = cfg->jitter_buffer_ms * 2;
+    }
     med_cfg.jb_discard_algo = PJMEDIA_JB_DISCARD_NONE;
     med_cfg.snd_auto_close_time = -1;
 
@@ -1544,18 +1846,38 @@ bool dm_sip_link_quality(dm_link_quality_t *q)
     q->tx_packets = stat.rtcp.tx.pkt;
     q->jitter_us = (unsigned) stat.rtcp.rx.jitter.mean;
     q->jitter_max_us = (unsigned) stat.rtcp.rx.jitter.max;
-    /* Not stat.jbuf.size, which counts frames that are not delay: on a
-     * loopback call with 150 ms in each buffer and a 300 ms round trip it
-     * read 280 to 320 ms. */
+    /* The delays are over the stream so far; what it holds now is
+     * stat.jbuf.size, in the codec's frames - G.711's are 10 ms, which is
+     * why, taken for 20 ms packets, it once read 280 to 320 ms on a loopback
+     * call with 150 ms in each buffer. */
     q->jb_avg_delay_ms = stat.jbuf.avg_delay;
     q->jb_min_delay_ms = stat.jbuf.min_delay;
     q->jb_max_delay_ms = stat.jbuf.max_delay;
     q->jb_empty = stat.jbuf.empty;
     q->jb_discard = stat.jbuf.discard;
+    /* frame_size is in bytes of G.711, 8 a millisecond. */
+    q->jb_frame_ms = stat.jbuf.frame_size / 8;
+    q->jb_depth_ms = stat.jbuf.size * stat.jbuf.frame_size / 8;
     q->far_reports = stat.rtcp.tx.update_cnt;
     q->far_lost = stat.rtcp.tx.loss;
     q->far_jitter_us = (unsigned) stat.rtcp.tx.jitter.last;
     q->net_rtt_us = (unsigned) stat.rtcp.rtt.last;
+
+    pthread_mutex_lock(&g.lock);
+    if (g.active != NULL && g.active->direct)
+    {
+        dm_call_t *c = g.active;
+
+        pthread_mutex_lock(&c->direct_lock);
+        q->direct = true;
+        q->direct_late = c->rx.late;
+        q->direct_filled_ms = (unsigned) (c->rx.filled * 1000 / DM_CLOCK_RATE);
+        q->direct_waiting_max = (unsigned) c->rx.max_queued;
+        q->direct_ts_jumps = c->rx.ts_jumps;
+        q->direct_ts_skipped_ms = (unsigned) (c->rx.ts_skipped * 1000 / DM_CLOCK_RATE);
+        pthread_mutex_unlock(&c->direct_lock);
+    }
+    pthread_mutex_unlock(&g.lock);
     return true;
 }
 

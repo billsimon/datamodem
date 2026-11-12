@@ -538,7 +538,10 @@ has to leave the audio alone.
 - **A fixed jitter buffer** (`--jitter-buffer-ms`, default 150), which never
   drops or stretches a frame. Bigger costs round-trip delay an interactive
   session can feel; smaller starves the receiver. 60 is usually fine on a
-  LAN.
+  LAN. `--jitter-buffer-ms 0` does without one (experimental): the modem
+  has each packet as it arrives, placed by its RTP timestamp, so the buffer's
+  delay is gone and cannot creep up through a long call when the far end
+  sends more packets than our clock asks for.
 - **The RTP port range.** Media stays inside `[--rtp-port, --rtp-port +
   --rtp-port-range]`. Open exactly that range on the firewall and the SBC; a
   narrower allowance shows up as a call that connects and then never trains.

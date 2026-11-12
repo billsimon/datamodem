@@ -186,6 +186,16 @@ void dm_modem_status(dm_modem_t *m, dm_modem_status_t *out);
  * from any thread. */
 void dm_modem_far_loss(dm_modem_t *m);
 
+/* We are hanging up: with LAPM up, close it with DISC first, as a modem
+ * does on ATH, so that the far end knows the call is over at once rather
+ * than when its carrier has been gone long enough - a SIP BYE that never
+ * reached a caller left it listening to silence for fifteen seconds.
+ * dm_modem_released() is true once the link is closed or there was none to
+ * close; the caller waits for that, up to dm_modem_release()'s return value
+ * in ms, before clearing the call. 0 when there is nothing to wait for. */
+int dm_modem_release(dm_modem_t *m);
+bool dm_modem_released(dm_modem_t *m);
+
 /* Carrier up. Not the same as ready to carry data - see dm_modem_data_ready. */
 bool dm_modem_connected(dm_modem_t *m);
 

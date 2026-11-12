@@ -402,6 +402,7 @@ struct dm_v34
     dm_rate_memory_t rx_failed, tx_failed;
     dm_path_watch_t path;     /* whether the retrain under way is the path's doing */
     dm_loss_watch_t loss;     /* whether the far end's last retrain was a lost packet's doing */
+    bool loss_rn;             /* ... or its last asking for less */
     long long rx_since, tx_since; /* line time each direction's rate started */
     int trained_rx, trained_tx;   /* what the last start-up or retrain settled on */
     int rn_prev_tx, rn_prev_rx;   /* the rates as a renegotiation started */
@@ -2254,6 +2255,34 @@ static void heard_e(dm_v34_t *v)
     q->a2 = 0.0005f;
 }
 
+/* Which end set each direction's rate in the MPs just exchanged, for the
+ * log: what the far end's MP would take, what ours offered, and why ours
+ * offered less, if a failure is holding a rate back. A far end that asks to
+ * change rate every 30 seconds and gets the rate it had is usually trying
+ * to come back up past a rate our memory is holding it below. */
+static void mp_text(dm_v34_t *v, char *out, size_t len)
+{
+    v34_mp_t mine;
+    int far_out, far_in, my_out, my_in, lim_out, lim_in;
+    size_t k;
+
+    v34_mp_unpack(v->mpbits, v->mp_len, &mine);
+    far_out = 2400 * (v->calling ? v->mp_far.rate_c_to_a : v->mp_far.rate_a_to_c);
+    far_in = 2400 * (v->calling ? v->mp_far.rate_a_to_c : v->mp_far.rate_c_to_a);
+    my_out = 2400 * (v->calling ? mine.rate_c_to_a : mine.rate_a_to_c);
+    my_in = 2400 * (v->calling ? mine.rate_a_to_c : mine.rate_c_to_a);
+    lim_out = dm_rate_memory_limit(&v->tx_failed, v->n);
+    lim_in = dm_rate_memory_limit(&v->rx_failed, v->n);
+    k = (size_t) snprintf(out, len, "; out: the far end would take %d, we offered %d; in: it offered %d, we would "
+                                    "take %d", far_out, my_out, far_in, my_in);
+    if (lim_out > 0 && k < len)
+        k += (size_t) snprintf(out + k, len - k, "; holding below %d out for %.1f more minutes", lim_out,
+                               (double) (v->tx_failed.until - v->n) / (8000.0 * 60.0));
+    if (lim_in > 0 && k < len)
+        snprintf(out + k, len - k, "; holding below %d in for %.1f more minutes", lim_in,
+                 (double) (v->rx_failed.until - v->n) / (8000.0 * 60.0));
+}
+
 static void go_data(dm_v34_t *v)
 {
     bool retrain = v->trained_once;
@@ -2265,23 +2294,50 @@ static void go_data(dm_v34_t *v)
     if (v->renegotiating)
     {
         int lim = rate_ceiling(&v->tx_failed, v->n);
+        char why[256];
 
+        mp_text(v, why, sizeof(why));
         v->renegotiating = false;
         v->renegotiations++;
-        DM_INFO("v34", "rates changed without a retrain: %d bit/s out, %d in, SNR %.1f dB (tag=%s)", v->rate_tx,
-                v->rate_rx, v->snr_db, v->tag);
+        DM_INFO("v34", "rates changed without a retrain: %d bit/s out, %d in, SNR %.1f dB%s (tag=%s)", v->rate_tx,
+                v->rate_rx, v->snr_db, why, v->tag);
         /* Less of our transmitter, and not because our own MP said so: the
          * far end's reception would not bear what it had. */
         v->tx_step = 0;
         v->up_since = 0;
+        /* Asking for more and getting nothing waits twice as long to ask
+         * again. A renegotiation of the far end's that leaves what we
+         * receive as it was says nothing about that, and leaves the wait
+         * alone: a far end renegotiating every 30 seconds for its own
+         * reasons, and only ever offering 28800, otherwise had us asking
+         * it for 31200 every 30 seconds too, for nothing each time. */
         if (v->up_from > 0 && v->rate_rx <= v->up_from && v->up_backoff > 0.0)
+        {
             v->up_backoff = (v->up_backoff * 2.0 > 600.0) ? 600.0 : v->up_backoff * 2.0;
-        else
+            v->up_next = v->n + (long long) (v->up_backoff * 8000.0);
+        }
+        else if (v->up_from > 0 || v->rate_rx != v->rn_prev_rx || v->up_backoff <= 0.0)
+        {
             v->up_backoff = 30.0;
-        v->up_next = v->n + (long long) (v->up_backoff * 8000.0);
+            v->up_next = v->n + (long long) (v->up_backoff * 8000.0);
+        }
         v->up_from = 0;
         if (v->rate_tx < v->rn_prev_tx && (lim == 0 || lim >= v->rn_prev_tx))
+        {
+            /* As with a retrain: a packet of ours lost on the way is a gap
+             * in what it heard, which no rate would have held through. Two
+             * of a production call's three requests for less came with a
+             * report of a lost packet, and were held against 31200 for 20
+             * minutes and 26400 for 80. */
+            dm_loss_watch_arm(&v->loss, v->n, &v->tx_failed);
+            v->loss_rn = true;
             rate_failed(v, false, v->rn_prev_tx, v->tx_since, true, "the far end asked for less");
+            if (dm_loss_watch_check(&v->loss, v->n, &v->tx_failed))
+                DM_INFO("v34", "the far end has just reported losing some of our packets, which is what it asked "
+                               "for less over and no rate would have held through; not holding it against the rate "
+                               "(tag=%s)",
+                        v->tag);
+        }
         if (v->rate_tx != v->rn_prev_tx)
             v->tx_since = v->n;
         if (v->rate_rx != v->rn_prev_rx)
@@ -2467,6 +2523,7 @@ static void enter_phase3(dm_v34_t *v)
                    "round trip %.0f ms (tag=%s)",
             V34_SR_NAME[v->sr_tx], v34_carrier(v->sr_tx, v->high_tx), v->pe_tx, V34_SR_NAME[v->sr_rx],
             v34_carrier(v->sr_rx, v->high_rx), v->rtd / 8.0, v->tag);
+    emit(v, DM_V34_PROBED);
     v34_p2rx_init(&v->tonerx, v->calling);
     v->tonerx.floor = 4.0f * v->pmin;
     qrx_start(v, v->sr_rx, v->high_rx);
@@ -3261,6 +3318,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             {
                 dm_path_watch_arm(&v->path, (v->rtd >= 0) ? v->rtd / 8.0 : -1.0, &v->rx_failed, &v->tx_failed);
                 dm_loss_watch_arm(&v->loss, n, &v->tx_failed);
+                v->loss_rn = false;
                 rate_failed(v, false, v->rate_tx, v->tx_since, v->poor_since == 0 || n - v->poor_since < MS(300),
                             "the far end retrained");
                 if (dm_loss_watch_check(&v->loss, n, &v->tx_failed))
@@ -3666,10 +3724,11 @@ void dm_v34_far_loss(dm_v34_t *v)
     long long ago = v->n - v->loss.retrain_at;
 
     if (dm_loss_watch_loss(&v->loss, v->n, &v->tx_failed))
-        DM_INFO("v34", "the far end reports losing some of our packets around its retrain %.1f seconds ago, which "
-                       "is what it retrained over and no rate would have held through; not holding it against the "
+        DM_INFO("v34", "the far end reports losing some of our packets around its %s %.1f seconds ago, which "
+                       "is what it %s over and no rate would have held through; not holding it against the "
                        "rate (tag=%s)",
-                ago / 8000.0, v->tag);
+                v->loss_rn ? "asking for less" : "retrain", ago / 8000.0, v->loss_rn ? "asked for less" : "retrained",
+                v->tag);
 }
 
 bool dm_v34_renegotiate(dm_v34_t *v, int rx_rate)

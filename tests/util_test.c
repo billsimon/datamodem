@@ -1,5 +1,5 @@
 /* Unit tests for the small shared pieces in util.c: caller ID parsing, rate
- * memory and the retrain count. */
+ * memory, the retrain count and RTP arrival. */
 #include "datamodem/util.h"
 
 #include <stdio.h>
@@ -16,6 +16,74 @@ static void check_party(const char *in, const char *want_name, const char *want_
     {
         printf("FAIL %-55s name=[%s] want [%s], user=[%s] want [%s]\n", in ? in : "(null)", name,
                want_name, user, want_user);
+        failures++;
+    }
+}
+
+/* RTP arrival: what the modem is given, sample by sample - the sequence
+ * number of the packet each came from, which the test packets carry as
+ * their samples, or -1 for nothing. */
+#define RX_MAX 16000
+static int rx_got[RX_MAX];
+static int rx_n;
+
+static void rx_out(void *user, const int16_t *s, int n)
+{
+    (void) user;
+    for (int i = 0; i < n && rx_n < RX_MAX; i++)
+        rx_got[rx_n++] = s ? s[i] : -1;
+}
+
+static void rx_push_ts(dm_rtp_rx_t *q, uint16_t seq, uint32_t ts)
+{
+    int16_t s[160];
+
+    for (int i = 0; i < 160; i++)
+        s[i] = (int16_t) (seq & 0x7fff);
+    dm_rtp_rx_push(q, 1234, seq, ts, s, 160);
+}
+
+static void rx_push(dm_rtp_rx_t *q, uint16_t seq)
+{
+    rx_push_ts(q, seq, 1000u + 160u * seq);
+}
+
+/* want_n samples, want_none of them nothing, and the packets in order with
+ * none repeated: each packet's samples together, each after the last. */
+static void rx_check(const char *what, int want_n, int want_none)
+{
+    int none = 0, last = -1, run = 0;
+
+    for (int i = 0; i < rx_n; i++)
+    {
+        if (rx_got[i] < 0)
+        {
+            none++;
+            continue;
+        }
+        if (rx_got[i] != last)
+        {
+            int ahead = (rx_got[i] - last) & 0x7fff; /* the samples carry 15 bits of it */
+
+            if (last >= 0 && (ahead == 0 || ahead >= 0x4000))
+            {
+                printf("FAIL rtp rx %s: packet %d after %d\n", what, rx_got[i], last);
+                failures++;
+                return;
+            }
+            last = rx_got[i];
+            run = 0;
+        }
+        if (++run > 160)
+        {
+            printf("FAIL rtp rx %s: packet %d given twice\n", what, last);
+            failures++;
+            return;
+        }
+    }
+    if (rx_n != want_n || none != want_none)
+    {
+        printf("FAIL rtp rx %s: %d samples (%d of nothing), want %d (%d)\n", what, rx_n, none, want_n, want_none);
         failures++;
     }
 }
@@ -308,6 +376,173 @@ int main(void)
             dm_retrain_count_update(&c, 2, 1200, 0, true, 3000) != 1)
         {
             printf("FAIL retrain count: V.22bis, %u strikes\n", c.strikes);
+            failures++;
+        }
+    }
+
+    {
+        static dm_rtp_rx_t q;
+        const uint16_t s0 = 65530; /* across the wrap */
+
+        /* In order, a packet a tick: each goes as it comes. */
+        dm_rtp_rx_reset(&q);
+        rx_n = 0;
+        for (int k = 0; k < 10; k++)
+        {
+            rx_push(&q, (uint16_t) (s0 + k));
+            dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        }
+        rx_check("in order", 1600, 0);
+
+        /* Two at once - the far end's clock ahead of ours, or a packet more
+         * on the path - both go at once, and nothing is kept back. */
+        dm_rtp_rx_reset(&q);
+        rx_n = 0;
+        rx_push(&q, s0);
+        rx_push(&q, (uint16_t) (s0 + 1));
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        rx_check("two at once", 320, 0);
+
+        /* Out of order: the third waits for the second. */
+        dm_rtp_rx_reset(&q);
+        rx_n = 0;
+        rx_push(&q, s0);
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        rx_push(&q, (uint16_t) (s0 + 2));
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        rx_push(&q, (uint16_t) (s0 + 1));
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        rx_check("out of order", 480, 0);
+
+        /* Lost: after the hold, nothing in its place, and then what came
+         * after it. */
+        dm_rtp_rx_reset(&q);
+        rx_n = 0;
+        rx_push(&q, s0);
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        for (int k = 2; k < 6; k++)
+        {
+            rx_push(&q, (uint16_t) (s0 + k));
+            dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        }
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        rx_check("lost", 960, 160);
+        if (q.lost != 1 || q.queued != 0)
+        {
+            printf("FAIL rtp rx lost: %u lost, %d waiting\n", q.lost, q.queued);
+            failures++;
+        }
+
+        /* Nothing at all for a while, then everything at once, late: the
+         * modem's clock runs on through it, and what comes late is skipped
+         * as far as the modem was given nothing for it. Nothing after it is
+         * delayed. */
+        dm_rtp_rx_reset(&q);
+        rx_n = 0;
+        rx_push(&q, s0);
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        for (int k = 0; k < 5; k++)
+            dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        for (int k = 1; k < 7; k++)
+            rx_push(&q, (uint16_t) (s0 + k));
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        rx_check("stall", 7 * 160, 3 * 160);
+        if (q.late != 3 || q.queued != 0 || q.owed != 0)
+        {
+            printf("FAIL rtp rx stall: %u late, %d waiting, %d owed\n", q.late, q.queued, q.owed);
+            failures++;
+        }
+
+        /* A path that has become slower for good: after the stall, a
+         * packet a tick as before, every one of them later than it was.
+         * The production failure: from there on every packet was late, and
+         * the modem was given nothing for the rest of the call. Now it
+         * costs one gap, and then each packet goes as it comes. */
+        dm_rtp_rx_reset(&q);
+        rx_n = 0;
+        rx_push(&q, s0);
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        for (int k = 0; k < 5; k++)
+            dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        for (int k = 1; k < 30; k++)
+        {
+            rx_push(&q, (uint16_t) (s0 + k));
+            dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        }
+        rx_check("slower path", 160 + 3 * 160 + 26 * 160, 3 * 160);
+        if (q.late != 3 || q.queued != 0)
+        {
+            printf("FAIL rtp rx slower path: %u late, %d waiting\n", q.late, q.queued);
+            failures++;
+        }
+
+        /* Lost in a stall: what the modem was given nothing for during it
+         * pays for the packets that never came, and is not given again. */
+        dm_rtp_rx_reset(&q);
+        rx_n = 0;
+        rx_push(&q, s0);
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        for (int k = 0; k < 5; k++)
+            dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        rx_push(&q, (uint16_t) (s0 + 6));
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        rx_check("lost in a stall", 160 + 5 * 160 + 160, 5 * 160);
+        if (q.lost != 5 || q.owed != 0)
+        {
+            printf("FAIL rtp rx lost in a stall: %u lost, %d owed\n", q.lost, q.owed);
+            failures++;
+        }
+
+        /* Timestamps that jump, the sequence numbers running on: back, or
+         * far ahead, counted and nothing more; a packet's worth ahead - a
+         * carrier taking 20 ms out and numbering on - and that much nothing
+         * goes in the gap, as for a packet lost. */
+        dm_rtp_rx_reset(&q);
+        rx_n = 0;
+        rx_push_ts(&q, s0, 1000);
+        rx_push_ts(&q, (uint16_t) (s0 + 1), 1160);
+        rx_push_ts(&q, (uint16_t) (s0 + 2), 900);   /* back */
+        rx_push_ts(&q, (uint16_t) (s0 + 3), 50000); /* a new timeline */
+        rx_push_ts(&q, (uint16_t) (s0 + 4), 50320); /* 20 ms taken out */
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        rx_check("timestamps jump", 6 * 160, 160);
+        if (q.ts_jumps != 3 || q.ts_skipped != 160)
+        {
+            printf("FAIL rtp rx timestamps jump: %u jumps counted, %llu skipped\n", q.ts_jumps, q.ts_skipped);
+            failures++;
+        }
+
+        /* Lost, with the timestamps saying more went missing than the
+         * packets: the lot is given as nothing. */
+        dm_rtp_rx_reset(&q);
+        rx_n = 0;
+        rx_push_ts(&q, s0, 1000);
+        rx_push_ts(&q, (uint16_t) (s0 + 2), 1000 + 4 * 160);
+        for (int k = 0; k < 4; k++)
+            dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        rx_check("lost and taken out", 2 * 160 + 3 * 160, 3 * 160);
+
+        /* A new SSRC, or sequence numbers that leap, start again. */
+        dm_rtp_rx_reset(&q);
+        rx_n = 0;
+        rx_push(&q, s0);
+        dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        {
+            int16_t s[160];
+
+            for (int i = 0; i < 160; i++)
+                s[i] = 500;
+            dm_rtp_rx_push(&q, 99, 500, 0, s, 160);
+            dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+            for (int i = 0; i < 160; i++)
+                s[i] = 9000;
+            dm_rtp_rx_push(&q, 99, 9000, 0, s, 160);
+            dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        }
+        rx_check("new stream", 480, 0);
+        if (q.resyncs != 2)
+        {
+            printf("FAIL rtp rx new stream: %u resyncs\n", q.resyncs);
             failures++;
         }
     }
