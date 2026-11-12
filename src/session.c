@@ -369,9 +369,10 @@ static void buffer_text(const dm_session_t *s, const dm_link_quality_t *q, char 
     if (q->direct)
         snprintf(out, len, "no jitter buffer: the modem has been given nothing for %u ms and %u packet%s came too "
                            "late to use since the connect, at most %u waiting at once, the far end's timestamps "
-                           "jumping %u times",
+                           "jumping %u times (%u ms of its audio missing)",
                  since_base(gap, gap0), since_base(dropped, dropped0), since_base(dropped, dropped0) == 1 ? "" : "s",
-                 q->direct_waiting_max, since_base(q->direct_ts_jumps, s->path_base.direct_ts_jumps));
+                 q->direct_waiting_max, since_base(q->direct_ts_jumps, s->path_base.direct_ts_jumps),
+                 since_base(q->direct_ts_skipped_ms, s->path_base.direct_ts_skipped_ms));
     else
         snprintf(out, len, "jitter buffer holding %u ms (%u on average, %u to %u), empty for %u ms and %u ms thrown "
                            "away since the connect",
@@ -1760,8 +1761,8 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
                 path_gaps(&s.path_base, &gap0, &dropped0);
             if (q.direct)
                 snprintf(buffer, sizeof(buffer), "jitter_buffer=none gap_ms=%u late_packets=%u waiting_max=%u "
-                         "ts_jumps=%u", since_base(gap, gap0), since_base(dropped, dropped0), q.direct_waiting_max,
-                         q.direct_ts_jumps);
+                         "ts_jumps=%u ts_skipped_ms=%u", since_base(gap, gap0), since_base(dropped, dropped0),
+                         q.direct_waiting_max, q.direct_ts_jumps, q.direct_ts_skipped_ms);
             else
                 snprintf(buffer, sizeof(buffer), "jb_avg_delay_ms=%u jb_max_delay_ms=%u jb_depth_ms=%u "
                          "jb_empty_ms=%u jb_discard_ms=%u", q.jb_avg_delay_ms, q.jb_max_delay_ms, q.jb_depth_ms,

@@ -1395,8 +1395,18 @@ gap_ms=15380 rx_lost=0`): whether the path became slower for good or the
 carrier's timestamps went back, the queue gave the modem nothing for each
 tick and moved on at our clock, the packets never caught up, and the caller
 heard nothing for the rest of the call. pjmedia's jitter buffer goes by
-sequence number too. Timestamps that do not follow on from the packet before
-are counted (`ts_jumps`) and otherwise ignored.
+sequence number too.
+
+Timestamps now only say how much is missing between two packets given one
+after the other. The same carrier, Sinch, took 20 ms at a time out of what
+it passed toward the caller - 7 times in 8 minutes, numbering its packets on
+as if it had not, so the caller received 11 packets fewer than it sent - and
+the caller's reception gave out at nearly every one: what came after the gap
+arrived a fraction of a symbol out of step, which no equalizer follows. Up
+to 200 ms (`DM_RTP_RX_MAX_SKIP`) ahead of where the packet before left off,
+that much nothing now goes between them, and the receiver rides through it
+as through a packet lost. A jump back, or further ahead - a new timeline,
+not a gap - is only counted. Both are logged (`ts_jumps`, `ts_skipped_ms`).
 
 The modems compare what they hear with what they sent by counting samples
 each way (V.34's round trip is `n - ntx`), and with a buffer the two counts

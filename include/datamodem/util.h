@@ -173,13 +173,19 @@ unsigned dm_retrain_count_update(dm_retrain_count_t *c, unsigned retrains, int r
  * behind it, and a path that has become slower for good costs the modem
  * one gap and no more.
  *
- * Not timestamps, though they could place each packet to the sample: the
+ * Not by timestamp, though that could place each packet to the sample: the
  * first version of this did, and a carrier's packets toward a calling
  * datamodem - none lost, none out of order - all came to be behind where it
  * expected them, after which it skipped every one, and the modem heard
- * nothing for the rest of the call. The far end's timestamps are counted
- * when they jump, for the log, and otherwise not trusted, as pjmedia's own
- * jitter buffer does not trust them.
+ * nothing for the rest of the call. Timestamps only say how much is missing
+ * between two packets the modem is given one after the other: up to
+ * DM_RTP_RX_MAX_SKIP ahead of where the packet before left off, that much
+ * nothing goes between them. The same carrier took 20 ms out of what it
+ * passed on now and then, numbering its packets on as if it had not, and
+ * the caller's reception gave out each time: what came after the gap
+ * arrived a fraction of a symbol out of step. With the gap given as
+ * nothing, the receiver rides through it as it would a packet lost. A jump
+ * back, or further ahead - a new timeline, not a gap - is only counted.
  *
  * Lengths are in samples at 8000 a second. One per call; not
  * thread-safe. */
@@ -187,6 +193,7 @@ unsigned dm_retrain_count_update(dm_retrain_count_t *c, unsigned retrains, int r
 #define DM_RTP_RX_MAX_SAMPLES 480       /* 60 ms, the most a packet may hold */
 #define DM_RTP_RX_RESYNC 100            /* a jump in sequence numbers this big is a new stream */
 #define DM_RTP_RX_MAX_OWED (8000 * 2)   /* the most a stall puts the modem ahead by */
+#define DM_RTP_RX_MAX_SKIP (8000 / 5)   /* the most audio a timestamp jump is taken to say is missing */
 
 typedef struct
 {
@@ -216,6 +223,7 @@ typedef struct
     unsigned overflow;        /* packets with no room for them */
     unsigned resyncs;         /* a new SSRC, or sequence numbers that jumped */
     unsigned ts_jumps;        /* timestamps that did not follow on from the packet before */
+    unsigned long long ts_skipped; /* samples the far end's timestamps said were missing, given as nothing */
     unsigned long long filled; /* samples of nothing given the modem */
     int max_queued;           /* the most packets ever waiting */
 } dm_rtp_rx_t;

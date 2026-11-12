@@ -1874,6 +1874,7 @@ bool dm_sip_link_quality(dm_link_quality_t *q)
         q->direct_filled_ms = (unsigned) (c->rx.filled * 1000 / DM_CLOCK_RATE);
         q->direct_waiting_max = (unsigned) c->rx.max_queued;
         q->direct_ts_jumps = c->rx.ts_jumps;
+        q->direct_ts_skipped_ms = (unsigned) (c->rx.ts_skipped * 1000 / DM_CLOCK_RATE);
         pthread_mutex_unlock(&c->direct_lock);
     }
     pthread_mutex_unlock(&g.lock);

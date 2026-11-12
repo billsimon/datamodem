@@ -536,6 +536,10 @@ void dm_rtp_rx_drain(dm_rtp_rx_t *q, int tick, int hold, void (*out)(void *user,
     {
         dm_rtp_rx_slot_t *p = &q->slot[i];
         int d = (int16_t) (uint16_t) (p->seq - q->next_seq);
+        /* How far ahead of where the packet before left off its timestamp
+         * is: d packets' worth, if nothing but those d is missing. */
+        int32_t ahead = q->have_last ? (int32_t) (p->ts - (q->last_ts + (uint32_t) q->last_len)) : 0;
+        int want = 0;
         int skip;
 
         if (d > 0)
@@ -543,22 +547,33 @@ void dm_rtp_rx_drain(dm_rtp_rx_t *q, int tick, int hold, void (*out)(void *user,
             /* Something missing before it: wait for that, up to hold, then
              * give the modem nothing in its place - unless a stall already
              * has. */
-            int fill;
-
             if (q->waited < hold)
                 break;
-            fill = rtp_rx_pay(q, d * p->len);
+            want = d * p->len;
+            q->lost += (unsigned) d;
+            q->next_seq = p->seq;
+        }
+        if (q->have_last && ahead != want)
+        {
+            q->ts_jumps++;
+            /* More missing than the packets lost: audio taken out on the
+             * way, and the gap it left given as nothing too. */
+            if (ahead > want && ahead - want <= DM_RTP_RX_MAX_SKIP)
+            {
+                q->ts_skipped += (unsigned long long) (ahead - want);
+                want = (int) ahead;
+            }
+        }
+        if (want > 0)
+        {
+            int fill = rtp_rx_pay(q, want);
+
             if (fill > 0)
             {
                 out(user, NULL, fill);
                 q->filled += (unsigned long long) fill;
             }
-            q->lost += (unsigned) d;
-            q->next_seq = p->seq;
-            q->have_last = false;
         }
-        if (q->have_last && p->ts != q->last_ts + (uint32_t) q->last_len)
-            q->ts_jumps++;
         q->have_last = true;
         q->last_ts = p->ts;
         q->last_len = p->len;

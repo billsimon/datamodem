@@ -493,21 +493,34 @@ int main(void)
             failures++;
         }
 
-        /* Timestamps that jump, the sequence numbers running on: counted,
-         * and nothing given in their place. */
+        /* Timestamps that jump, the sequence numbers running on: back, or
+         * far ahead, counted and nothing more; a packet's worth ahead - a
+         * carrier taking 20 ms out and numbering on - and that much nothing
+         * goes in the gap, as for a packet lost. */
         dm_rtp_rx_reset(&q);
         rx_n = 0;
         rx_push_ts(&q, s0, 1000);
         rx_push_ts(&q, (uint16_t) (s0 + 1), 1160);
-        rx_push_ts(&q, (uint16_t) (s0 + 2), 900); /* back */
-        rx_push_ts(&q, (uint16_t) (s0 + 3), 50000); /* forward */
+        rx_push_ts(&q, (uint16_t) (s0 + 2), 900);   /* back */
+        rx_push_ts(&q, (uint16_t) (s0 + 3), 50000); /* a new timeline */
+        rx_push_ts(&q, (uint16_t) (s0 + 4), 50320); /* 20 ms taken out */
         dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
-        rx_check("timestamps jump", 640, 0);
-        if (q.ts_jumps != 2)
+        rx_check("timestamps jump", 6 * 160, 160);
+        if (q.ts_jumps != 3 || q.ts_skipped != 160)
         {
-            printf("FAIL rtp rx timestamps jump: %u jumps counted\n", q.ts_jumps);
+            printf("FAIL rtp rx timestamps jump: %u jumps counted, %llu skipped\n", q.ts_jumps, q.ts_skipped);
             failures++;
         }
+
+        /* Lost, with the timestamps saying more went missing than the
+         * packets: the lot is given as nothing. */
+        dm_rtp_rx_reset(&q);
+        rx_n = 0;
+        rx_push_ts(&q, s0, 1000);
+        rx_push_ts(&q, (uint16_t) (s0 + 2), 1000 + 4 * 160);
+        for (int k = 0; k < 4; k++)
+            dm_rtp_rx_drain(&q, 160, 320, rx_out, NULL);
+        rx_check("lost and taken out", 2 * 160 + 3 * 160, 3 * 160);
 
         /* A new SSRC, or sequence numbers that leap, start again. */
         dm_rtp_rx_reset(&q);
