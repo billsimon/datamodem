@@ -1310,6 +1310,14 @@ the data arrived. The drain is estimated from the line rate instead, which is
 what actually governs it, plus a tail for packetisation and the far end's
 jitter buffer.
 
+Once it is drained, the link is closed before the call is: with LAPM up we
+send DISC, as a modem does on ATH, and wait for the UA - up to the round
+trip and a second - before the SIP BYE (`dm_modem_release()`). A far end
+then knows the call is over at once ("the far end closed the error-corrected
+link; hanging up") whether or not the BYE reaches it. One that did not, on
+a call into a carrier that lost the BYE, sat listening to silence until its
+fifteen-second carrier grace ran out.
+
 ## Call setup
 
 **Why the media path is set up the way it is.** datamodem offers only PCMU

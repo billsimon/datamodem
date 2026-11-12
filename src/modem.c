@@ -308,6 +308,7 @@ struct dm_modem
     int v42bis_max_string;
     bool lapm_up;
     bool lapm_lost;            /* LAPM was up and has closed: the call is ending */
+    bool releasing;            /* we sent DISC to close it: see dm_modem_release() */
     int stall_tries;           /* what we have done about the far end's silence; see check_v42_stall() */
     int stall_polls;           /* the polls unanswered when we last did something */
     int64_t stall_ms;          /* and when */
@@ -1756,7 +1757,10 @@ static void v42_status(void *user, int status)
              * screen as ~?~?~?. A real modem says NO CARRIER here; so do we. */
             m->carrier_lost = true;
             m->phase = DM_PHASE_DOWN;
-            if (why != NULL && strcmp(why, "the far end sent DISC") == 0)
+            if (m->releasing)
+                DM_INFO("modem", "the error-corrected link is closed%s%s (tag=%s)",
+                        (why != NULL && why[0] != '\0') ? " - " : "", (why != NULL) ? why : "", m->tag);
+            else if (why != NULL && strcmp(why, "the far end sent DISC") == 0)
                 DM_INFO("modem", "the far end closed the error-corrected link; hanging up (tag=%s)", m->tag);
             else
                 DM_ERROR("modem", "the error-corrected link was lost%s%s, so the call is no use (tag=%s)",
@@ -4283,6 +4287,35 @@ bool dm_modem_connected(dm_modem_t *m)
     c = m->connected && !m->carrier_lost;
     pthread_mutex_unlock(&m->lock);
     return c;
+}
+
+int dm_modem_release(dm_modem_t *m)
+{
+    int wait_ms = 0;
+
+    pthread_mutex_lock(&m->lock);
+    if (m->v42 != NULL && m->lapm_up && !m->carrier_lost && m->carrier_down_ms == 0 && !m->releasing)
+    {
+        /* The DISC goes after whatever LAPM still has queued, and its UA
+         * comes back across the round trip: a second for that and for the
+         * far end to answer, which is V.42's own shortest T401. */
+        m->releasing = true;
+        v42_stop(m->v42);
+        wait_ms = v42_round_trip_ms(m) + 1000;
+        DM_INFO("modem", "closing the error-corrected link before hanging up (tag=%s)", m->tag);
+    }
+    pthread_mutex_unlock(&m->lock);
+    return wait_ms;
+}
+
+bool dm_modem_released(dm_modem_t *m)
+{
+    bool done;
+
+    pthread_mutex_lock(&m->lock);
+    done = !m->lapm_up || m->carrier_lost;
+    pthread_mutex_unlock(&m->lock);
+    return done;
 }
 
 void dm_modem_far_loss(dm_modem_t *m)

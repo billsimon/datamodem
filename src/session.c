@@ -1704,6 +1704,18 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
         }
     }
 
+    /* Our end is clearing the call: say so on the link first, and give the
+     * far end a moment to answer. See dm_modem_release(). */
+    if (s.reason == DM_END_HANGUP || s.reason == DM_END_IDLE || s.reason == DM_END_SIGNAL ||
+        s.reason == DM_END_TIMEOUT || s.reason == DM_END_UNSTABLE)
+    {
+        int wait_ms = dm_modem_release(modem);
+        int64_t until = dm_now_ms() + wait_ms;
+
+        while (wait_ms > 0 && !dm_modem_released(modem) && dm_now_ms() < until)
+            poll(NULL, 0, 20);
+    }
+
     /* Anything the far end managed to say before the end still belongs on
      * the screen - or, as best it can, with the command, which is told the
      * call has ended once it has. */
