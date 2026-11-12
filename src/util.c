@@ -425,6 +425,8 @@ static void rtp_rx_restart(dm_rtp_rx_t *q)
     q->queued = 0;
     q->started = false;
     q->waited = 0;
+    q->owed = 0;
+    q->have_last = false;
 }
 
 void dm_rtp_rx_reset(dm_rtp_rx_t *q)
@@ -432,10 +434,10 @@ void dm_rtp_rx_reset(dm_rtp_rx_t *q)
     memset(q, 0, sizeof(*q));
 }
 
-bool dm_rtp_rx_push(dm_rtp_rx_t *q, uint32_t ssrc, uint32_t ts, const int16_t *s, int len)
+bool dm_rtp_rx_push(dm_rtp_rx_t *q, uint32_t ssrc, uint16_t seq, uint32_t ts, const int16_t *s, int len)
 {
     int free_slot = -1;
-    int32_t d;
+    int d;
 
     if (len <= 0 || len > DM_RTP_RX_MAX_SAMPLES)
     {
@@ -447,7 +449,7 @@ bool dm_rtp_rx_push(dm_rtp_rx_t *q, uint32_t ssrc, uint32_t ts, const int16_t *s
         rtp_rx_restart(q);
         q->resyncs++;
     }
-    d = q->started ? (int32_t) (ts - q->next_ts) : 0;
+    d = q->started ? (int16_t) (uint16_t) (seq - q->next_seq) : 0;
     if (d < -DM_RTP_RX_RESYNC || d > DM_RTP_RX_RESYNC)
     {
         rtp_rx_restart(q);
@@ -457,18 +459,18 @@ bool dm_rtp_rx_push(dm_rtp_rx_t *q, uint32_t ssrc, uint32_t ts, const int16_t *s
     {
         q->started = true;
         q->ssrc = ssrc;
-        q->next_ts = ts;
+        q->next_seq = seq;
         d = 0;
     }
     /* Its place has gone by: the modem was given nothing for it. */
-    if (d + len <= 0)
+    if (d < 0)
     {
         q->late++;
         return false;
     }
     for (int i = 0; i < DM_RTP_RX_SLOTS; i++)
     {
-        if (q->slot[i].used && q->slot[i].ts == ts)
+        if (q->slot[i].used && q->slot[i].seq == seq)
         {
             q->dup++;
             return false;
@@ -482,6 +484,7 @@ bool dm_rtp_rx_push(dm_rtp_rx_t *q, uint32_t ssrc, uint32_t ts, const int16_t *s
         return false;
     }
     q->slot[free_slot].used = true;
+    q->slot[free_slot].seq = seq;
     q->slot[free_slot].ts = ts;
     q->slot[free_slot].len = len;
     memcpy(q->slot[free_slot].s, s, (size_t) len * sizeof(int16_t));
@@ -495,15 +498,15 @@ bool dm_rtp_rx_push(dm_rtp_rx_t *q, uint32_t ssrc, uint32_t ts, const int16_t *s
 static int rtp_rx_head(const dm_rtp_rx_t *q)
 {
     int best = -1;
-    int32_t best_d = 0;
+    int best_d = 0;
 
     for (int i = 0; i < DM_RTP_RX_SLOTS; i++)
     {
-        int32_t d;
+        int d;
 
         if (!q->slot[i].used)
             continue;
-        d = (int32_t) (q->slot[i].ts - q->next_ts);
+        d = (int16_t) (uint16_t) (q->slot[i].seq - q->next_seq);
         if (best < 0 || d < best_d)
         {
             best = i;
@@ -511,6 +514,16 @@ static int rtp_rx_head(const dm_rtp_rx_t *q)
         }
     }
     return best;
+}
+
+/* What the modem gets for n samples it is owed nothing for, or n owed:
+ * those it has already been given nothing in place of. */
+static int rtp_rx_pay(dm_rtp_rx_t *q, int n)
+{
+    int paid = (q->owed < n) ? q->owed : n;
+
+    q->owed -= paid;
+    return n - paid;
 }
 
 void dm_rtp_rx_drain(dm_rtp_rx_t *q, int tick, int hold, void (*out)(void *user, const int16_t *s, int n),
@@ -522,30 +535,41 @@ void dm_rtp_rx_drain(dm_rtp_rx_t *q, int tick, int hold, void (*out)(void *user,
     while ((i = rtp_rx_head(q)) >= 0)
     {
         dm_rtp_rx_slot_t *p = &q->slot[i];
-        int32_t d = (int32_t) (p->ts - q->next_ts);
+        int d = (int16_t) (uint16_t) (p->seq - q->next_seq);
+        int skip;
 
         if (d > 0)
         {
             /* Something missing before it: wait for that, up to hold, then
-             * give the modem nothing in its place. */
+             * give the modem nothing in its place - unless a stall already
+             * has. */
+            int fill;
+
             if (q->waited < hold)
                 break;
-            out(user, NULL, (int) d);
-            q->filled += (unsigned long long) d;
-            q->next_ts = p->ts;
-            d = 0;
+            fill = rtp_rx_pay(q, d * p->len);
+            if (fill > 0)
+            {
+                out(user, NULL, fill);
+                q->filled += (unsigned long long) fill;
+            }
+            q->lost += (unsigned) d;
+            q->next_seq = p->seq;
+            q->have_last = false;
         }
-        /* d <= 0: all of it, or what is left of it after a wait gave up on
-         * the start. */
-        if (d + p->len > 0)
-        {
-            out(user, p->s - d, p->len + (int) d);
-            q->next_ts = p->ts + (uint32_t) p->len;
-        }
+        if (q->have_last && p->ts != q->last_ts + (uint32_t) q->last_len)
+            q->ts_jumps++;
+        q->have_last = true;
+        q->last_ts = p->ts;
+        q->last_len = p->len;
+        /* A stall the modem was given nothing for is paid off out of what
+         * comes after it, so that it leaves no delay behind. */
+        skip = p->len - rtp_rx_pay(q, p->len);
+        if (skip < p->len)
+            out(user, p->s + skip, p->len - skip);
         else
-        {
             q->late++;
-        }
+        q->next_seq++;
         p->used = false;
         q->queued--;
         gave = true;
@@ -564,7 +588,8 @@ void dm_rtp_rx_drain(dm_rtp_rx_t *q, int tick, int hold, void (*out)(void *user,
         if (q->started)
         {
             q->filled += (unsigned long long) tick;
-            q->next_ts += (uint32_t) tick;
+            if (q->owed + tick <= DM_RTP_RX_MAX_OWED)
+                q->owed += tick;
         }
     }
 }

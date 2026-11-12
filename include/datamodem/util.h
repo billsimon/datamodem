@@ -163,23 +163,35 @@ unsigned dm_retrain_count_update(dm_retrain_count_t *c, unsigned retrains, int r
  * signal - the last of them in the middle of a retrain, which ended the
  * call.
  *
- * Here the far end's own timestamps place each packet, so a packet lost or
- * given up on becomes exactly as many samples of nothing as it would have
- * held, and the samples the modem is given keep step with the far end's
- * clock whatever the network does with the packets. Packets out of order
- * wait for the one before them up to hold samples; with nothing arriving at
- * all, or nothing yet, after hold the modem is given nothing, a tick at a
- * time, as a jitter buffer would when empty - but a packet that comes after that loses only
- * the part of it already given up on, and everything after it is on time.
- * Timestamps and lengths are in samples at 8000 a second. One per call;
- * not thread-safe. */
+ * Packets go to the modem in sequence-number order, as they come. One out of
+ * order waits for the one before it up to hold samples; one lost is given up
+ * on after hold, and becomes as many samples of nothing as the packet after
+ * it holds. With nothing arriving at all, or nothing yet, after hold the
+ * modem is given nothing a tick at a time, so its clock runs on as it would
+ * through an empty buffer - and that is owed: the packets that come after
+ * it, late, are skipped until it is paid off, so a stall leaves no delay
+ * behind it, and a path that has become slower for good costs the modem
+ * one gap and no more.
+ *
+ * Not timestamps, though they could place each packet to the sample: the
+ * first version of this did, and a carrier's packets toward a calling
+ * datamodem - none lost, none out of order - all came to be behind where it
+ * expected them, after which it skipped every one, and the modem heard
+ * nothing for the rest of the call. The far end's timestamps are counted
+ * when they jump, for the log, and otherwise not trusted, as pjmedia's own
+ * jitter buffer does not trust them.
+ *
+ * Lengths are in samples at 8000 a second. One per call; not
+ * thread-safe. */
 #define DM_RTP_RX_SLOTS 32
 #define DM_RTP_RX_MAX_SAMPLES 480       /* 60 ms, the most a packet may hold */
-#define DM_RTP_RX_RESYNC (8000 * 2)     /* a jump in timestamps this big is a new stream */
+#define DM_RTP_RX_RESYNC 100            /* a jump in sequence numbers this big is a new stream */
+#define DM_RTP_RX_MAX_OWED (8000 * 2)   /* the most a stall puts the modem ahead by */
 
 typedef struct
 {
     bool used;
+    uint16_t seq;
     uint32_t ts;
     int len;
     int16_t s[DM_RTP_RX_MAX_SAMPLES];
@@ -191,22 +203,29 @@ typedef struct
     int queued;
     bool started;
     uint32_t ssrc;
-    uint32_t next_ts;         /* the far end's timestamp of the next sample the modem is due */
+    uint16_t next_seq;        /* the packet the modem is due next */
     int waited;               /* samples' worth of ticks with nothing to give */
+    int owed;                 /* samples of nothing the modem was given for packets still to come */
+    bool have_last;
+    uint32_t last_ts;         /* of the last packet given, to see the far end's timestamps jump */
+    int last_len;
     /* Counts, for the log. */
-    unsigned late;            /* packets that came after the modem had been given nothing in their place */
+    unsigned late;            /* packets skipped: after their place had gone, or to pay off a stall */
+    unsigned lost;            /* packets given up on */
     unsigned dup;
     unsigned overflow;        /* packets with no room for them */
-    unsigned resyncs;         /* a new SSRC, or timestamps that jumped */
+    unsigned resyncs;         /* a new SSRC, or sequence numbers that jumped */
+    unsigned ts_jumps;        /* timestamps that did not follow on from the packet before */
     unsigned long long filled; /* samples of nothing given the modem */
     int max_queued;           /* the most packets ever waiting */
 } dm_rtp_rx_t;
 
 void dm_rtp_rx_reset(dm_rtp_rx_t *q);
 
-/* A packet from the far end: its SSRC, timestamp and len samples. Returns
- * false if it was not kept - late, a duplicate, or no room. */
-bool dm_rtp_rx_push(dm_rtp_rx_t *q, uint32_t ssrc, uint32_t ts, const int16_t *s, int len);
+/* A packet from the far end: its SSRC, sequence number, timestamp and len
+ * samples. Returns false if it was not kept - late, a duplicate, or no
+ * room. */
+bool dm_rtp_rx_push(dm_rtp_rx_t *q, uint32_t ssrc, uint16_t seq, uint32_t ts, const int16_t *s, int len);
 
 /* A tick of tick samples of our clock: everything that can go to the modem
  * now goes, through out(user, samples, n), with samples NULL for n samples

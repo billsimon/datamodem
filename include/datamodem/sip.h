@@ -79,6 +79,7 @@ typedef struct
     unsigned direct_late;      /* packets that came after the modem had been given nothing for them */
     unsigned direct_filled_ms; /* nothing given the modem, for packets lost or late */
     unsigned direct_waiting_max; /* the most packets ever waiting for one before them */
+    unsigned direct_ts_jumps;  /* the far end's timestamps not following on from the packet before */
     /* What the far end says of ours, in its RTCP receiver reports - the only
      * view there is of the direction we send in. far_reports is 0 if it
      * sends none. */

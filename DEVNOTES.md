@@ -1378,13 +1378,25 @@ transport adapter under the stream (`on_create_media_transport`) that copies
 each RTP packet, decoded, into a small queue (`dm_rtp_rx_t`) on its way to
 the stream - which still keeps the statistics, answers RTCP and feeds the
 speaker, but no longer the modem - and the modem port empties the queue on
-each tick of the bridge's clock, ahead of sending its own 20 ms. The far
-end's timestamps place each packet: one out of order waits for the one
-before it, up to 40 ms (`DM_DIRECT_HOLD_MS`); one lost becomes exactly as
-many samples of nothing as it held; and with nothing arriving at all, after
-40 ms the modem is given nothing a tick at a time, so its clock runs on as
-it did through an empty buffer - but a packet that turns up after that
-loses only the part already given up on, and nothing after it is delayed.
+each tick of the bridge's clock, ahead of sending its own 20 ms. Packets go
+in sequence-number order: one out of order waits for the one before it, up
+to 40 ms (`DM_DIRECT_HOLD_MS`); one lost becomes as many samples of nothing
+as the packet after it holds; and with nothing arriving at all, after 40 ms
+the modem is given nothing a tick at a time, so its clock runs on as it did
+through an empty buffer. That is owed: the packets that come after a stall,
+late, are skipped until it is paid off, so a stall leaves no delay behind,
+and a path that has become slower for good costs one gap.
+
+The first version placed each packet by its RTP timestamp instead, which is
+exact to the sample - and on the first call with a datamodem calling through
+another carrier, every packet toward the caller came to be behind where it
+expected them, none lost and none out of order (`late_packets=762
+gap_ms=15380 rx_lost=0`): whether the path became slower for good or the
+carrier's timestamps went back, the queue gave the modem nothing for each
+tick and moved on at our clock, the packets never caught up, and the caller
+heard nothing for the rest of the call. pjmedia's jitter buffer goes by
+sequence number too. Timestamps that do not follow on from the packet before
+are counted (`ts_jumps`) and otherwise ignored.
 
 The modems compare what they hear with what they sent by counting samples
 each way (V.34's round trip is `n - ntx`), and with a buffer the two counts

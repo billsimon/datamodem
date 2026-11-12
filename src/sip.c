@@ -587,8 +587,8 @@ static uint32_t be32(const uint8_t *b)
 }
 
 /* One RTP packet (RFC 3550, 5.1): G.711 into the call's queue. Anything else
- * - comfort noise, telephone-events - has no samples, and the timestamps of
- * what comes after it say how long it was. */
+ * - comfort noise, telephone-events - has no samples, and is skipped like a
+ * packet lost. */
 static void tap_packet(pjsua_call_id call_id, const void *pkt, pj_ssize_t size)
 {
     const uint8_t *b = pkt;
@@ -623,7 +623,7 @@ static void tap_packet(pjsua_call_id call_id, const void *pkt, pj_ssize_t size)
     if (c->direct)
     {
         pthread_mutex_lock(&c->direct_lock);
-        dm_rtp_rx_push(&c->rx, be32(b + 8), be32(b + 4), s, (int) n);
+        dm_rtp_rx_push(&c->rx, be32(b + 8), (uint16_t) ((b[2] << 8) | b[3]), be32(b + 4), s, (int) n);
         pthread_mutex_unlock(&c->direct_lock);
     }
     call_unlock();
@@ -1873,6 +1873,7 @@ bool dm_sip_link_quality(dm_link_quality_t *q)
         q->direct_late = c->rx.late;
         q->direct_filled_ms = (unsigned) (c->rx.filled * 1000 / DM_CLOCK_RATE);
         q->direct_waiting_max = (unsigned) c->rx.max_queued;
+        q->direct_ts_jumps = c->rx.ts_jumps;
         pthread_mutex_unlock(&c->direct_lock);
     }
     pthread_mutex_unlock(&g.lock);
