@@ -2523,6 +2523,7 @@ static void enter_phase3(dm_v34_t *v)
                    "round trip %.0f ms (tag=%s)",
             V34_SR_NAME[v->sr_tx], v34_carrier(v->sr_tx, v->high_tx), v->pe_tx, V34_SR_NAME[v->sr_rx],
             v34_carrier(v->sr_rx, v->high_rx), v->rtd / 8.0, v->tag);
+    emit(v, DM_V34_PROBED);
     v34_p2rx_init(&v->tonerx, v->calling);
     v->tonerx.floor = 4.0f * v->pmin;
     qrx_start(v, v->sr_rx, v->high_rx);

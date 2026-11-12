@@ -51,8 +51,9 @@ typedef enum
     DM_V34_CLEARDOWN,        /* the far end cleared down, or the two found no rate in common */
     DM_V34_RATE_CHANGED,     /* rates renegotiated without a retrain; data is crossing again */
     DM_V34_NOT_V34,          /* V.8 found the far end does not do V.34, or V.8 stalled */
-    DM_V34_NO_V8             /* the far end does not do V.8 at all: a plain answer tone, or no CM
+    DM_V34_NO_V8,            /* the far end does not do V.8 at all: a plain answer tone, or no CM
                                 in answer to ANSam - an older modem, which may well do V.32 bis */
+    DM_V34_PROBED            /* a retrain has got through Phase 2: the far end is there, and in it */
 } dm_v34_event_t;
 
 typedef struct
