@@ -186,8 +186,14 @@ SPAN_DECLARE(const char *) lapm_status_to_str(int status)
 }
 /*- End of function --------------------------------------------------------*/
 
+/* datamodem: see below. */
+extern char dm_v42_disconnect_cause[80];
+
 static void report_rx_status_change(v42_state_t *s, int status)
 {
+    /* datamodem: a link that is up has not gone down for any reason yet. */
+    if (status == SIG_STATUS_LINK_CONNECTED)
+        dm_v42_disconnect_cause[0] = '\0';
     if (s->lapm.status_handler)
         s->lapm.status_handler(s->lapm.status_user_data, status);
     else if (s->lapm.iframe_put)
@@ -767,6 +773,10 @@ static void dm_frame_log(v42_state_t *ss, const char *dir, const uint8_t *frame,
 #define dm_cause(str) \
     do { strncpy(dm_v42_disconnect_cause, (str), sizeof(dm_v42_disconnect_cause) - 1); \
          dm_v42_disconnect_cause[sizeof(dm_v42_disconnect_cause) - 1] = '\0'; } while (0)
+/* The far end answering a DISC we sent is how the link ended, not why: when
+   we sent it for a reason, that reason stands. */
+#define dm_cause_unless_known(str) \
+    do { if (dm_v42_disconnect_cause[0] == '\0') dm_cause(str); } while (0)
 
 static int ms_to_bits(v42_state_t *s, int time)
 {
@@ -851,21 +861,34 @@ static __inline__ void t400_stop(v42_state_t *s)
 }
 /*- End of function --------------------------------------------------------*/
 
+/* datamodem: N400 once the link is up. V.42 specifies no value (9.2.2), and
+   Appendix III.2 advises "a relatively large value (e.g. 16), such that
+   repeated attempts of a procedure requiring a response shall be made over
+   a span of several seconds". spandsp's 5 is a little over five seconds of
+   T401, which is less than one bad patch and the retrain that cures it: a
+   far end still answering - it acknowledged the DISC that followed - was
+   hung up on that way. Establishment keeps spandsp's count, which datamodem
+   repeats itself as --v42-timeout allows. */
+#define DM_N400_CONNECTED 16
+
 static void t401_expired(v42_state_t *ss)
 {
     lapm_state_t *s;
 
     span_log(&ss->logging, SPAN_LOG_FLOW, "T.401 expired\n");
     s = &ss->lapm;
-    if (s->retry_count > V42_DEFAULT_N_400)
+    if (s->retry_count > ((s->state == LAPM_DATA) ? DM_N400_CONNECTED : V42_DEFAULT_N_400))
     {
         s->retry_count = 0;
         switch (s->state)
         {
         case LAPM_ESTABLISH:
         case LAPM_RELEASE:
+            if (s->state == LAPM_ESTABLISH)
+                dm_cause("no answer to SABME after N400 retries");
+            else
+                dm_cause_unless_known("no answer to our DISC");
             s->state = LAPM_IDLE;
-            dm_cause("no answer to SABME after N400 retries");
             report_rx_status_change(ss, SIG_STATUS_LINK_DISCONNECTED);
             break;
         case LAPM_DATA:
@@ -1155,7 +1178,7 @@ static int valid_data_state(v42_state_t *ss)
     case LAPM_RELEASE:
         reset_lapm(ss);
         s->state = LAPM_IDLE;
-        dm_cause("our DISC was acknowledged");
+        dm_cause_unless_known("our DISC was acknowledged");
         report_rx_status_change(ss, SIG_STATUS_LINK_DISCONNECTED);
         break;
     case LAPM_SIGNAL:
@@ -1435,7 +1458,7 @@ static int rx_unnumbered_rsp_frame(v42_state_t *ss, const uint8_t *frame, int le
             s->state = LAPM_IDLE;
             reset_lapm(ss);
             t401_stop(ss);
-            dm_cause("our DISC was answered with UA");
+            dm_cause_unless_known("our DISC was answered with UA");
             report_rx_status_change(ss, SIG_STATUS_LINK_DISCONNECTED);
             break;
         default:
@@ -2010,6 +2033,20 @@ SPAN_DECLARE(void) v42_rx_bit(void *user_data, int bit)
         hdlc_rx_put_bit(&s->lapm.hdlc_rx, bit);
     }
     /*endif*/
+}
+/*- End of function --------------------------------------------------------*/
+
+/* datamodem: on a link that is up, how many times in a row T401 has run out
+   with nothing from the far end to acknowledge us - each time a poll gone
+   unanswered - or 0. The modem watches it: a far end that has stopped
+   answering while we still hear it perfectly well has most likely lost our
+   signal, and a retrain is what gets its receiver back (see modem.c's
+   check_v42_stall()). */
+int dm_v42_unanswered(const v42_state_t *ss)
+{
+    if (ss->lapm.state != LAPM_DATA  ||  ss->bit_timer_func != t401_expired)
+        return 0;
+    return ss->lapm.retry_count;
 }
 /*- End of function --------------------------------------------------------*/
 

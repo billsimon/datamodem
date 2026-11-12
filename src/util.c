@@ -249,3 +249,169 @@ void dm_parse_sip_party(const char *s, char *name, size_t name_len, char *user, 
         }
     }
 }
+
+/* Five minutes, then four times as long each time, up to eighty: long
+ * enough that a rate the line will not bear costs a failure an hour or so,
+ * short enough that a call which met a bad patch gets its speed back. */
+#define RATE_MEMORY_FIRST_S 300.0
+#define RATE_MEMORY_MAX_S 4800.0
+/* A rate that has run this long has shown it can. */
+#define RATE_MEMORY_HELD_S 300.0
+
+double dm_rate_memory_failed(dm_rate_memory_t *m, int rate, long long since, long long now)
+{
+    double hold = RATE_MEMORY_FIRST_S;
+
+    if (rate <= 0 || now - since > (long long) (RATE_MEMORY_HELD_S * 8000.0))
+        return 0.0;
+    /* A failure above a limit still in force cannot raise it. */
+    if (dm_rate_memory_limit(m, now) == 0 || rate < m->failed)
+        m->failed = rate;
+    m->count++;
+    for (unsigned i = 1; i < m->count && hold < RATE_MEMORY_MAX_S; i++)
+        hold *= 4.0;
+    if (hold > RATE_MEMORY_MAX_S)
+        hold = RATE_MEMORY_MAX_S;
+    m->until = now + (long long) (hold * 8000.0);
+    return hold;
+}
+
+int dm_rate_memory_limit(const dm_rate_memory_t *m, long long now)
+{
+    return (m->failed > 0 && now < m->until) ? m->failed : 0;
+}
+
+void dm_rate_memory_text(double hold_s, char *out, size_t out_len)
+{
+    if (hold_s <= 0.0)
+        snprintf(out, out_len, "it ran for five minutes first, so not holding it against the rate");
+    else
+        snprintf(out, out_len, "staying below it for %.0f minutes", hold_s / 60.0);
+}
+
+void dm_path_watch_arm(dm_path_watch_t *w, double rtd_ms, const dm_rate_memory_t *a, const dm_rate_memory_t *b)
+{
+    w->armed = rtd_ms >= 0.0;
+    w->rtd_ms = rtd_ms;
+    w->a = *a;
+    if (b != NULL)
+        w->b = *b;
+}
+
+static bool memory_same(const dm_rate_memory_t *x, const dm_rate_memory_t *y)
+{
+    return x->failed == y->failed && x->until == y->until && x->count == y->count;
+}
+
+bool dm_path_watch_judge(dm_path_watch_t *w, double rtd_ms, dm_rate_memory_t *a, dm_rate_memory_t *b)
+{
+    double moved = rtd_ms - w->rtd_ms;
+    bool changed;
+
+    if (!w->armed)
+        return false;
+    w->armed = false;
+    if (moved < 0.0)
+        moved = -moved;
+    if (rtd_ms < 0.0 || moved < DM_PATH_MOVED_MS)
+        return false;
+    changed = !memory_same(a, &w->a) || (b != NULL && !memory_same(b, &w->b));
+    *a = w->a;
+    if (b != NULL)
+        *b = w->b;
+    return changed;
+}
+
+double dm_robust_mean(const double *blocks, int n)
+{
+    double sorted[64];
+    double median, sum = 0.0;
+    int used = 0;
+
+    if (n <= 0)
+        return 0.0;
+    if (n > 64)
+        n = 64;
+    for (int i = 0; i < n; i++)
+    {
+        int j = i;
+
+        while (j > 0 && sorted[j - 1] > blocks[i])
+        {
+            sorted[j] = sorted[j - 1];
+            j--;
+        }
+        sorted[j] = blocks[i];
+    }
+    median = (n % 2) ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+    for (int i = 0; i < n; i++)
+        if (blocks[i] <= 4.0 * median)
+        {
+            sum += blocks[i];
+            used++;
+        }
+    return sum / used;
+}
+
+void dm_loss_watch_arm(dm_loss_watch_t *w, long long now, const dm_rate_memory_t *m)
+{
+    w->armed = true;
+    w->retrain_at = now;
+    w->m = *m;
+}
+
+static bool loss_restore(dm_loss_watch_t *w, dm_rate_memory_t *m)
+{
+    bool changed = !memory_same(m, &w->m);
+
+    *m = w->m;
+    w->armed = false;
+    return changed;
+}
+
+bool dm_loss_watch_check(dm_loss_watch_t *w, long long now, dm_rate_memory_t *m)
+{
+    if (!w->armed || w->loss_at <= 0 || now - w->loss_at > DM_LOSS_BEFORE_S * 8000LL)
+        return false;
+    return loss_restore(w, m);
+}
+
+bool dm_loss_watch_loss(dm_loss_watch_t *w, long long now, dm_rate_memory_t *m)
+{
+    w->loss_at = now;
+    if (!w->armed)
+        return false;
+    if (now - w->retrain_at > DM_LOSS_AFTER_S * 8000LL)
+    {
+        w->armed = false;
+        return false;
+    }
+    return loss_restore(w, m);
+}
+
+/* Two quiet minutes and --max-retrains counts afresh. What it is for is a
+ * link that never settles - the V.22bis pair that disagree about the rate
+ * retrain every few seconds - and a link that has carried data for two
+ * minutes since its last retrain is working. Five used to be the figure, and
+ * a V.32 bis call that retrained cleanly every three or four minutes through
+ * its line's dropouts was one retrain from being hung up. */
+#define RETRAIN_QUIET_MS (2 * 60 * 1000)
+
+unsigned dm_retrain_count_update(dm_retrain_count_t *c, unsigned retrains, int rx_rate, int tx_rate,
+                                 bool in_data, int64_t now_ms)
+{
+    int rates = rx_rate + (tx_rate > 0 ? tx_rate : rx_rate);
+
+    if (retrains > c->seen)
+    {
+        if (c->last_ms != 0 && now_ms - c->last_ms > RETRAIN_QUIET_MS)
+            c->strikes = 0;
+        if (c->rates == 0 || rates >= c->rates)
+            c->strikes += retrains - c->seen;
+        c->seen = retrains;
+        c->last_ms = now_ms;
+    }
+    if (in_data && rx_rate > 0)
+        c->rates = rates;
+    return c->strikes;
+}

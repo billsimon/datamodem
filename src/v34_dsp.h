@@ -124,6 +124,9 @@ typedef struct
     float pbox[V34_P2_HIST];
     double spow;
     long long n;
+    /* In-band power below which there is no tone, and no reversal: set by
+     * the caller after v34_p2rx_init, 0 for none. */
+    float floor;
     /* DPSK: four slicers a quarter symbol apart. An INFO sequence is too
      * short for a timing loop to settle in, and one of the four is always
      * within an eighth of a symbol of the eye's centre. */

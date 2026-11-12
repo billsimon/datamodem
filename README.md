@@ -560,9 +560,11 @@ what each end offered, every V.42 frame - so the log says where it stopped.
   trunk, or RTP ports blocked. `datamodem selftest` (below) rules out the
   modem itself.
 - **Keeps retraining, then hangs up.** The line will not hold the rate.
-  `--max-retrains` (default 4) ends such a call with a diagnosis; try a lower
-  `--bit-rate`, or `--modulation v21`, which is far more tolerant of a poor
-  audio path.
+  V.32bis and V.34 step down on their own when a rate fails, and remember it
+  for a while rather than go straight back; `--max-retrains` (default 4)
+  counts only the retrains that did not come back slower, and ends a call
+  that runs out of them with a diagnosis. Try a lower `--bit-rate`, or
+  `--modulation v21`, which is far more tolerant of a poor audio path.
 - **The host sees junk at the start of the call.** While V.42 is detecting,
   a calling modem sends DC1 characters, which an async host takes for XON,
   for a second or so (never at 300 bps, where V.42 does not run). Real modems did the same; `--v42 off` spares a host

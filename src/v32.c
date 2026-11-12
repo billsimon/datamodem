@@ -40,6 +40,7 @@
  * to align our own signal against when it comes back. */
 #include "datamodem/v32.h"
 #include "datamodem/log.h"
+#include "datamodem/util.h"
 
 #include <complex.h>
 #include <math.h>
@@ -397,6 +398,7 @@ typedef struct
     int pre_run;
     int pre_count;
     int pre_tail;
+    float norm_ref;           /* in data, the equaliser's input power as it usually is; 0 until known */
 } rx_t;
 
 typedef struct
@@ -481,11 +483,25 @@ struct dm_v32
     unsigned rn_offer;        /* our R4 or R5 */
     bool rn_refused;          /* the far end ignored a renegotiation; do not ask again */
     bool rn_deaf;             /* test hook: never hear the far end's renegotiation */
+    bool no_retrain;          /* test hook: never act on our own poor reception */
     unsigned renegotiations;
     int rn_from;              /* the coding a renegotiation we asked for started from */
+    bool rn_down;             /* and it asked for less */
+    int rn_prev;              /* the coding any renegotiation, ours or the far end's, started from */
     long long up_since;       /* reception good enough for a higher rate since then, 0 if not */
     long long up_next;        /* no asking for a higher rate before then */
     double up_backoff;        /* seconds, doubled each time asking for more got nothing */
+    dm_rate_memory_t failed;  /* the rates that have failed on this call: see rate_failed() */
+    dm_path_watch_t path;     /* whether the retrain under way is the path's doing */
+    dm_loss_watch_t loss;     /* whether the far end's last retrain was a lost packet's doing */
+    long long rate_since;     /* line time the coding in use started */
+    int trained_coding;       /* what the last start-up or retrain settled on */
+    long long probe_from;     /* after a step up, reception has to bear it from then */
+    long long probe_until;    /* until then; 0 when not on probation */
+    long long probe_low;      /* on probation, short of the new rate since then, 0 if not */
+    float snr_data;           /* the SNR as data last left it */
+    long long snr_log_next;   /* in data, the next debug line about reception */
+    float snr_low;            /* and the worst SNR since the last */
     bool trellis;
     char tag[48];
     int (*get_bit)(void *user);
@@ -1750,6 +1766,7 @@ static void rx_enter_data(dm_v32_t *v, coding_t coding)
     r->prev_y = Y_OF_QUAD[r->prev_q];
     vit_reset(&r->vit);
     r->vit_mse = r->mse;
+    r->norm_ref = 0.0f;
     r->pre_run = 0;
     r->pre_prev = 0.0f;
     set_loops(r, 0.01f, 0.03f, 0.0005f, 0.01f);
@@ -1849,6 +1866,7 @@ static bool rn_pre_watch(dm_v32_t *v, cf_t u)
     r->last_q = slice4(v, u);
     if (v->stage == STG_DATA)
     {
+        v->rn_prev = (int) v->coding;
         stage_enter(v, STG_RN_RESP, 3.0 + ((v->rtd >= 0.0) ? v->rtd / 8000.0 : 0.5));
         DM_INFO("v32", "the far end is asking to change rate (tag=%s)", v->tag);
     }
@@ -1912,6 +1930,26 @@ static void symbol_out(dm_v32_t *v)
     }
     u = vout * (cosf(r->theta) - I * sinf(r->theta));
     idx = r->osym++;
+
+    /* A dropout on the far end's line arrives as audio, not as lost packets,
+     * so dm_v32_rx_fillin() never hears of it - and as the far end goes
+     * quiet, and again as it comes back, the equaliser's window holds next
+     * to nothing: its update, normalised by that, is enormous, the taps
+     * are wrecked in a few symbols, and the SNR goes below zero and stays
+     * there until a retrain. A hundred milliseconds was enough to cost a
+     * six-second retrain, where V.34 (which holds its own adaptation the
+     * same way) rode it out. So in data, a window 6 dB down on what it
+     * usually holds stops all adaptation, as a lost packet does, until it
+     * has filled with signal again. */
+    if (r->mode == RX_DATA || r->mode == RX_RN_PRE)
+    {
+        if (r->norm_ref <= 0.0f)
+            r->norm_ref = norm;
+        else if (norm < 0.25f * r->norm_ref)
+            v->freeze_until = v->n + 2 * MF_HALF + EQ_LEN * 2;
+        else if (v->n >= v->freeze_until)
+            r->norm_ref += 0.002f * (norm - r->norm_ref);
+    }
 
     switch (r->mode)
     {
@@ -2168,15 +2206,38 @@ static bool rx_can(coding_t c, float snr)
     return snr >= CODING[c].offer_db;
 }
 
+/* A set of codings less any at or above a rate that has failed on this call
+ * and is still being avoided (rate_failed()) - though never all of them. */
+static unsigned allowed(const dm_v32_t *v, unsigned s)
+{
+    int lim = dm_rate_memory_limit(&v->failed, v->n);
+    unsigned out = s;
+
+    if (lim == 0)
+        return s;
+    for (int c = 0; c < CODE_COUNT; c++)
+        if ((out & CBIT(c)) && CODING[c].rate >= lim)
+            out &= ~CBIT(c);
+    if (out == 0)
+        out = s & CBIT(CODE_4800);
+    return (out != 0) ? out : s;
+}
+
 /* What we can offer in reply to the far end's rate signal: the codings we
  * are enabled for, restricted to the ones it allowed (5.4.1 and 6.1/V.32
- * bis), less any our receiver would not bear. */
+ * bis), less any our receiver would not bear, and less any that has failed
+ * on this call - which 6.1 and 6.2/V.32 bis recommend, in asking that the
+ * rate signals "take also account of the likely receiver performance". */
 static unsigned offer_set(const dm_v32_t *v, unsigned far, const char *verb)
 {
-    unsigned s = v->enabled & far & (v->far_bis ? SET_BIS : SET_V32);
+    unsigned all = v->enabled & far & (v->far_bis ? SET_BIS : SET_V32);
+    unsigned s = allowed(v, all);
     int lost = -1;
     int kept;
 
+    if (best_of(s) < best_of(all))
+        DM_INFO("v32", "%d failed earlier in the call; not %s it (tag=%s)", CODING[best_of(all)].rate, verb,
+                v->tag);
     for (int c = 0; c < CODE_COUNT; c++)
         if ((s & CBIT(c)) && !rx_can((coding_t) c, v->rx.snr_trained))
         {
@@ -2213,6 +2274,7 @@ static void restart(dm_v32_t *v, const char *why, bool failed)
     v->p18_ref = v->p18_avg = 0.0f;
     v->tx.data_on = false;
     v->low_since = v->poor_since = 0;
+    v->probe_until = v->probe_low = 0;
     if (v->calling)
     {
         tx_set(v, SEG_AA, -1);
@@ -2236,15 +2298,107 @@ static float rx_snr(const dm_v32_t *v)
     return 10.0f * log10f(10.0f / (mse + 1e-9f));
 }
 
+/* A rate that did not hold: our reception gave out at it, or the far end's
+ * did, which it tells us by retraining or asking for less. Training picks a
+ * rate from a few hundred milliseconds of a quiet line, and a line whose
+ * trouble comes and goes trains as well as a good one - so without this a
+ * retrain goes straight back to the rate that just failed, and between two
+ * V.32 bis modems a step up does too, ten seconds later. allowed() keeps
+ * it, and everything above it, out of what we offer and ask for until
+ * dm_rate_memory_t lets it back. This is what Notes 1 and 3 to 8/V.32 bis
+ * ask in their own case: that what became of earlier attempts be taken into
+ * account before asking again.
+ *
+ * Not every failure is the rate's fault. A line that goes away for a few
+ * seconds takes every rate with it, and holding that against each rate in
+ * turn would walk the call down to 4800 one bad patch at a time. So it
+ * counts only where something says a lower rate would have done better -
+ * lower_held: reception still good enough for the next rate down, the far
+ * end asking for less, the far end giving up while our own reception was
+ * fine - or where the rate was a step up from what training settled on,
+ * which is a bet, and a lost one. And not if the rate ran five minutes
+ * first (dm_rate_memory_failed()).
+ *
+ * Only between two V.32 bis modems, which can come back up without a
+ * retrain when the time is up. A V.32 call has nothing between 9600 and
+ * 4800 and no way back up, so a single bad patch would leave it at half
+ * speed for good; it retrains and picks the rate again, as it always has. */
+static void rate_failed(dm_v32_t *v, coding_t c, bool lower_held, const char *how)
+{
+    char hold[96];
+
+    if (!v->bis || !v->far_bis || c == CODE_4800)
+        return;
+    if (!lower_held && CODING[c].rate <= CODING[v->trained_coding].rate)
+    {
+        DM_DEBUG("v32", "%d failed - %s - but nothing says a lower rate would have held; not holding it "
+                        "against the rate (tag=%s)",
+                 CODING[c].rate, how, v->tag);
+        return;
+    }
+    dm_rate_memory_text(dm_rate_memory_failed(&v->failed, CODING[c].rate, v->rate_since, v->n), hold,
+                        sizeof(hold));
+    DM_INFO("v32", "%d did not hold - %s; %s (tag=%s)", CODING[c].rate, how, hold, v->tag);
+}
+
+/* A retrain from data, about to hold a failure against a rate, and the
+ * round trip it then measures: see dm_path_watch_t. */
+static void path_arm(dm_v32_t *v)
+{
+    dm_path_watch_arm(&v->path, (v->rtd >= 0.0) ? v->rtd / 8.0 : -1.0, &v->failed, NULL);
+}
+
+static void path_judge(dm_v32_t *v)
+{
+    double before = v->path.rtd_ms;
+
+    if (dm_path_watch_judge(&v->path, v->rtd / 8.0, &v->failed, NULL))
+        DM_INFO("v32", "the round trip went from %.0f ms to %.0f across that retrain: the path changed under the "
+                       "call, which no rate would have held through, so not holding it against the rate (tag=%s)",
+                before, v->rtd / 8.0, v->tag);
+}
+
+/* The far end has started a retrain from data: hold it against the rate,
+ * unless the round trip it measures or a lost packet it reports says it
+ * was not the rate's doing. */
+static void far_retrained(dm_v32_t *v, long long n)
+{
+    path_arm(v);
+    dm_loss_watch_arm(&v->loss, n, &v->failed);
+    rate_failed(v, v->coding, v->poor_since == 0 || n - v->poor_since < SECONDS(0.3), "the far end retrained");
+    if (dm_loss_watch_check(&v->loss, n, &v->failed))
+        DM_INFO("v32", "the far end has just reported losing some of our packets, which is what it retrained over "
+                       "and no rate would have held through; not holding it against the rate (tag=%s)",
+                v->tag);
+}
+
+/* The next coding down from c that both ends can run, or -1. */
+static int next_down(const dm_v32_t *v, coding_t c)
+{
+    int best = -1;
+
+    for (int k = 0; k < CODE_COUNT; k++)
+        if ((v->enabled & SET_BIS & CBIT(k)) && CODING[k].rate < CODING[c].rate &&
+            (best < 0 || CODING[k].rate > CODING[best].rate))
+            best = k;
+    return best;
+}
+
 static void go_data(dm_v32_t *v)
 {
     stage_enter(v, STG_DATA, 0.0);
+    v->path.armed = false;
     v->tx.data_on = true;
     v->rx.data_on = true;
     v->low_since = v->poor_since = 0;
     v->up_since = 0;
     v->up_next = v->n + SECONDS(10.0);
     v->rn_from = -1;
+    v->probe_until = v->probe_low = 0;
+    v->rate_since = v->n;
+    v->trained_coding = (int) v->coding;
+    v->snr_log_next = v->n + SECONDS(10.0);
+    v->snr_low = 99.0f;
     DM_INFO("v32", "trained at %s%s: SNR %.1f dB, round trip %.0f ms, echo canceller %s (tag=%s)",
             coding_name(v->rx.coding), (v->bis && !v->far_bis) ? ", as V.32" : "", rx_snr(v),
             v->rtd >= 0.0 ? v->rtd / 8.0 : -1.0,
@@ -2298,15 +2452,35 @@ static unsigned rn_set_upto(const dm_v32_t *v, int want)
     return s;
 }
 
-/* The best coding our receiver would bear now, by the SNR it has in data. */
+/* The best coding our receiver would bear now, by the SNR it has in data,
+ * that has not failed recently, and no more than one rate above the one in
+ * use. In data, the SNR is the SNR now; once the far end's preamble and
+ * rate signal have started arriving it is the SNR they interrupted, because
+ * the slicer's error on them is no measure of anything - it reads 10 dB low
+ * on a clean line, and turned down every step up the far end asked for that
+ * came near the margin.
+ *
+ * One rate at a time, up, whoever asks (R4 or R5): SNR at one rate is only
+ * an estimate of how the next will do, and less of one for each rate
+ * beyond. On a production call whose hold on 12000 lifted, the step went
+ * straight from 9600 to 14400 - the rate that had failed soonest. Each rate
+ * now has to hold, and wait out the time before the next step up (up_next),
+ * before the one above is asked for. Down is as far as reception says. */
 static int rn_desired(const dm_v32_t *v)
 {
-    float snr = rx_snr(v);
-    int best = CODE_4800;
+    float snr = (v->stage == STG_DATA) ? rx_snr(v) : v->snr_data;
+    unsigned s = 0;
+    int best;
 
     for (int c = 0; c < CODE_COUNT; c++)
         if ((v->enabled & SET_BIS & CBIT(c)) && rx_can((coding_t) c, snr))
-            best = c;
+            s |= CBIT(c);
+    s = allowed(v, s);
+    best = (s != 0) ? best_of(s) : CODE_4800;
+    for (int c = 0; c < CODE_COUNT; c++)
+        if ((v->enabled & SET_BIS & CBIT(c)) && CODING[c].rate > v->rate && CODING[best].rate > CODING[c].rate &&
+            (s & CBIT(c)))
+            return c;
     return best;
 }
 
@@ -2340,13 +2514,19 @@ static bool rn_start(dm_v32_t *v, int want, const char *why)
         return false;
     v->rn_offer = offer;
     v->rn_from = (int) v->coding;
+    v->rn_prev = (int) v->coding;
+    v->rn_down = CODING[best_of(offer)].rate < v->rate;
     rn_tx_preamble(v);
     tx_then(v, SEG_RATE, -1);
     v->tx.word = make_word(false, offer, true);
     v->tx.e_min = 64;
     v->tx.rn = true;
     v->tx.data_on = false;
-    stage_enter(v, STG_RN_SEND, rn_timeout(v));
+    /* The answer is back within a round trip and a tenth of a second. A
+     * step down is asked for with reception going, so if it is not, the
+     * line has gone too far for the far end to hear us: a retrain is the
+     * cure, and the sooner the better. */
+    stage_enter(v, STG_RN_SEND, v->rn_down ? rn_timeout(v) - 1.5 : rn_timeout(v));
     DM_INFO("v32", "%s; asking the far end to change to %d (tag=%s)", why, CODING[best_of(offer)].rate,
             v->tag);
     return true;
@@ -2567,8 +2747,12 @@ static void stage_timeout(dm_v32_t *v)
     case STG_RN_SEND:
         /* Note 3 to 8/V.32 bis: a far end that never answers may be a V.32
          * modem that uses B4 for something else. Retrain, and do not ask
-         * again. */
-        v->rn_refused = true;
+         * again - unless what went unanswered was a step down. That is asked
+         * for because reception is going, and the far end's may be going
+         * with it: no answer then says nothing about what the far end is,
+         * and refusing would leave the rest of the call to retrains. */
+        if (!v->rn_down)
+            v->rn_refused = true;
         emit(v, DM_V32_RETRAINING);
         restart(v, "the far end did not answer a request to change rate", false);
         break;
@@ -2578,9 +2762,12 @@ static void stage_timeout(dm_v32_t *v)
     {
         char why[96];
 
-        /* A far end that starts the procedure and does not finish it is no
-         * more to be relied on than one that never starts it. */
-        v->rn_refused = true;
+        /* A far end that answers a step up and does not finish it is no
+         * more to be relied on than one that never answers. One that asked
+         * itself, or was asked for less, has shown that it renegotiates -
+         * and a bad line explains the rest. */
+        if (v->rn_from >= 0 && !v->rn_down)
+            v->rn_refused = true;
         snprintf(why, sizeof(why), "a rate renegotiation stalled at '%s'", STAGE_NAMES[v->stage]);
         emit(v, DM_V32_RETRAINING);
         restart(v, why, false);
@@ -2626,7 +2813,10 @@ static void control(dm_v32_t *v, long long n)
         return;
 
     /* 5.5: the far end starting a retrain, or starting over. A renegotiation
-     * preamble's 56 symbols of AC or AA are too short to be taken for one. */
+     * preamble's 56 symbols of AC or AA are too short to be taken for one -
+     * but a retrain's first 24 are taken for a preamble, by rn_pre_watch(),
+     * so one arrives here in STG_RN_RESP: the far end's request, as we took
+     * it, at the rate still in use. */
     {
         bool in_data = v->stage == STG_DATA || v->stage == STG_RN_SEND || v->stage == STG_RN_RESP ||
                        v->stage == STG_RN_WAIT_E || v->stage == STG_RN_B1;
@@ -2634,6 +2824,8 @@ static void control(dm_v32_t *v, long long n)
         if (v->calling && v->ac_strict >= RUN_128T &&
             (v->stage == STG_C_TRAIN2 || v->stage == STG_C_WAIT_E || v->stage == STG_C_B1 || in_data))
         {
+            if (v->stage == STG_DATA || v->stage == STG_RN_RESP)
+                far_retrained(v, n);
             if (in_data)
                 emit(v, DM_V32_RETRAINING);
             restart(v, "the answering modem is sending AC", false);
@@ -2643,6 +2835,8 @@ static void control(dm_v32_t *v, long long n)
             (v->stage == STG_A_R1 || v->stage == STG_A_TRAIN || v->stage == STG_A_WAIT_E ||
              v->stage == STG_A_B1 || in_data))
         {
+            if (v->stage == STG_DATA || v->stage == STG_RN_RESP)
+                far_retrained(v, n);
             if (in_data)
                 emit(v, DM_V32_RETRAINING);
             restart(v, "the calling modem is sending AA", false);
@@ -2702,6 +2896,10 @@ static void control(dm_v32_t *v, long long n)
             v->rtd = v->nt - 64.0 * SPS;
             if (v->rtd < 0.0)
                 v->rtd = 0.0;
+            /* Not from S: that only says roughly where the reversal was. */
+            if (v->s_run >= S_RUN)
+                v->path.armed = false;
+            path_judge(v);
             tx_set(v, SEG_SILENCE, -1);
             v->want_train = true;
             v->train_gate = n;
@@ -2753,6 +2951,7 @@ static void control(dm_v32_t *v, long long n)
             v->rtd = v->nt - 64.0 * SPS;
             if (v->rtd < 0.0)
                 v->rtd = 0.0;
+            path_judge(v);
             /* Back to AC after an A, which in CA means an even boundary. */
             if ((k - v->ca_start) & 1)
                 k += (boundary_time(k + 1) - target < target - boundary_time(k - 1)) ? 1 : -1;
@@ -2833,9 +3032,23 @@ static void control(dm_v32_t *v, long long n)
             else
                 v->up_backoff = 30.0;
             v->up_next = n + SECONDS(v->up_backoff);
-            v->rn_from = -1;
             DM_INFO("v32", "changed rate to %s without retraining: SNR %.1f dB (tag=%s)",
                     coding_name(v->rx.coding), rx_snr(v), v->tag);
+            /* Up, by either end's asking: reception now has to bear it (see
+             * STG_DATA). Down, at the far end's asking: its reception did
+             * not bear the old rate - ours, when we ask, is noted as we do. */
+            v->probe_until = v->probe_low = 0;
+            if (v->rate > CODING[v->rn_prev].rate)
+            {
+                v->probe_from = n + SECONDS(0.5);
+                v->probe_until = n + SECONDS(8.0);
+            }
+            else if (v->rate < CODING[v->rn_prev].rate && v->rn_from < 0)
+            {
+                rate_failed(v, (coding_t) v->rn_prev, true, "the far end asked for less");
+            }
+            v->rate_since = n;
+            v->rn_from = -1;
             emit(v, DM_V32_RATE_CHANGED);
         }
         break;
@@ -2866,25 +3079,93 @@ static void control(dm_v32_t *v, long long n)
         {
             v->low_since = 0;
         }
-        if (snr < poor)
+
+        /* Now and then, how reception is going: what to look at first when a
+         * real far end's calls keep failing. */
+        v->snr_data = snr;
+        if (snr < v->snr_low)
+            v->snr_low = snr;
+        if (n >= v->snr_log_next)
+        {
+            DM_DEBUG("v32", "receiving at %d: SNR %.1f dB, %.1f at worst in the last 10 seconds (tag=%s)",
+                     v->rate, snr, v->snr_low, v->tag);
+            v->snr_log_next = n + SECONDS(10.0);
+            v->snr_low = 99.0f;
+        }
+
+        /* On probation after a step up. Asking for one takes reception at
+         * the old rate as the measure of the new, which holds where the
+         * trouble is noise and need not where it is anything else. Half a
+         * second for the measurement to settle - straight after the change
+         * it reads 10 dB low on a clean line - then a second short of what
+         * the new rate would have been offered at is enough to step back:
+         * in a fraction of a second, rather than the retrain it would
+         * otherwise come to when the line next has a bad moment. */
+        if (v->probe_until > 0)
+        {
+            if (n >= v->probe_until)
+            {
+                v->probe_until = 0;
+            }
+            else if (n >= v->probe_from && snr < CODING[v->coding].offer_db)
+            {
+                if (v->probe_low == 0)
+                {
+                    v->probe_low = n;
+                }
+                else if (n - v->probe_low > SECONDS(1.0))
+                {
+                    char why[96];
+
+                    v->probe_until = 0;
+                    rate_failed(v, v->coding, true, "reception did not bear it");
+                    snprintf(why, sizeof(why), "reception at %d is short of it (%.1f dB SNR)", v->rate, snr);
+                    if (rn_start(v, rn_desired(v), why))
+                        break;
+                }
+            }
+            else
+            {
+                v->probe_low = 0;
+            }
+        }
+
+        if (snr < poor && !v->no_retrain)
         {
             if (v->poor_since == 0)
-                v->poor_since = n;
-            else if (n - v->poor_since > SECONDS(2.0))
             {
-                char why[80];
+                v->poor_since = n;
+            }
+            else if (n - v->poor_since > SECONDS(1.0))
+            {
                 int want = rn_desired(v);
-
-                snprintf(why, sizeof(why), "reception has been poor (%.1f dB SNR) for 2 seconds", snr);
                 /* Stepping down only helps where the line is the trouble -
                  * not where the signal has all but gone, or the far end
-                 * ignored the last request. */
-                if (!v->rn_refused && want < (int) v->coding && snr >= CODING[CODE_4800].poor_db + 2.0f &&
-                    rn_start(v, want, why))
-                    break;
-                emit(v, DM_V32_RETRAINING);
-                restart(v, why, false);
-                return;
+                 * ignored the last request. A second is enough to tell: by
+                 * two, a line going bad has often gone too far for it. */
+                bool step = v->bis && v->far_bis && !v->rn_refused && want < (int) v->coding &&
+                            snr >= CODING[CODE_4800].poor_db + 2.0f;
+
+                if (step || n - v->poor_since > SECONDS(2.0))
+                {
+                    char why[80];
+
+                    snprintf(why, sizeof(why), "reception has been poor (%.1f dB SNR) for %.1f seconds", snr,
+                             (double) (n - v->poor_since) / 8000.0);
+                    int down = next_down(v, v->coding);
+
+                    path_arm(v);
+                    rate_failed(v, v->coding, down >= 0 && snr >= CODING[down].poor_db, "our reception gave out");
+                    if (step && rn_start(v, want, why))
+                    {
+                        /* No retrain, so no round trip to judge by. */
+                        v->path.armed = false;
+                        break;
+                    }
+                    emit(v, DM_V32_RETRAINING);
+                    restart(v, why, false);
+                    return;
+                }
             }
         }
         else
@@ -2987,6 +3268,7 @@ dm_v32_t *dm_v32_create(const dm_v32_params_t *p)
     v->calling = p->calling;
     v->bis = p->v32bis;
     v->rn_deaf = p->deaf_to_renegotiation;
+    v->no_retrain = p->no_retrain;
     v->trellis = p->trellis || p->v32bis;
     /* 4800 always. V.32 bis keeps the nonredundant 9600 for a V.32 far end
      * that has no trellis coder (1e/V.32 bis: "compatibility with V.32"). */
@@ -3085,6 +3367,26 @@ bool dm_v32_engaged(const dm_v32_t *v)
 int dm_v32_bit_rate(const dm_v32_t *v)
 {
     return v->rate;
+}
+
+bool dm_v32_retrain(dm_v32_t *v, const char *why)
+{
+    if (v->stage != STG_DATA)
+        return false;
+    emit(v, DM_V32_RETRAINING);
+    restart(v, why, false);
+    return true;
+}
+
+void dm_v32_far_loss(dm_v32_t *v)
+{
+    long long ago = v->n - v->loss.retrain_at;
+
+    if (dm_loss_watch_loss(&v->loss, v->n, &v->failed))
+        DM_INFO("v32", "the far end reports losing some of our packets around its retrain %.1f seconds ago, which "
+                       "is what it retrained over and no rate would have held through; not holding it against the "
+                       "rate (tag=%s)",
+                ago / 8000.0, v->tag);
 }
 
 bool dm_v32_renegotiate(dm_v32_t *v, int rate)

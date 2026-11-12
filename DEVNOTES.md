@@ -329,6 +329,30 @@ with the echo 3 dB down and a 250 ms path, with the far modem's clock 1000
 ppm off ours (ten times what V.32 permits), and through a dispersive
 channel; 20-60 ms of lost audio costs the bits in it and no retrain.
 
+**Dropouts that arrive as audio.** That last was lost *packets*, which
+`dm_v32_rx_fillin()` hears of and freezes adaptation across. A dropout on the
+far end's own line arrives as perfectly good RTP with next to nothing in it,
+and nothing froze for that. As the far end goes quiet, and again as it comes
+back, the equaliser's window holds almost no signal, and its update -
+normalised by what the window holds - is enormous: the taps are wrecked in a
+few symbols and the SNR goes below zero and stays there until a retrain. A
+production V.32bis call showed exactly that signature, every few minutes, at
+every rate:
+
+```
+info  [v32] reception has been poor (-9.6 dB SNR) for 2.0 seconds; retraining (tag=in)
+```
+
+An SNR below zero is not noise - the error is bigger than the signal - and
+in the selftest a hundred milliseconds of silence (`cut=20/100`) was enough
+to do it and cost a six-second retrain, where V.34, which holds its own
+adaptation while the far end is quiet, rode out 200 ms without one. Now a
+window 6 dB down on what it usually holds in data stops all adaptation
+(equaliser, phase, timing, echo canceller) until it has filled with signal
+again, and V.32 rides out 100, 200 and 350 ms with no retrain; the 400 ms
+that counts as the carrier gone still retrains. `scripts/retrain-test.sh`
+checks it.
+
 **Against other manufacturers' modems.** Everything above is datamodem
 against datamodem, which has exactly the weakness the V.42 sections below
 describe: two copies of the same code agree with each other even where they
@@ -406,29 +430,108 @@ second in all where a retrain is several. The equaliser, the loops and the
 echo canceller carry on as they were. datamodem answers the far end's
 requests, and makes its own:
 
-- **down**, when reception has been poor for two seconds, to the best rate
-  the receiver would bear now - which is what V.32 can only retrain for;
+- **down**, when reception has been poor for a second, to the best rate the
+  receiver would bear now - which is what V.32 can only retrain for. A
+  second is enough to tell, and by two a line going bad has often gone too
+  far for it; where reception has all but gone, there is a retrain at two
+  seconds as before;
 - **up**, when reception has been good enough for a higher rate, with a dB
   to spare, for ten seconds: after a step down that was more cautious than it
-  needed to be, or a bad patch that passed. An attempt that gets nothing -
-  the far end's receiver would not have it - waits twice as long before the
-  next.
+  needed to be, or a bad patch that passed. One rate at a time, whichever end
+  asks (our R4, or our R5 answering the far end's): SNR at one rate is only
+  an estimate of the next, and less of one for each rate beyond, and a
+  production call whose hold on 12000 lifted went straight from 9600 to
+  14400 - the rate that had failed soonest. Each rate now holds for the
+  thirty seconds before the next step up may be asked for. An attempt that
+  gets nothing - the far end's receiver would not have it - waits twice as
+  long before the next.
 
 ```
-info  [v32] reception has been poor (18.3 dB SNR) for 2 seconds; asking the far end to change to 7200 (tag=out)
+info  [v32] reception has been poor (18.3 dB SNR) for 1.0 seconds; asking the far end to change to 7200 (tag=out)
 info  [v32] changed rate to 7200 (trellis coded) without retraining: SNR 17.8 dB (tag=out)
 ...
-info  [v32] reception is good enough for 14400 (31.5 dB SNR); asking the far end to change to 14400 (tag=out)
-info  [v32] changed rate to 14400 (trellis coded) without retraining: SNR 29.9 dB (tag=out)
+info  [v32] reception is good enough for 12000 (31.5 dB SNR); asking the far end to change to 12000 (tag=out)
+info  [v32] changed rate to 12000 (trellis coded) without retraining: SNR 29.9 dB (tag=out)
 ```
 
 The Recommendation sends the rate change in the middle of whatever was
 crossing, so the bits in flight at that moment are lost: V.42 retransmits
 them, and without V.42 a character or two goes astray, exactly as with a
-retrain. A far end that does not answer a request - the Recommendation
-warns that some V.32 modems use the marking bit for something else - or
-starts the exchange and does not finish it, is retrained with instead, and
-not asked again; its own requests are still answered.
+retrain. A far end that does not answer a request to step *up* - the
+Recommendation warns that some V.32 modems use the marking bit for something
+else - or answers it and does not finish, is retrained with instead, and not
+asked again; its own requests are still answered. One that does not answer
+a step *down* is retrained with but asked again next time: a step down is
+asked for with reception going, and the far end's may be going with it, so
+no answer says nothing about what the far end is. (It used to count the
+same, and a call whose line went bad once was left with nothing but retrains
+for the rest of it.)
+
+**Remembering a rate that failed.** A BBS in production logged this, over
+and over, through an eleven-minute call that then dropped:
+
+```
+info  [v32] trained at 9600 (trellis coded): SNR 28.6 dB, round trip 186 ms
+info  [v32] reception is good enough for 14400 (36.2 dB SNR); asking the far end to change to 14400
+info  [v32] changed rate to 14400 (trellis coded) without retraining: SNR 22.5 dB
+... a few minutes ...
+info  [v32] reception has been poor (1.9 dB SNR) for 2 seconds; retraining
+```
+
+The far end had left 14400 out of its rate signal at training, which 6.1
+recommends be done by "likely receiver performance"; datamodem stepped up to
+it ten seconds into every stretch at 9600 anyway, and three times out of
+three it did not last. Training is a few hundred milliseconds of a quiet
+line, and a line whose trouble comes and goes trains as well as a good one,
+so each retrain chose afresh and the step up followed. Now a rate that fails
+within five minutes of starting is avoided, and everything above it, for
+five minutes the first time, twenty the second and eighty after that - out
+of what we offer at a retrain (R1, R2, R3) and what we ask or answer for in
+a renegotiation (R4, R5), which are ours to choose. Notes 1 and 3 to 8/V.32
+bis ask much the same of a renegotiation that came to nothing: that it be
+"taken into account in determining the desirability of further rate
+renegotiation". Failed means:
+
+- our reception gave out at it, stepping down or retraining;
+- the far end retrained, or asked for less, there;
+- on probation after a step up - our own or the far end's - the new rate's
+  SNR stayed short of what it would have been offered at for a second,
+  starting half a second in. The step up takes the SNR at the old rate as
+  the measure of the new, which holds where the trouble is noise and need
+  not where it is anything else; probation steps straight back in a fraction
+  of a second rather than waiting for the line's next bad moment to turn it
+  into a retrain. (The SNR logged with `changed rate` is taken 24 symbols
+  in, and reads well below the line even on a clean one - 28 dB on a 39 dB
+  line in the selftest - so the 22.5 dB above says less than it seems to.)
+
+```
+info  [v32] changed rate to 14400 (trellis coded) without retraining: SNR 22.6 dB (tag=out)
+info  [v32] 14400 did not hold - reception did not bear it; staying below it for 5 minutes (tag=out)
+info  [v32] reception at 14400 is short of it (24.9 dB SNR); asking the far end to change to 12000 (tag=out)
+```
+
+Not every failure is the rate's fault, though. A line that goes away for a
+few seconds takes every rate with it, and holding that against each rate in
+turn walks the call down to 4800 one bad patch at a time - which the first
+version of this did, taking 340 seconds over a transfer the old code made in
+200. So a failure counts against a rate only where something says a lower
+one would have done better - reception still good enough for the next rate
+down, the far end asking for less, the far end giving up while our own
+reception was fine - or where the rate was a step up from what training
+settled on, which is a bet, and a lost one; and not at all if the rate ran
+five minutes first. Over a line that fades four seconds in thirty,
+`scripts/retrain-test.sh` measures it: where a step down will do, 157
+seconds against 177 and no retrain; where nothing survives, the same
+retrains as before and 186 seconds against 198.
+
+V.32 alone does none of this: it has nothing between 9600 and 4800 and no way
+back up, so one bad patch would leave a call at half speed for good.
+
+A smaller fault turned up on the way. Answering a request, we said what we
+wanted (R5) by the SNR at that moment - measured against the far end's
+preamble and rate signal, which read about 10 dB low even on a clean line,
+and turned down every step up the far end asked for that came near the
+margin. It is the SNR the request interrupted now.
 
 Datamodem against datamodem it has run fifteen minutes at 14400 without a
 bit error, with the far end's echo 10 dB down, a 150 ms path, G.711 and the
@@ -469,6 +572,117 @@ data rates are normal, and `CONNECT` reports the rate we receive at.
 `--bit-rate` caps both. Both ends of a retrain (11.5), rate renegotiation
 without one (11.6) and cleardown (11.7) are implemented; a carrier lost for
 up to 15 seconds is retrained, not hung up on.
+
+**When reception goes bad.** Reception poor for a second is answered with a
+rate renegotiation, not a retrain: 11.6 offers it as a way "to resynchronize
+the receiver without going through a complete retrain", because the far
+end's TRN in it retrains our equaliser and our MP asks for what the receiver
+then measures. A second or so, against five or more for Phase 2. Below 12 dB
+our receiver is not following the far end well enough to hear its S, so
+there it waits two seconds and retrains as before.
+
+Each direction also remembers a rate that failed, the way V.32bis does (see
+there for what counts as failing, and why not every failure does): our
+receive rate when our reception gives out, and our transmit rate when the
+far end's does - it asks for less, or retrains while our own reception was
+fine. What goes in our MP is ours to choose, and the rate each way is the
+most both MPs allow (11.4.1.1.3), so that is where the limit goes.
+
+V.34 had no way back up, either: a call that stepped down, or whose
+renegotiation's TRN met a bad patch and settled low, stayed there to the
+end. Now, as in V.32bis, reception good enough for the next rate in, with a
+dB to spare, for ten seconds asks for it by renegotiating, one rate at a
+time, and the far end may come up one in the same exchange if its own
+reception says so; an attempt that gets nothing waits twice as long. A
+limit lifting renegotiates the same way, one rate up in whichever direction
+it held back. Over a line with one bad patch six minutes in, the call that
+used to finish at 26400 climbs back to 31200 within a minute.
+
+The transmit side is what a production BBS needed. A caller whose own
+receiver could not hold 28800 from us retrained every fifteen seconds and
+asked for 28800 again each time, four times in two minutes, until
+`--max-retrains` hung up on a call each of whose retrains had worked:
+
+```
+info  [v34] the caller is sending tone B; answering a retrain (tag=in)
+info  [v34] trained: 28800 bit/s out at 3429 symbols/s on 1959 Hz, 31200 bit/s in ...
+... four times ...
+error [session] the link retrained 4 times at 31200 bps and will not hold (40.1 dB SNR)
+```
+
+Now our transmitter steps below a rate the far end gives up on, and
+`--max-retrains` counts only retrains that did not come back slower in
+either direction, afresh after two quiet minutes. `DATAMODEM_V34_PLAIN_RECOVERY`
+(under Testing) makes one end of the selftest a far end like that one; the
+other end steps from 33600 to 31200 after its first retrain and holds there,
+where it used to answer nine retrains in the same transfer.
+
+Not every far-end retrain is the rate's fault. A call from the MICA through
+a VoIP path retrained three times in four minutes as the round trip each
+Phase 2 measured went 128, 148 and 288 ms - a jitter buffer somewhere past
+Telnyx taking on frames, each one splicing audio into the signal, which no
+rate survives (at 3429 baud and 1959 Hz, 20 ms is not a whole number of
+symbols or carrier cycles; V.32 bis, at 2400 and 1800, rides through). Each
+retrain held a rate against our transmitter all the same. A retrain from
+data now remembers the rate memory as it was before the failure went in,
+and when Phase 2 measures the round trip, puts it back if that has moved by
+15 ms or more (`dm_path_watch_t`, used by V.32 bis too):
+
+```
+info  [v34] the round trip went from 200 ms to 240 across that retrain: the path changed under the call, which no rate would have held through, so not holding it against the rate (tag=selftest-answer)
+```
+
+That call's third retrain is the one that lost it: six times over, two
+seconds apart, we reversed tone A and the caller never reversed B in reply.
+Each time we went silent for 70 ms and started over with tone A, which gave
+the caller 50 ms of A before each reversal - the least 11.2.1.2.3 allows,
+and maybe less than its tone detector needed to be listening for one.
+11.2.2.2.2 says otherwise: no reversal of B in 2 s, keep A on and reverse it
+again. We do that now, five times before starting over
+(`the caller has not answered our reversal of tone A in 2 seconds; reversing
+it again`). The caller's side of it, 11.2.2.1.3, was already near enough:
+silence, then tone B and a wait for A's reversal, which an answerer doing
+11.2.2.2.2 will be sending.
+
+Testing that recovery turned up two more. Phase 2's tone detector judged a
+tone by how much of the band's power was steady, with no floor on the power
+itself: in an answerer's retrain, the caller's 70 ms of silence before tone
+B - the tail of its data signal dying away in it - read as tone B, then as
+B's reversal, and the round trip came out at nothing, so the probing window
+was in the wrong place and the retrain failed. Below 4 x `pmin` (-42 dBm0)
+there is now no tone and no reversal.
+
+And a renegotiation we started chose our receive rate from the previous
+renegotiation's TRN: `rn_begin()` cleared `far_trn_on` but not the count of
+the far end's TRN symbols, which still passed "400 of them" before any had
+arrived. A call that renegotiated over a bad patch asked for the bad
+patch's rate at every renegotiation after, and the deaf far end of
+`DATAMODEM_NO_RETRAIN` sat at 16800 with 37 dB of SNR. With that fixed,
+every renegotiation really measures, and on a line with a burst of noise
+every two seconds the bursts landed in the TRN and walked the call down to
+2400. So the rate is chosen from TRN in 25-symbol blocks, leaving out any
+more than 6 dB worse than the median (`dm_robust_mean()`), and a
+renegotiation waits for 600 symbols of the far end's TRN rather than 300,
+so that a 60 ms burst covers less than half of it. Over six burst lines the
+transfers now take less time on four, the same on one, and longer on one;
+on one of them the old code lost the call.
+
+A far end that retrains over a packet of ours it lost - the MICA did, twice,
+each loss in its RTCP reports within 2.5 seconds of a retrain - has not
+shown the rate too high either. The session passes each new reported loss
+to the modem (`dm_modem_far_loss()`), and a far-end retrain up to 3 seconds
+after one, or 8 before, is not held against the rate (`dm_loss_watch_t`,
+V.34 and V.32bis):
+
+```
+info  [v34] the far end reports losing some of our packets around its retrain 0.3 seconds ago, which is what it retrained over and no rate would have held through; not holding it against the rate (tag=selftest-answer)
+```
+
+Not yet done: V.34 changes symbol rate only by retraining, so a retrain
+whose probing meets a fade settles at 2400 symbols/s and stays there until
+the next retrain, however good the line is after. On the selftest's line
+with a deep three-second fade every forty, every retrain now completes
+inside the fade and the call runs at 21600 throughout.
 
 Our receiver asks for the 16-state trellis code, no precoding and no
 non-linear encoder - which is what keeps it to a linear equaliser - but the
@@ -1006,6 +1220,79 @@ end:
 | V.42 | 968 | 45s |
 | V.42 + V.42bis | 413 (2.34:1) | 27s |
 
+### Giving up on a link the far end was still running
+
+A V.32bis call to a BBS in production ended like this, nine seconds after
+its third retrain:
+
+```
+error [modem] the error-corrected link was lost - our DISC was acknowledged, so the call is no use (tag=in)
+```
+
+Both halves of that were misleading. What had happened was that our polls
+went unanswered N400 times, and LAPM gave up and sent DISC - but the far end
+*acknowledged* the DISC, so it was alive and still running LAPM: we hung up
+on it. And the reason it gave was what became of the DISC, which overwrote
+the reason it was sent.
+
+spandsp's N400 is 5, so a link gives up a little over five seconds of T401
+after the last answer. V.42 sets no value (9.2.2: "no default value is
+specified ... minimum value of 1") and its Appendix III.2 advises "a
+relatively large value (e.g. 16), such that repeated attempts ... shall be
+made over a span of several seconds". Five seconds is less than a bad patch
+and the retrain that cures it: the timers are frozen during a retrain itself
+(7.10's L-SUSPEND - they count transmitted bits, and none are transmitted),
+but the second or two of poor reception before it count, and so does the
+time the far end takes to come back after. Once the link is up, N400 is now
+16; establishment keeps spandsp's 5, which datamodem already repeats for as
+long as `--v42-timeout` allows. And a DISC answered, or not, no longer
+replaces the reason it was sent:
+
+```
+error [modem] the error-corrected link was lost - the far end stopped answering our polls, so the call is no use (tag=in)
+```
+
+`build/v42test` runs two LAPM links over a bit pipe and cuts it: ten seconds
+without answers is ridden out, which N400 of 5 was not, and twenty-five is
+given up on with that reason.
+
+**A far end that loses us and does not notice.** With N400 at 16 a later
+call on the same BBS ran twenty-five minutes, and ended the same way: the
+far end stopped answering, for the seventeen seconds V.42 now allows, while
+everything we heard from it was perfect - no poor reception, no tone, no
+lost packets. Its receiver had lost our signal, and it never retrained, so
+nothing at the modem level on our side could tell. V.42's unanswered polls
+were the only sign. So once five in a row have gone unanswered
+(`dm_v42_unanswered()` in the vendored V.42), and our own reception has been
+undisturbed - no retrain, rate change or dropped carrier - for eight
+seconds, the modem trains the far end's receiver again: V.32 by retraining,
+which the far end must join on hearing AC or AA (7.1 and 7.2/V.32bis), V.34
+by a renegotiation at the rates in use, whose TRN goes both ways (11.6) and
+which becomes a retrain if the far end does not hear it. V.42's timers stop
+meanwhile (7.10/V.42), so the eleven polls left are still there after it;
+if they go unanswered too, the link is given up as before.
+
+```
+warn  [modem] the far end has not answered 5 polls in a row, though we hear it fine - it has most likely lost our signal (tag=in)
+info  [v32] retraining to bring its receiver back; retraining (tag=in)
+```
+
+The eight quiet seconds matter. Without them, a line with a burst of noise
+every two seconds - polls lost, but to the line, which the pumps already
+deal with by renegotiating - had V.34 retrain on top, through a Phase 2 the
+bursts kept breaking, and the call was lost where renegotiations alone had
+carried it. V.32bis and V.34 retrain when their own reception is poor
+anyway; this is only for the far end's.
+
+A V.34 call from abroad stopped answering after losing two of our packets,
+renegotiated with us when we asked, and closed the link half a minute
+later - and nothing said whether it had heard us again in between. Now the
+modem says when the far end answers again (`the far end is answering
+again, 7.2 seconds after we retrained`), and if five more polls go
+unanswered after the first try, with the same eight quiet seconds, it tries
+once more: a retrain, all of Phase 2, for V.34 (`dm_v34_retrain()`), and
+another retrain for V.32bis. After that the polls left run out as before.
+
 ### Knowing when it is safe to hang up
 
 Handing a byte to the link layer is not the same as putting it on the line,
@@ -1031,6 +1318,57 @@ and perceptual enhancement explicitly: PLC invents audio to cover a gap,
 which is exactly the wrong thing to hand a demodulator. The jitter buffer is
 fixed and never drops or stretches a frame, because chasing latency by
 discarding samples corrupts the stream the demodulator is tracking.
+
+What a fixed buffer cannot do is make two clocks agree. We send a packet per
+20 ms of our clock and the far end one per 20 ms of its own; if they differ,
+a buffer somewhere - ours, or the carrier's - slowly drains or fills, and
+each time it runs dry or overflows the modem on the other side of it gets a
+20 ms gap or splice. A V.32bis call to a production BBS retrained every few
+minutes at every rate while the round trip it measured at each retrain crept
+up a frame at a time, 107 ms to 367 over half an hour - about 135 ppm, and
+about one frame's worth of drift between retrains - and nothing in the log
+said what the buffer was doing. The session now does:
+
+```
+info  [session] the jitter buffer had nothing for 1 frame (20 ms) and threw away 0 - the modem was handed a gap (its delay 150 ms on average, 140 to 160); the far end has sent 4 packets fewer than we have since the connect (80 ms of audio)
+info  [session] audio path at retrain 3: jitter buffer delay 150 ms on average (140 to 160), empty for 2 frames and 0 thrown away since the connect; round trip 287 ms; the far end has sent ...
+info  [session] audio path: jitter buffer delay 160 ms on average (160 to 160), empty for 0 frames and 0 thrown away since the connect, 0 packets lost; the far end has sent as many packets as we have since the connect
+```
+
+(The last is a real one, from a loopback call; the first two show the form.)
+
+- a line each time the buffer has nothing to give or throws frames away, at
+  most every ten seconds, so it can be set beside the modem's own;
+- at each retrain, the buffer and the round trip the retrain measured, which
+  on a path whose delay is not changing should not change either;
+- every five minutes, and in the end-of-call `audio path` summary
+  (`jb_avg_delay_ms`, `jb_max_delay_ms`, `jb_empty`, `jb_discard`,
+  `far_extra_packets`), the buffer and how many more packets the far end has
+  sent than we have since the connect, which no jitter buffer can disguise.
+  A count that grows through the call is the two clocks drifting apart; one
+  that jumps and stays is the path adding or taking out audio; one either way
+  is only where the two ends' ticks fall. It used to be given as our clock in
+  ppm, which made a jump look like drift fading as the call went on: a MICA
+  call's `-454 (+/-114)` at three minutes and `-300` at four and a half were
+  the same 4 packets, 80 ms, arriving at the moment the caller retrained.
+
+pjmedia's own idea of how full the buffer is (`size`) is not its delay - on
+loopback, with 150 ms in each direction's buffer and a 300 ms round trip, it
+read 280 to 320 ms - so the delay given is the buffer's own measure of it.
+
+What the far end's RTCP receiver reports say of our packets - how many it
+lost, the jitter it saw, the network round trip - goes with the five-minute
+and retrain lines, a line of its own whenever it reports more lost, and the
+summary (`far_reports`, `far_lost`, `far_jitter_ms`, `net_rtt_ms`): the
+direction we send in is the one we cannot measure, and the one a far end
+goes deaf in.
+
+The next long call on that BBS answered the question: `clock_ppm=+13`, to
+within 13 - a packet or so - over twenty-five minutes. The clocks agree. Its jitter buffer did
+run dry once, for six frames, at a moment two packets were lost - which a
+V.32bis call before the dropout fix would have retrained over, and this one
+rode out. The round trip's creep is more likely jitter buffers refilling
+after each such hiccup than drift.
 
 Nothing in the modem runs until the call is actually answered. That sounds
 obvious and is easy to get wrong: pjmedia's conference bridge starts clocking
@@ -1219,6 +1557,33 @@ and `cut=20/600` silences the line both ways for 600 ms, 20 seconds in:
 # a dropout long enough to need a retrain
 DATAMODEM_SELFTEST_LINE="ulaw,delay=100,cut=15/2000" DATAMODEM_SELFTEST_BYTES=80000 \
     ./build/datamodem selftest --modulation v34 --v42 require
+```
+
+`fade=4/30/-32` raises the noise to -32 dBm0 for four seconds in every thirty,
+from fifteen seconds in: a line whose trouble comes and goes, which training
+never sees. `fade=.../call` and `noise=-36/call` put it only on what the
+caller hears (`/answer` the answerer), for a direction one end's receiver
+cannot hold and the other's can. `DATAMODEM_V34_PLAIN_RECOVERY=call` makes
+that end retrain whenever its reception is poor and remember no rate that
+failed, as many far ends do; `DATAMODEM_NO_RETRAIN=call` makes it never do
+anything about its own reception at all - a far end that loses us and does
+not notice, which only the other end's V.42 can see. `slip=40/40/call` makes
+what the caller hears 40 ms later from forty seconds in, repeating the 40 ms
+before - a jitter buffer on the path taking on two frames - and
+`DATAMODEM_V34_SLOW_TONE=call:100` makes the caller miss a reversal of tone A
+that comes less than 100 ms after the tone, as a slow tone detector might.
+`lose=22/call` loses the 20 ms packet the caller would hear 22 seconds in
+and tells the answerer two seconds later, as an RTCP report would; and
+`DATAMODEM_V42_DEAF=call:20/18` makes the caller's V.42 hear nothing for 18
+seconds from 20 seconds after the connect, though its modem hears us fine -
+a far end the first try does not bring back.
+`scripts/retrain-test.sh` runs the cases these
+were made for - a step down where one will do, no rate held against a
+dropout, a step up that does not hold, a far end that keeps retraining - and
+checks what the log says happened, not just that the data arrived:
+
+```
+./scripts/retrain-test.sh
 ```
 
 V.34 has its own matrix, about forty cases covering every symbol rate,

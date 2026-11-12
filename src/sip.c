@@ -1544,6 +1544,18 @@ bool dm_sip_link_quality(dm_link_quality_t *q)
     q->tx_packets = stat.rtcp.tx.pkt;
     q->jitter_us = (unsigned) stat.rtcp.rx.jitter.mean;
     q->jitter_max_us = (unsigned) stat.rtcp.rx.jitter.max;
+    /* Not stat.jbuf.size, which counts frames that are not delay: on a
+     * loopback call with 150 ms in each buffer and a 300 ms round trip it
+     * read 280 to 320 ms. */
+    q->jb_avg_delay_ms = stat.jbuf.avg_delay;
+    q->jb_min_delay_ms = stat.jbuf.min_delay;
+    q->jb_max_delay_ms = stat.jbuf.max_delay;
+    q->jb_empty = stat.jbuf.empty;
+    q->jb_discard = stat.jbuf.discard;
+    q->far_reports = stat.rtcp.tx.update_cnt;
+    q->far_lost = stat.rtcp.tx.loss;
+    q->far_jitter_us = (unsigned) stat.rtcp.tx.jitter.last;
+    q->net_rtt_us = (unsigned) stat.rtcp.rtt.last;
     return true;
 }
 

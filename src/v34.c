@@ -21,6 +21,7 @@
  * on. */
 #include "datamodem/v34.h"
 #include "datamodem/log.h"
+#include "datamodem/util.h"
 
 #include "v34_codec.h"
 #include "v34_dsp.h"
@@ -232,6 +233,15 @@ typedef struct
     float pwr_q;             /* T/2 sample power over the last few, to see a silence start at once */
 } qrx_t;
 
+/* The far end's TRN that the rate is chosen from: symbols 100 to 700 of it,
+ * clear of the S-bar to TRN turn. Phase 4 chooses after 600, a
+ * renegotiation after 700 - long enough that a burst of noise of 60 ms
+ * covers less than half of it, and dm_robust_mean() can leave it out. */
+#define TRN_FROM 100
+#define TRN_TO 700
+#define TRN_BLOCK 25
+#define TRN_BLOCKS ((TRN_TO - TRN_FROM) / TRN_BLOCK)
+
 struct dm_v34
 {
     bool calling;
@@ -242,6 +252,9 @@ struct dm_v34
     int force_pe;
     int req_trellis;          /* 0, 1, 2: 16, 32, 64 states */
     bool req_shaping;
+    bool plain_recovery;      /* test hook: see dm_v34_params_t */
+    bool no_retrain;          /* test hook: likewise */
+    int slow_tone_ms;         /* test hook: likewise */
     bool lapm;
     float nominal_dbm0;
     int (*get_bit)(void *user);
@@ -341,6 +354,9 @@ struct dm_v34
     long long far_trn;        /* symbols of it */
     double trn_err;           /* squared error over a block of it, for the rate */
     int trn_err_n;
+    double trn_blk[TRN_BLOCKS]; /* and in 25-symbol pieces, to leave a burst of noise out */
+    int trn_blk_n;
+    double trn_blk_acc;
     v34_dec_t dec;
     v34_enc_t b1ref;
     v34_cf_t b1u[256];
@@ -362,6 +378,7 @@ struct dm_v34
     bool have_mp, far_ack, far_e;
     long long rtd;            /* samples; -1 until measured */
     long long rev_sent;       /* line time of our reversal */
+    unsigned rev_tries;       /* answering: reversals of tone A the caller has not answered */
     double rev_cand;          /* a reversal not yet known to be followed by L1, -1 if none */
     int sr_tx, sr_rx;
     bool high_tx, high_rx;
@@ -381,6 +398,19 @@ struct dm_v34
     long long poor_since, low_since;
     long long freeze_until;
     unsigned failures;
+    /* The rates that have failed on this call, each way: see rate_failed(). */
+    dm_rate_memory_t rx_failed, tx_failed;
+    dm_path_watch_t path;     /* whether the retrain under way is the path's doing */
+    dm_loss_watch_t loss;     /* whether the far end's last retrain was a lost packet's doing */
+    long long rx_since, tx_since; /* line time each direction's rate started */
+    int trained_rx, trained_tx;   /* what the last start-up or retrain settled on */
+    int rn_prev_tx, rn_prev_rx;   /* the rates as a renegotiation started */
+    int rx_limit_seen, tx_limit_seen; /* the limits in force at the last look, for when they lift */
+    int tx_step;                  /* while a renegotiation after a limit lifted: the most to offer out, 0 = no cap */
+    long long up_since;           /* reception good enough for the next rate up since then, 0 if not */
+    long long up_next;            /* no asking for more before then */
+    double up_backoff;            /* seconds, doubled each time asking for more got nothing */
+    int up_from;                  /* our receive rate when we asked for more, 0 if we have not */
 };
 
 /* ------------------------------------------------------------- helpers */
@@ -399,6 +429,14 @@ static void stage_enter(dm_v34_t *v, stage_t st, double timeout_s)
     v->stage = st;
     v->t_stage = v->n;
     v->deadline = (timeout_s > 0.0) ? v->n + (long long) (timeout_s * 8000.0) : 0;
+}
+
+static void trn_reset(dm_v34_t *v)
+{
+    v->trn_err = 0.0;
+    v->trn_err_n = 0;
+    v->trn_blk_n = 0;
+    v->trn_blk_acc = 0.0;
 }
 
 static double rtd_s(const dm_v34_t *v)
@@ -429,6 +467,68 @@ static int best_rate_for(float snr, int sr, int cap)
         if (snr >= rate_needs_db(r, sr))
             best = r;
     return best;
+}
+
+/* The lowest data rate a symbol rate carries (Table 8). */
+static int lowest_rate(int sr)
+{
+    return (sr == V34_S2400) ? 2400 : 4800;
+}
+
+/* The most a direction may run at now, by the rates that have failed in it
+ * on this call (rate_failed()); 0 for no limit. */
+static int rate_ceiling(const dm_rate_memory_t *m, long long now)
+{
+    int lim = dm_rate_memory_limit(m, now);
+
+    return (lim > 0) ? lim - 2400 : 0;
+}
+
+/* A rate that did not hold, in one direction: receiving, when our reception
+ * gave out at it; transmitting, when the far end's did, which it tells us by
+ * retraining or asking for less. Each retrain picks the rate again from how
+ * well training went, and training is short and quiet where a bad line's
+ * trouble is neither - so without this a far end can retrain at the same
+ * rate every fifteen seconds until the call is hung up, and has. What goes
+ * in our MP is ours to choose (11.4.1.1.3: the rate is the most both MPs
+ * allow), so choose_rx_rate() and build_mp() keep below the failed rate
+ * until dm_rate_memory_t lets it back.
+ *
+ * Not every failure is the rate's fault. A line that goes away for a few
+ * seconds takes every rate with it, and holding that against each rate in
+ * turn would walk the call down one bad patch at a time. So it counts only
+ * where something says a lower rate would have done better - lower_held:
+ * reception still good enough for the next rate down, the far end asking
+ * for less, the far end giving up while our own reception was fine - or
+ * where the rate was a step up from what training settled on. And not if
+ * the rate ran five minutes first (dm_rate_memory_failed()). */
+static void rate_failed(dm_v34_t *v, bool rx, int rate, long long since, bool lower_held, const char *how)
+{
+    char hold[96];
+
+    if (v->plain_recovery || rate <= lowest_rate(rx ? v->sr_rx : v->sr_tx))
+        return;
+    if (!lower_held && rate <= (rx ? v->trained_rx : v->trained_tx))
+    {
+        DM_DEBUG("v34", "%d bit/s %s failed - %s - but nothing says a lower rate would have held; not "
+                        "holding it against the rate (tag=%s)",
+                 rate, rx ? "in" : "out", how, v->tag);
+        return;
+    }
+    dm_rate_memory_text(dm_rate_memory_failed(rx ? &v->rx_failed : &v->tx_failed, rate, since, v->n), hold,
+                        sizeof(hold));
+    DM_INFO("v34", "%d bit/s %s did not hold - %s; %s (tag=%s)", rate, rx ? "in" : "out", how, hold, v->tag);
+}
+
+/* Phase 2 has measured the round trip again: see dm_path_watch_t. */
+static void path_judge(dm_v34_t *v)
+{
+    double before = v->path.rtd_ms;
+
+    if (dm_path_watch_judge(&v->path, v->rtd / 8.0, &v->rx_failed, &v->tx_failed))
+        DM_INFO("v34", "the round trip went from %.0f ms to %.0f across that retrain: the path changed under the "
+                       "call, which no rate would have held through, so not holding it against the rate (tag=%s)",
+                before, v->rtd / 8.0, v->tag);
 }
 
 /* ------------------------------------------------------------------ V.8 */
@@ -654,6 +754,7 @@ static void info_bits_reset(dm_v34_t *v, int expect)
 static void p2_start_rx(dm_v34_t *v)
 {
     v34_p2rx_init(&v->p2rx, v->calling);
+    v->p2rx.floor = 4.0f * v->pmin;
     info_bits_reset(v, V34_INFO0_BITS);
 }
 
@@ -1672,12 +1773,19 @@ static void rx_symbol(dm_v34_t *v, const v34_cf_t *w, v34_cf_t vout, v34_cf_t u)
         {
             /* The block the rate is chosen from: clear of the S-bar to TRN
              * turn, and before MP. */
-            if (v->far_trn >= 100 && v->far_trn < 600)
+            if (v->far_trn >= TRN_FROM && v->far_trn < TRN_TO)
             {
                 v34_cf_t e = u - pt4(quad);
+                double e2 = crealf(e) * crealf(e) + cimagf(e) * cimagf(e);
 
-                v->trn_err += crealf(e) * crealf(e) + cimagf(e) * cimagf(e);
+                v->trn_err += e2;
                 v->trn_err_n++;
+                v->trn_blk_acc += e2;
+                if ((v->far_trn - TRN_FROM) % TRN_BLOCK == TRN_BLOCK - 1 && v->trn_blk_n < TRN_BLOCKS)
+                {
+                    v->trn_blk[v->trn_blk_n++] = v->trn_blk_acc / TRN_BLOCK;
+                    v->trn_blk_acc = 0.0;
+                }
             }
             v->far_trn++;
         }
@@ -1879,6 +1987,8 @@ static void p4_heard_s(dm_v34_t *v)
         v->renegotiating = true;
         v->rn_initiator = false;
         v->rn_want = 0;
+        v->rn_prev_tx = v->rate_tx;
+        v->rn_prev_rx = v->rate_rx;
         v->rx_in_data = false;
         v->q.mode = RQ_DD;
         v->q.beta = 0.02f;
@@ -1897,7 +2007,13 @@ static void build_mp(dm_v34_t *v, bool ack)
 {
     v34_mp_t mp = { 0 };
     int my_tx_max = (v->max_rate < V34_SR_MAX_RATE[v->sr_tx]) ? v->max_rate : V34_SR_MAX_RATE[v->sr_tx];
+    int lim = rate_ceiling(&v->tx_failed, v->n);
     int rx = v->want_rx;
+
+    if (v->tx_step > 0 && (lim == 0 || v->tx_step < lim))
+        lim = v->tx_step;
+    if (lim > 0 && lim < my_tx_max)
+        my_tx_max = (lim < lowest_rate(v->sr_tx)) ? lowest_rate(v->sr_tx) : lim;
 
     /* Note to Tables 20 and 21 */
     if (!v->info0_far.c1664)
@@ -2046,10 +2162,15 @@ static void start_mp(dm_v34_t *v)
 static void choose_rx_rate(dm_v34_t *v)
 {
     int cap = (v->max_rate < V34_SR_MAX_RATE[v->sr_rx]) ? v->max_rate : V34_SR_MAX_RATE[v->sr_rx];
+    int lim = rate_ceiling(&v->rx_failed, v->n);
 
     if (v->rn_want > 0 && v->rn_want < cap)
         cap = v->rn_want;
-    if (v->trn_err_n > 100)
+    if (lim > 0 && lim < cap)
+        cap = lim;
+    if (v->trn_blk_n >= 4)
+        v->snr_db = snr_from_mse((float) dm_robust_mean(v->trn_blk, v->trn_blk_n));
+    else if (v->trn_err_n > 100)
         v->snr_db = snr_from_mse((float) (v->trn_err / v->trn_err_n));
     v->want_rx = best_rate_for(v->snr_db, v->sr_rx, cap);
     if (v->want_rx == 0)
@@ -2073,8 +2194,7 @@ static void p4_heard_sbar(dm_v34_t *v)
         v->q.ones_a = 0;
         v->far_trn_on = true;
         v->far_trn = 0;
-        v->trn_err = 0.0;
-        v->trn_err_n = 0;
+        trn_reset(v);
         stage_enter(v, ST_P4_TRN, 2.5 + 2.0 * rtd_s(v) + 2.0);
     }
     else if (v->renegotiating && (v->stage == ST_DATA || v->stage == ST_RN))
@@ -2084,8 +2204,7 @@ static void p4_heard_sbar(dm_v34_t *v)
         rx_dd_reset(&v->q);
         v->far_trn_on = true;
         v->far_trn = 0;
-        v->trn_err = 0.0;
-        v->trn_err_n = 0;
+        trn_reset(v);
         v->have_mp = v->far_ack = v->far_e = false;
         if (v->stage == ST_DATA)
         {
@@ -2105,8 +2224,7 @@ static void p4_heard_jprime(dm_v34_t *v)
     DM_DEBUG("v34", "J' heard; the caller's TRN follows (tag=%s)", v->tag);
     v->far_trn_on = true;
     v->far_trn = 0;
-    v->trn_err = 0.0;
-    v->trn_err_n = 0;
+    trn_reset(v);
 }
 
 static void heard_e(dm_v34_t *v)
@@ -2143,15 +2261,41 @@ static void go_data(dm_v34_t *v)
     stage_enter(v, ST_DATA, 0.0);
     v->poor_since = v->low_since = 0;
     v->failures = 0;
+    v->path.armed = false;
     if (v->renegotiating)
     {
+        int lim = rate_ceiling(&v->tx_failed, v->n);
+
         v->renegotiating = false;
         v->renegotiations++;
         DM_INFO("v34", "rates changed without a retrain: %d bit/s out, %d in, SNR %.1f dB (tag=%s)", v->rate_tx,
                 v->rate_rx, v->snr_db, v->tag);
+        /* Less of our transmitter, and not because our own MP said so: the
+         * far end's reception would not bear what it had. */
+        v->tx_step = 0;
+        v->up_since = 0;
+        if (v->up_from > 0 && v->rate_rx <= v->up_from && v->up_backoff > 0.0)
+            v->up_backoff = (v->up_backoff * 2.0 > 600.0) ? 600.0 : v->up_backoff * 2.0;
+        else
+            v->up_backoff = 30.0;
+        v->up_next = v->n + (long long) (v->up_backoff * 8000.0);
+        v->up_from = 0;
+        if (v->rate_tx < v->rn_prev_tx && (lim == 0 || lim >= v->rn_prev_tx))
+            rate_failed(v, false, v->rn_prev_tx, v->tx_since, true, "the far end asked for less");
+        if (v->rate_tx != v->rn_prev_tx)
+            v->tx_since = v->n;
+        if (v->rate_rx != v->rn_prev_rx)
+            v->rx_since = v->n;
         emit(v, DM_V34_RATE_CHANGED);
         return;
     }
+    v->tx_step = 0;
+    v->up_since = 0;
+    v->up_next = v->n + MS(10000);
+    v->up_from = 0;
+    v->rx_since = v->tx_since = v->n;
+    v->trained_rx = v->rate_rx;
+    v->trained_tx = v->rate_tx;
     DM_INFO("v34", "trained: %d bit/s out at %s symbols/s on %.0f Hz, %d bit/s in at %s on %.0f Hz; SNR %.1f dB, "
                    "round trip %.0f ms, echo canceller %s (tag=%s)",
             v->rate_tx, V34_SR_NAME[v->sr_tx], v34_carrier(v->sr_tx, v->high_tx), v->rate_rx, V34_SR_NAME[v->sr_rx],
@@ -2324,6 +2468,7 @@ static void enter_phase3(dm_v34_t *v)
             V34_SR_NAME[v->sr_tx], v34_carrier(v->sr_tx, v->high_tx), v->pe_tx, V34_SR_NAME[v->sr_rx],
             v34_carrier(v->sr_rx, v->high_rx), v->rtd / 8.0, v->tag);
     v34_p2rx_init(&v->tonerx, v->calling);
+    v->tonerx.floor = 4.0f * v->pmin;
     qrx_start(v, v->sr_rx, v->high_rx);
     v->q.far_md = v->md_far > 0;
     v->far_trn_on = false;
@@ -2451,6 +2596,45 @@ static bool phase2_frame(dm_v34_t *v, int k)
 
 /* ------------------------------------------------------------- retrains */
 
+/* 11.6: ask to change rate, to rx_rate inbound at most, or with 0 to train
+ * our receiver again on the far end's TRN and let what it measures choose -
+ * which 11.6 offers as a way "to resynchronize the receiver without going
+ * through a complete retrain". Either way the far end's MP says again what
+ * its own receiver wants. */
+static bool rn_begin(dm_v34_t *v, int rx_rate, const char *why)
+{
+    if (v->stage != ST_DATA || v->renegotiating)
+        return false;
+    /* 11.6.1.1.1: S, S-bar, TRN, then MP, all on the 4-point set. */
+    v->renegotiating = true;
+    v->rn_initiator = true;
+    v->rn_want = rx_rate;
+    v->rn_prev_tx = v->rate_tx;
+    v->rn_prev_rx = v->rate_rx;
+    v->tx_in_data = false;
+    v->tx_data = false;
+    v->tx16 = false;
+    v->have_mp = v->far_ack = v->far_e = false;
+    /* The far end's TRN is still to come. far_trn left over from the last
+     * renegotiation passed the test below before any of it had arrived,
+     * and the rate was chosen from that one's TRN: a call renegotiated
+     * over a bad patch asked for the bad patch's rate ever after. */
+    v->far_trn_on = false;
+    v->far_trn = 0;
+    trn_reset(v);
+    tx_set(v, TS_S, 128);
+    tx_then(v, TS_SBAR, 16);
+    tx_then(v, TS_TRN, -1);
+    stage_enter(v, ST_RN, 2.5 + 2.0 * rtd_s(v) + 2.0);
+    emit(v, DM_V34_RETRAINING);
+    if (rx_rate > 0)
+        DM_INFO("v34", "%s; asking the far end to change rate (to %d bit/s inbound at most) (tag=%s)", why,
+                rx_rate, v->tag);
+    else
+        DM_INFO("v34", "%s; renegotiating, to train our receiver again without a retrain (tag=%s)", why, v->tag);
+    return true;
+}
+
 static void restart_phase2(dm_v34_t *v, bool initiate, const char *why)
 {
     if (++v->failures > 12)
@@ -2464,6 +2648,7 @@ static void restart_phase2(dm_v34_t *v, bool initiate, const char *why)
     v->tx_in_data = v->rx_in_data = false;
     v->tx_data = false;
     v->renegotiating = false;
+    v->tx_step = 0;
     v->rate_tx = v->rate_rx = 0;
     v->have_mp = v->far_ack = v->far_e = false;
     /* 10.1.3.9: the coefficients are zero until the first MP of Phase 4. */
@@ -2564,6 +2749,7 @@ static void begin_phase2(dm_v34_t *v)
     v->have_info0 = false;
     v->ack_info0 = false;
     v->info0_count = 0;
+    v->rev_tries = 0;
     send_info0(v);
     stage_enter(v, v->calling ? ST_C2_INFO0 : ST_A2_INFO0, 10.0);
     DM_DEBUG("v34", "Phase 2: INFO0%c (tag=%s)", v->calling ? 'c' : 'a', v->tag);
@@ -2705,6 +2891,22 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             v->info0_count = 1;
             send_info0(v);
         }
+        /* Test hook: a tone detector that needs this long of tone A before
+         * it looks for the reversal. The reversal itself can dip the tone
+         * out, as v34_p2rx allows for. */
+        if (reversed && v->slow_tone_ms > 0)
+        {
+            long long since = (r->tone_since >= 0 && r->tone_since < (long long) rev - 240) ? r->tone_since
+                              : (r->prev_until >= (long long) rev - 160)                    ? r->prev_since
+                                                                                             : -1;
+
+            if (since < 0 || rev - (double) since < MS(v->slow_tone_ms))
+            {
+                DM_INFO("v34", "test hook: missing a reversal of tone A that came too soon after the tone (tag=%s)",
+                        v->tag);
+                reversed = false;
+            }
+        }
         if (reversed && v->have_info0 && v34_p2tx_pending(&v->p2tx) == 0)
         {
             /* 11.2.1.1.3: our reversal 40 ms after theirs. */
@@ -2751,6 +2953,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             if (v->rtd < 0)
                 v->rtd = 0;
             DM_DEBUG("v34", "round trip %.1f ms; receiving L1 and L2 (tag=%s)", v->rtd / 8.0, v->tag);
+            path_judge(v);
             v34_probe_init(&v->probe);
             v->probing = true;
             /* L1 after 10 ms more of A; L2 160 ms after that. */
@@ -2828,6 +3031,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             if (v->rtd < 0)
                 v->rtd = 0;
             DM_DEBUG("v34", "round trip %.1f ms; L1 and L2 (tag=%s)", v->rtd / 8.0, v->tag);
+            path_judge(v);
             p2_reverse(v, (long long) rev + MS(40), 10, true);
             stage_enter(v, ST_A2_L, 0.05 + 0.16 + 0.6 + rt + 0.5);
         }
@@ -2881,7 +3085,8 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
         }
         break;
     case ST_RN:
-        if (v->seg == TS_TRN && v->trn_symbols >= 512 && v->q.mode == RQ_DD && v->far_trn >= 400)
+        if (v->seg == TS_TRN && v->trn_symbols >= 512 && v->q.mode == RQ_DD && v->far_trn_on &&
+            v->far_trn >= TRN_TO)
         {
             choose_rx_rate(v);
             start_mp(v);
@@ -2933,22 +3138,109 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             {
                 v->low_since = 0;
             }
-            if (snr < rate_needs_db(v->rate_rx, v->sr_rx) - 4.0f)
+            if (snr < rate_needs_db(v->rate_rx, v->sr_rx) - 4.0f && !v->no_retrain)
             {
                 if (v->poor_since == 0)
-                    v->poor_since = n;
-                else if (n - v->poor_since > MS(2000))
                 {
-                    char why[96];
+                    v->poor_since = n;
+                }
+                else if (n - v->poor_since > MS(1000))
+                {
+                    /* Renegotiating (11.6) trains our receiver again on the
+                     * far end's TRN and picks the rate from what it measures,
+                     * in a second or two; a retrain goes back to Phase 2 and
+                     * takes five or more. Worth it while there is a signal to
+                     * train on: below 12 dB our receiver is not following it
+                     * well enough to hear the far end's S, and the attempt
+                     * would only time out into a retrain. */
+                    int down = v->rate_rx - 2400;
+                    bool resync = snr >= 12.0f && !v->plain_recovery;
 
-                    snprintf(why, sizeof(why), "reception has been poor (%.1f dB SNR) for 2 seconds", snr);
-                    restart_phase2(v, true, why);
-                    return;
+                    if (resync || n - v->poor_since > MS(2000))
+                    {
+                        char why[96];
+
+                        snprintf(why, sizeof(why), "reception has been poor (%.1f dB SNR) for %.1f seconds", snr,
+                                 (double) (n - v->poor_since) / 8000.0);
+                        dm_path_watch_arm(&v->path, (v->rtd >= 0) ? v->rtd / 8.0 : -1.0, &v->rx_failed,
+                                          &v->tx_failed);
+                        rate_failed(v, true, v->rate_rx, v->rx_since,
+                                    down >= lowest_rate(v->sr_rx) && snr >= rate_needs_db(down, v->sr_rx) - 4.0f,
+                                    "our reception gave out");
+                        if (resync && rn_begin(v, rate_ceiling(&v->rx_failed, n), why))
+                        {
+                            /* No Phase 2, so no round trip to judge by. */
+                            v->path.armed = false;
+                            return;
+                        }
+                        restart_phase2(v, true, why);
+                        return;
+                    }
                 }
             }
             else
             {
                 v->poor_since = 0;
+            }
+
+            /* A limit has lifted that was holding a direction back: one
+             * renegotiation lets that direction come back up, which nothing
+             * else would until the next failure - one rate, and no more, as
+             * V.32 bis steps up: the measurement at one rate says less about
+             * each rate beyond it, and the rate that failed soonest is
+             * usually the one at the top. The next lift, or the next
+             * retrain, may go further. */
+            {
+                int rl = dm_rate_memory_limit(&v->rx_failed, n);
+                int tl = dm_rate_memory_limit(&v->tx_failed, n);
+                bool rx_lifted = v->rx_limit_seen > 0 && rl == 0 && v->rate_rx >= v->rx_limit_seen - 2400;
+                bool tx_lifted = v->tx_limit_seen > 0 && tl == 0 && v->rate_tx >= v->tx_limit_seen - 2400;
+
+                v->rx_limit_seen = rl;
+                v->tx_limit_seen = tl;
+                if (rx_lifted || tx_lifted)
+                {
+                    v->tx_step = tx_lifted ? v->rate_tx + 2400 : v->rate_tx;
+                    if (rn_begin(v, rx_lifted ? v->rate_rx + 2400 : v->rate_rx,
+                                 "a rate held back after a failure may be tried again"))
+                        return;
+                    v->tx_step = 0;
+                }
+            }
+
+            /* And back up when reception has been good enough for the next
+             * rate in for ten seconds, with a dB to spare: after a step down
+             * that a bad patch called for and that has passed, or a
+             * renegotiation whose TRN met the bad patch. One rate at a time,
+             * as V.32 bis does, and the far end may come up one in the same
+             * exchange if its own reception says so. Without this a V.34 call
+             * that once stepped down stayed down to the end. An attempt that
+             * gets nothing waits twice as long before the next. */
+            {
+                int up = v->rate_rx + 2400;
+                int lim = rate_ceiling(&v->rx_failed, n);
+
+                if (v->plain_recovery || up > V34_SR_MAX_RATE[v->sr_rx] || up > v->max_rate ||
+                    (lim > 0 && up > lim) || snr < rate_needs_db(up, v->sr_rx) + 1.0f)
+                {
+                    v->up_since = 0;
+                }
+                else if (v->up_since == 0)
+                {
+                    v->up_since = n;
+                }
+                else if (n - v->up_since > MS(10000) && n >= v->up_next)
+                {
+                    char why[96];
+
+                    snprintf(why, sizeof(why), "reception is good enough for %d bit/s in (%.1f dB SNR)", up, snr);
+                    v->tx_step = v->rate_tx + 2400;
+                    v->up_from = v->rate_rx;
+                    if (rn_begin(v, up, why))
+                        return;
+                    v->tx_step = 0;
+                    v->up_from = 0;
+                }
             }
         }
         break;
@@ -2961,6 +3253,22 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
     {
         if (v->tonerx.tone_since >= 0 && n - v->tonerx.tone_since > MS(60) && v->tonerx.level > 4.0f * v->pmin)
         {
+            /* In data, the far end's reception has given out - at what we
+             * send it. If ours was fine until the far end stopped sending
+             * data to start the retrain - its silence and the 60 ms of tone
+             * read as poor reception too - it was not the line. */
+            if (v->stage == ST_DATA && !v->renegotiating)
+            {
+                dm_path_watch_arm(&v->path, (v->rtd >= 0) ? v->rtd / 8.0 : -1.0, &v->rx_failed, &v->tx_failed);
+                dm_loss_watch_arm(&v->loss, n, &v->tx_failed);
+                rate_failed(v, false, v->rate_tx, v->tx_since, v->poor_since == 0 || n - v->poor_since < MS(300),
+                            "the far end retrained");
+                if (dm_loss_watch_check(&v->loss, n, &v->tx_failed))
+                    DM_INFO("v34", "the far end has just reported losing some of our packets, which is what it "
+                                   "retrained over and no rate would have held through; not holding it against the "
+                                   "rate (tag=%s)",
+                            v->tag);
+            }
             restart_phase2(v, false, v->calling ? "the answerer is sending tone A" : "the caller is sending tone B");
             return;
         }
@@ -3004,8 +3312,25 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             p2_carrier(v, true);
             v->info0_count = 1;
             v->ack_info0 = true;
+            v->rev_tries = 0;
             stage_enter(v, v->calling ? ST_C2_INFO0 : ST_A2_INFO0, 6.0 + 2.0 * rt);
             return;
+        case ST_A2_REV1:
+            /* 11.2.2.2.2: no reversal of tone B within 2 s. Tone A is still
+             * on; reverse it again once tone B is heard (11.2.1.2.3), rather
+             * than start over. Starting over gives the caller 50 ms of tone A
+             * after each 70 ms of silence before the reversal comes, and on
+             * a production call a MICA answered none of six attempts at that,
+             * then hung up. */
+            if (++v->rev_tries <= 5)
+            {
+                DM_INFO("v34", "the caller has not answered our reversal of tone A in 2 seconds; reversing it again "
+                               "(tag=%s)",
+                        v->tag);
+                stage_enter(v, ST_A2_INFO0, 6.0 + 2.0 * rt);
+                return;
+            }
+            break;
         default:
             break;
         }
@@ -3236,6 +3561,9 @@ dm_v34_t *dm_v34_create(const dm_v34_params_t *p)
     v->force_pe = p->pre_emphasis;
     v->req_trellis = (p->trellis == 64) ? 2 : (p->trellis == 32) ? 1 : 0;
     v->req_shaping = p->shaping;
+    v->plain_recovery = p->plain_recovery;
+    v->no_retrain = p->no_retrain;
+    v->slow_tone_ms = p->slow_tone_ms;
     v->lapm = p->lapm;
     v->nominal_dbm0 = p->tx_power;
     v->get_bit = p->get_bit;
@@ -3320,26 +3648,33 @@ int dm_v34_rx_rate(const dm_v34_t *v)
     return (v->stage == ST_DATA || v->rx_in_data) ? v->rate_rx : 0;
 }
 
+bool dm_v34_resync(dm_v34_t *v, const char *why)
+{
+    return rn_begin(v, v->rate_rx, why);
+}
+
+bool dm_v34_retrain(dm_v34_t *v, const char *why)
+{
+    if (v->stage != ST_DATA)
+        return false;
+    restart_phase2(v, true, why);
+    return true;
+}
+
+void dm_v34_far_loss(dm_v34_t *v)
+{
+    long long ago = v->n - v->loss.retrain_at;
+
+    if (dm_loss_watch_loss(&v->loss, v->n, &v->tx_failed))
+        DM_INFO("v34", "the far end reports losing some of our packets around its retrain %.1f seconds ago, which "
+                       "is what it retrained over and no rate would have held through; not holding it against the "
+                       "rate (tag=%s)",
+                ago / 8000.0, v->tag);
+}
+
 bool dm_v34_renegotiate(dm_v34_t *v, int rx_rate)
 {
-    if (v->stage != ST_DATA || v->renegotiating)
-        return false;
-    /* 11.6.1.1.1: S, S-bar, TRN, then MP, all on the 4-point set. */
-    v->renegotiating = true;
-    v->rn_initiator = true;
-    v->rn_want = rx_rate;
-    v->tx_in_data = false;
-    v->tx_data = false;
-    v->tx16 = false;
-    v->have_mp = v->far_ack = v->far_e = false;
-    v->far_trn_on = false;
-    tx_set(v, TS_S, 128);
-    tx_then(v, TS_SBAR, 16);
-    tx_then(v, TS_TRN, -1);
-    stage_enter(v, ST_RN, 2.5 + 2.0 * rtd_s(v) + 2.0);
-    emit(v, DM_V34_RETRAINING);
-    DM_INFO("v34", "asking the far end to change rate (to %d bit/s inbound at most) (tag=%s)", rx_rate, v->tag);
-    return true;
+    return rn_begin(v, rx_rate, "asked to change rate");
 }
 
 float dm_v34_rx_power(const dm_v34_t *v)

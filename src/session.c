@@ -196,6 +196,20 @@ typedef struct
     dm_link_quality_t quality;
     bool have_quality;
 
+    /* What --max-retrains counts: see dm_retrain_count_update(). */
+    dm_retrain_count_t retrains;
+
+    /* The audio path, watched through a call: see watch_audio_path(). */
+    unsigned jb_empty_seen, jb_discard_seen;     /* the jitter buffer's counts at the last look */
+    unsigned far_lost_seen, far_lost_unsaid;     /* the far end's reports of our packets lost */
+    int64_t far_said_ms;
+    unsigned jb_empty_unsaid, jb_discard_unsaid; /* since the last line about them */
+    int64_t jb_said_ms;
+    unsigned path_retrains_seen;
+    int64_t path_report_ms;      /* when the last periodic line went out */
+    dm_link_quality_t path_base; /* the packet counts at connect */
+    int64_t path_base_ms;
+
     /* Dominance watch on what arrives, see count_repeats(). */
     unsigned hist[256];
     unsigned hist_n;
@@ -276,6 +290,162 @@ static void term_reply(void *user, const void *data, size_t len)
 
     if (!s->command_mode)
         dm_modem_send(s->modem, data, len);
+}
+
+/* How many more packets the far end has sent us since the connect than we
+ * have sent it: we send one per 20 ms of our clock, it one per 20 ms of its
+ * own. A count that grows through a call is the clocks drifting apart; one
+ * that jumps and then stays put is something on the path adding or taking
+ * out audio. A production call had one of those - 80 ms, at the moment the
+ * far end retrained - which this, given in ppm, made look like drift that
+ * faded as the call went on. One either way is just where the two ends'
+ * ticks fall. False before the connect. */
+static bool packet_skew(const dm_session_t *s, const dm_link_quality_t *q, long *skew)
+{
+    long rx = (long) (q->rx_packets + q->rx_lost) - (long) (s->path_base.rx_packets + s->path_base.rx_lost);
+    long tx = (long) q->tx_packets - (long) s->path_base.tx_packets;
+
+    if (s->path_base_ms == 0 || rx <= 0)
+        return false;
+    *skew = rx - tx;
+    return true;
+}
+
+static void skew_text(long skew, char *out, size_t len)
+{
+    if (skew == 0)
+        snprintf(out, len, "; the far end has sent as many packets as we have since the connect");
+    else
+        snprintf(out, len, "; the far end has sent %ld packet%s %s than we have since the connect (%ld ms of audio)",
+                 labs(skew), labs(skew) == 1 ? "" : "s", skew > 0 ? "more" : "fewer", labs(skew) * 20 /* ms a packet */);
+}
+
+/* A count since the connect, or the count itself if pjsua has started its
+ * statistics again (a new stream, after a re-INVITE) and it went down. */
+static unsigned since_base(unsigned now_count, unsigned base)
+{
+    return (now_count >= base) ? now_count - base : now_count;
+}
+
+/* What the far end's RTCP receiver reports say of the packets we send it,
+ * for the end of a log line. The other direction is ours to measure, but
+ * this one is not, and it is where a far end goes deaf: a production call
+ * ended with the far end no longer answering V.42 while what we heard from
+ * it was perfect. */
+static void far_text(const dm_session_t *s, const dm_link_quality_t *q, char *out, size_t len)
+{
+    if (q->far_reports == 0)
+        snprintf(out, len, "; the far end sends no reports of what it receives");
+    else
+        snprintf(out, len, "; the far end reports losing %u of ours since the connect, jitter %.1f ms, network "
+                           "round trip %u ms",
+                 since_base(q->far_lost, s->path_base.far_lost), q->far_jitter_us / 1000.0,
+                 q->net_rtt_us / 1000);
+}
+
+#define DM_PATH_REPORT_MS (5 * 60 * 1000)
+#define DM_JB_SAY_MS (10 * 1000)
+
+/* What the jitter buffer is doing, in the log, while connected. A modem
+ * expects an unbroken stream of samples, and the buffer cannot always give
+ * one: when our clock and the far end's disagree it slowly drains or fills,
+ * and each time it runs dry the modem is handed a frame of nothing. A V.32bis
+ * call to a production BBS retrained every few minutes at every rate while
+ * the round trip it measured at each retrain crept up a frame at a time, 107
+ * ms to 367 over half an hour - which is what that looks like from the
+ * modem, and nothing recorded what the buffer was doing. Now:
+ *
+ *   - each time it has nothing to give or throws frames away, a line saying
+ *     so, at most every ten seconds, so it can be set beside the modem's own;
+ *     and the same each time the far end reports losing some of ours;
+ *   - at each retrain, its state and the round trip the retrain measured;
+ *   - every five minutes, its state and the packets each end has sent;
+ *
+ * and with each of the last two, what the far end reports of ours. */
+static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64_t now)
+{
+    const dm_link_quality_t *q = &s->quality;
+    long skew;
+    char clocks[128] = "";
+    char far[160];
+
+    if (!s->have_quality)
+        return;
+    if (s->connected_ms == 0 || !st->connected)
+    {
+        /* Call setup has its own empties, before any audio arrives. */
+        s->jb_empty_seen = q->jb_empty;
+        s->jb_discard_seen = q->jb_discard;
+        s->far_lost_seen = q->far_lost;
+        return;
+    }
+    if (s->path_base_ms == 0)
+    {
+        s->path_base = *q;
+        s->path_base_ms = now;
+        s->path_report_ms = now;
+        s->path_retrains_seen = st->retrains;
+    }
+    if (q->jb_empty > s->jb_empty_seen)
+        s->jb_empty_unsaid += q->jb_empty - s->jb_empty_seen;
+    if (q->jb_discard > s->jb_discard_seen)
+        s->jb_discard_unsaid += q->jb_discard - s->jb_discard_seen;
+    s->jb_empty_seen = q->jb_empty;
+    s->jb_discard_seen = q->jb_discard;
+    if (q->far_lost > s->far_lost_seen)
+    {
+        s->far_lost_unsaid += q->far_lost - s->far_lost_seen;
+        /* A far end that retrains over a gap in what it heard has not
+         * shown the rate to be too high. */
+        dm_modem_far_loss(s->modem);
+    }
+    s->far_lost_seen = q->far_lost;
+    far_text(s, q, far, sizeof(far));
+    if (packet_skew(s, q, &skew))
+        skew_text(skew, clocks, sizeof(clocks));
+
+    if ((s->jb_empty_unsaid > 0 || s->jb_discard_unsaid > 0) && now - s->jb_said_ms >= DM_JB_SAY_MS)
+    {
+        DM_INFO("session", "the jitter buffer had nothing for %u frame%s (%u ms) and threw away %u - the "
+                           "modem was handed a gap (its delay %u ms on average, %u to %u)%s",
+                s->jb_empty_unsaid, s->jb_empty_unsaid == 1 ? "" : "s", s->jb_empty_unsaid * 20 /* ms a frame */,
+                s->jb_discard_unsaid, q->jb_avg_delay_ms, q->jb_min_delay_ms, q->jb_max_delay_ms, clocks);
+        s->jb_empty_unsaid = s->jb_discard_unsaid = 0;
+        s->jb_said_ms = now;
+    }
+    if (s->far_lost_unsaid > 0 && now - s->far_said_ms >= DM_JB_SAY_MS)
+    {
+        DM_INFO("session", "the far end reports losing %u of our packets (%u since the connect) - what it "
+                           "hears from us has gaps in it",
+                s->far_lost_unsaid, since_base(q->far_lost, s->path_base.far_lost));
+        s->far_lost_unsaid = 0;
+        s->far_said_ms = now;
+    }
+    if (st->retrains > s->path_retrains_seen)
+    {
+        char rtt[32] = "";
+
+        /* The round trip a V.32 or V.34 retrain has just measured: on a
+         * path whose delay is not changing, it should not either. */
+        if (st->round_trip_ms > 0)
+            snprintf(rtt, sizeof(rtt), "; round trip %d ms", st->round_trip_ms);
+        DM_INFO("session", "audio path at retrain %u: jitter buffer delay %u ms on average (%u to %u), empty "
+                           "for %u frames and %u thrown away since the connect%s%s%s",
+                st->retrains, q->jb_avg_delay_ms, q->jb_min_delay_ms, q->jb_max_delay_ms,
+                since_base(q->jb_empty, s->path_base.jb_empty),
+                since_base(q->jb_discard, s->path_base.jb_discard), rtt, clocks, far);
+        s->path_retrains_seen = st->retrains;
+    }
+    if (now - s->path_report_ms >= DM_PATH_REPORT_MS)
+    {
+        DM_INFO("session", "audio path: jitter buffer delay %u ms on average (%u to %u), empty for %u frames "
+                           "and %u thrown away since the connect, %u packets lost%s%s",
+                q->jb_avg_delay_ms, q->jb_min_delay_ms, q->jb_max_delay_ms,
+                since_base(q->jb_empty, s->path_base.jb_empty),
+                since_base(q->jb_discard, s->path_base.jb_discard), since_base(q->rx_lost, s->path_base.rx_lost),
+                clocks, far);
+        s->path_report_ms = now;
+    }
 }
 
 static void finish(dm_session_t *s, dm_session_end_t reason)
@@ -1281,6 +1451,7 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
         dm_modem_status(modem, &st);
         if (dm_sip_link_quality(&s.quality))
             s.have_quality = true;
+        watch_audio_path(&s, &st, now);
         update_screen(&s, &st);
 
         /* The speaker plays the training and stops at carrier, as ATM1. */
@@ -1401,20 +1572,29 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
          * then demodulates the other wrongly, so both see noise, and the
          * far end keeps asking to retrain. Say so and stop, rather than
          * filling the terminal with garbage until somebody clears the
-         * call. */
-        if (cfg->max_retrains > 0 && st.retrains >= (unsigned) cfg->max_retrains)
+         * call.
+         *
+         * But not every retrain counts (dm_retrain_count_update()): one that
+         * comes back slower is the rate stepping down to one the line will
+         * bear, which V.32 bis and V.34 do on purpose. A V.34 call whose far
+         * end retrained four times in two minutes, each time at a rate it
+         * could not hold, was hung up on here while each retrain still
+         * worked. */
+        dm_retrain_count_update(&s.retrains, st.retrains, st.bit_rate, st.tx_bit_rate, st.phase == DM_PHASE_DATA,
+                                now);
+        if (cfg->max_retrains > 0 && s.retrains.strikes >= (unsigned) cfg->max_retrains)
         {
             dm_tty_result("NO CARRIER");
             if (st.train_stage != NULL)
                 /* V.32 and V.34 agree their rates explicitly, so the ends cannot
                  * disagree about it the way V.22bis's can; and each retrain
-                 * already picks the rate the line will bear. One that still
+                 * that a rate failing caused steps below it. One that still
                  * will not hold has a line problem. */
                 DM_ERROR("session",
-                         "the link retrained %u times at %d bps and will not hold (%.1f dB SNR) - "
-                         "the audio path is too poor for %s. --modulation v22bis or v21 ask far "
-                         "less of it.",
-                         st.retrains, st.bit_rate, (double) st.snr_db,
+                         "the link retrained %u times in a few minutes without slowing to a rate that "
+                         "holds (now %d bps) - the audio path is too poor for %s. --modulation v22bis "
+                         "or v21 ask far less of it.",
+                         s.retrains.strikes, st.bit_rate,
                          strcmp(st.modulation, "v34") == 0      ? "V.34"
                          : strcmp(st.modulation, "v32bis") == 0 ? "V.32bis"
                                                                 : "V.32");
@@ -1424,13 +1604,13 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
                          "having offered %d, which usually means the two ends disagreed about "
                          "the rate - try --bit-rate %d so both start there, or --modulation v21, "
                          "which is far more tolerant of a poor audio path.",
-                         st.retrains, st.bit_rate, st.offered_rate, st.bit_rate);
+                         s.retrains.strikes, st.bit_rate, st.offered_rate, st.bit_rate);
             else
                 DM_ERROR("session",
                          "the link retrained %u times at %d bps and will not hold - check the "
                          "audio path, and try --modulation v21, which is far more tolerant of "
                          "a poor one.",
-                         st.retrains, st.bit_rate);
+                         s.retrains.strikes, st.bit_rate);
             finish(&s, DM_END_UNSTABLE);
             break;
         }
@@ -1534,12 +1714,26 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
         {
             unsigned bad = q.rx_lost + q.rx_discarded;
             unsigned pct = bad * 100u / (q.rx_packets + bad);
+            long skew = 0;
+            char skew_count[24] = "unknown";
+
+            /* The jitter buffer from the connect, not from call setup. */
+            unsigned jb_empty = since_base(q.jb_empty, s.path_base_ms != 0 ? s.path_base.jb_empty : 0);
+            unsigned jb_discard = since_base(q.jb_discard, s.path_base_ms != 0 ? s.path_base.jb_discard : 0);
+
+            if (packet_skew(&s, &q, &skew))
+                snprintf(skew_count, sizeof(skew_count), "%+ld", skew);
 
             dm_log_event(DM_LOG_INFO, "session", "audio path",
                          "rx_packets=%u rx_lost=%u rx_discarded=%u rx_reordered=%u tx_packets=%u "
-                         "jitter_ms=%.1f jitter_max_ms=%.1f rx_level_dbm0=%.1f",
+                         "jitter_ms=%.1f jitter_max_ms=%.1f rx_level_dbm0=%.1f jb_avg_delay_ms=%u jb_max_delay_ms=%u "
+                         "jb_empty=%u jb_discard=%u far_extra_packets=%s far_reports=%u far_lost=%u far_jitter_ms=%.1f "
+                         "net_rtt_ms=%u",
                          q.rx_packets, q.rx_lost, q.rx_discarded, q.rx_reordered, q.tx_packets,
-                         q.jitter_us / 1000.0, q.jitter_max_us / 1000.0, (double) st.rx_power);
+                         q.jitter_us / 1000.0, q.jitter_max_us / 1000.0, (double) st.rx_power, q.jb_avg_delay_ms,
+                         q.jb_max_delay_ms, jb_empty, jb_discard, skew_count, q.far_reports,
+                         since_base(q.far_lost, s.path_base_ms != 0 ? s.path_base.far_lost : 0),
+                         q.far_jitter_us / 1000.0, q.net_rtt_us / 1000);
 
             /* A modem is far less forgiving than speech. If the path lost
              * anything at all, say so next to the failure rather than

@@ -182,6 +182,10 @@ void dm_modem_set_wake(dm_modem_t *m, void (*wake)(void *user), void *user);
 
 void dm_modem_status(dm_modem_t *m, dm_modem_status_t *out);
 
+/* The far end's RTCP reports say it has lost more of what we send it. Safe
+ * from any thread. */
+void dm_modem_far_loss(dm_modem_t *m);
+
 /* Carrier up. Not the same as ready to carry data - see dm_modem_data_ready. */
 bool dm_modem_connected(dm_modem_t *m);
 
