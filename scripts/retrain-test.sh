@@ -236,6 +236,20 @@ case_ "V.34: a far end that loses a packet, report before" v34 \
     "+has just reported losing some of our packets" \
     "+33600 bit/s out did not hold"
 
+# The same far end, recovering the usual way: asking for less rather than
+# retraining. The lost packet is as much the reason.
+case_ "V.34: a far end that loses a packet and asks for less, report after" v34 \
+    DATAMODEM_SELFTEST_LINE=ulaw,delay=100,fade=4/20/-45/call,lose=21/call \
+    DATAMODEM_SELFTEST_BYTES=400000 -- \
+    "+reports losing some of our packets around its asking for less [0-9.]+ seconds ago" \
+    "+33600 bit/s out did not hold - the far end asked for less"
+
+case_ "V.34: a far end that loses a packet and asks for less, report before" v34 \
+    DATAMODEM_SELFTEST_LINE=ulaw,delay=100,fade=4/20/-45/call,lose=18/call \
+    DATAMODEM_SELFTEST_BYTES=400000 -- \
+    "+has just reported losing some of our packets, which is what it asked for less over" \
+    "+33600 bit/s out did not hold - the far end asked for less"
+
 # V.32 bis rides through a slip of whole frames: 20 ms is a whole number of
 # its symbols and of its carrier's cycles.
 case_ "V.32 bis: a path that slips" v32bis \

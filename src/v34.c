@@ -402,6 +402,7 @@ struct dm_v34
     dm_rate_memory_t rx_failed, tx_failed;
     dm_path_watch_t path;     /* whether the retrain under way is the path's doing */
     dm_loss_watch_t loss;     /* whether the far end's last retrain was a lost packet's doing */
+    bool loss_rn;             /* ... or its last asking for less */
     long long rx_since, tx_since; /* line time each direction's rate started */
     int trained_rx, trained_tx;   /* what the last start-up or retrain settled on */
     int rn_prev_tx, rn_prev_rx;   /* the rates as a renegotiation started */
@@ -2304,14 +2305,39 @@ static void go_data(dm_v34_t *v)
          * far end's reception would not bear what it had. */
         v->tx_step = 0;
         v->up_since = 0;
+        /* Asking for more and getting nothing waits twice as long to ask
+         * again. A renegotiation of the far end's that leaves what we
+         * receive as it was says nothing about that, and leaves the wait
+         * alone: a far end renegotiating every 30 seconds for its own
+         * reasons, and only ever offering 28800, otherwise had us asking
+         * it for 31200 every 30 seconds too, for nothing each time. */
         if (v->up_from > 0 && v->rate_rx <= v->up_from && v->up_backoff > 0.0)
+        {
             v->up_backoff = (v->up_backoff * 2.0 > 600.0) ? 600.0 : v->up_backoff * 2.0;
-        else
+            v->up_next = v->n + (long long) (v->up_backoff * 8000.0);
+        }
+        else if (v->up_from > 0 || v->rate_rx != v->rn_prev_rx || v->up_backoff <= 0.0)
+        {
             v->up_backoff = 30.0;
-        v->up_next = v->n + (long long) (v->up_backoff * 8000.0);
+            v->up_next = v->n + (long long) (v->up_backoff * 8000.0);
+        }
         v->up_from = 0;
         if (v->rate_tx < v->rn_prev_tx && (lim == 0 || lim >= v->rn_prev_tx))
+        {
+            /* As with a retrain: a packet of ours lost on the way is a gap
+             * in what it heard, which no rate would have held through. Two
+             * of a production call's three requests for less came with a
+             * report of a lost packet, and were held against 31200 for 20
+             * minutes and 26400 for 80. */
+            dm_loss_watch_arm(&v->loss, v->n, &v->tx_failed);
+            v->loss_rn = true;
             rate_failed(v, false, v->rn_prev_tx, v->tx_since, true, "the far end asked for less");
+            if (dm_loss_watch_check(&v->loss, v->n, &v->tx_failed))
+                DM_INFO("v34", "the far end has just reported losing some of our packets, which is what it asked "
+                               "for less over and no rate would have held through; not holding it against the rate "
+                               "(tag=%s)",
+                        v->tag);
+        }
         if (v->rate_tx != v->rn_prev_tx)
             v->tx_since = v->n;
         if (v->rate_rx != v->rn_prev_rx)
@@ -3291,6 +3317,7 @@ static void control(dm_v34_t *v, long long n, double rev, bool reversed)
             {
                 dm_path_watch_arm(&v->path, (v->rtd >= 0) ? v->rtd / 8.0 : -1.0, &v->rx_failed, &v->tx_failed);
                 dm_loss_watch_arm(&v->loss, n, &v->tx_failed);
+                v->loss_rn = false;
                 rate_failed(v, false, v->rate_tx, v->tx_since, v->poor_since == 0 || n - v->poor_since < MS(300),
                             "the far end retrained");
                 if (dm_loss_watch_check(&v->loss, n, &v->tx_failed))
@@ -3696,10 +3723,11 @@ void dm_v34_far_loss(dm_v34_t *v)
     long long ago = v->n - v->loss.retrain_at;
 
     if (dm_loss_watch_loss(&v->loss, v->n, &v->tx_failed))
-        DM_INFO("v34", "the far end reports losing some of our packets around its retrain %.1f seconds ago, which "
-                       "is what it retrained over and no rate would have held through; not holding it against the "
+        DM_INFO("v34", "the far end reports losing some of our packets around its %s %.1f seconds ago, which "
+                       "is what it %s over and no rate would have held through; not holding it against the "
                        "rate (tag=%s)",
-                ago / 8000.0, v->tag);
+                v->loss_rn ? "asking for less" : "retrain", ago / 8000.0, v->loss_rn ? "asked for less" : "retrained",
+                v->tag);
 }
 
 bool dm_v34_renegotiate(dm_v34_t *v, int rx_rate)
