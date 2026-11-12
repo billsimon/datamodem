@@ -201,7 +201,7 @@ typedef struct
 
     /* The audio path, watched through a call: see watch_audio_path(). */
     unsigned gap_seen, dropped_seen;             /* path_gaps()'s counts at the last look */
-    unsigned far_lost_seen, far_lost_unsaid;     /* the far end's reports of our packets lost */
+    unsigned far_lost_seen, far_lost_unsaid;     /* the most the far end has reported of ours lost */
     int64_t far_said_ms;
     unsigned gap_unsaid, dropped_unsaid;         /* since the last line about them */
     int64_t jb_said_ms;
@@ -339,7 +339,7 @@ static void far_text(const dm_session_t *s, const dm_link_quality_t *q, char *ou
     else
         snprintf(out, len, "; the far end reports losing %u of ours since the connect, jitter %.1f ms, network "
                            "round trip %u ms",
-                 since_base(q->far_lost, s->path_base.far_lost), q->far_jitter_us / 1000.0,
+                 since_base(s->far_lost_seen, s->path_base.far_lost), q->far_jitter_us / 1000.0,
                  q->net_rtt_us / 1000);
 }
 
@@ -413,7 +413,8 @@ static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64
         /* Call setup has its own empties, before any audio arrives. */
         s->gap_seen = gap;
         s->dropped_seen = dropped;
-        s->far_lost_seen = q->far_lost;
+        if (s->connected_ms == 0 || q->far_lost > s->far_lost_seen)
+            s->far_lost_seen = q->far_lost;
         return;
     }
     if (s->path_base_ms == 0)
@@ -429,14 +430,20 @@ static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64
         s->dropped_unsaid += dropped - s->dropped_seen;
     s->gap_seen = gap;
     s->dropped_seen = dropped;
+    /* RTCP's count of packets lost goes down as well as up - one counted
+     * lost that turns up after all is taken off again (RFC 3550, 6.4.1) -
+     * and a carrier whose reports went 1, 2, 1, 2 had each rise logged every
+     * ten seconds for seven minutes as a new loss, and each taken for a gap
+     * the far end might retrain over. Only a count higher than any before
+     * is a packet lost. */
     if (q->far_lost > s->far_lost_seen)
     {
         s->far_lost_unsaid += q->far_lost - s->far_lost_seen;
+        s->far_lost_seen = q->far_lost;
         /* A far end that retrains over a gap in what it heard has not
          * shown the rate to be too high. */
         dm_modem_far_loss(s->modem);
     }
-    s->far_lost_seen = q->far_lost;
     far_text(s, q, far, sizeof(far));
     buffer_text(s, q, buffer, sizeof(buffer));
     if (packet_skew(s, q, &skew))
@@ -460,7 +467,7 @@ static void watch_audio_path(dm_session_t *s, const dm_modem_status_t *st, int64
     {
         DM_INFO("session", "the far end reports losing %u of our packets (%u since the connect) - what it "
                            "hears from us has gaps in it",
-                s->far_lost_unsaid, since_base(q->far_lost, s->path_base.far_lost));
+                s->far_lost_unsaid, since_base(s->far_lost_seen, s->path_base.far_lost));
         s->far_lost_unsaid = 0;
         s->far_said_ms = now;
     }
@@ -1778,7 +1785,8 @@ int dm_session_run(const dm_config_t *cfg, dm_modem_t *modem, volatile sig_atomi
                          q.rx_packets, q.rx_lost, q.rx_discarded, q.rx_reordered, q.tx_packets,
                          q.jitter_us / 1000.0, q.jitter_max_us / 1000.0, (double) st.rx_power, buffer, skew_count,
                          q.far_reports,
-                         since_base(q.far_lost, s.path_base_ms != 0 ? s.path_base.far_lost : 0),
+                         since_base(q.far_lost > s.far_lost_seen ? q.far_lost : s.far_lost_seen,
+                                    s.path_base_ms != 0 ? s.path_base.far_lost : 0),
                          q.far_jitter_us / 1000.0, q.net_rtt_us / 1000);
 
             /* A modem is far less forgiving than speech. If the path lost
